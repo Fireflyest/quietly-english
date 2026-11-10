@@ -36,6 +36,8 @@ struct UndoEntry {
     /// Message index of the card block, so undo can jump back to it.
     message: usize,
     was_new: bool,
+    /// Rating was `again`, so a copy was pushed back into the session queue.
+    requeued: bool,
 }
 
 pub struct App {
@@ -63,6 +65,9 @@ pub struct App {
     /// Words behind each table message, for click-to-open and numeric picking.
     table_words: HashMap<usize, Vec<Word>>,
     undo: Vec<UndoEntry>,
+    /// Import queued by `/import`; it runs after the next frame so the user sees
+    /// the "importing" line instead of a frozen window.
+    pending_import: Option<String>,
 }
 
 impl App {
@@ -98,6 +103,7 @@ impl App {
             confirm_exit: false,
             table_words: HashMap::new(),
             undo: Vec::new(),
+            pending_import: None,
         };
         app.load_history();
         app.greet()?;
@@ -150,6 +156,13 @@ impl App {
                 info = draw(frame, &view);
             })?;
             self.draw_info = info;
+
+            // Imports read a whole dictionary file; run them only once the frame is
+            // on screen so the "importing" line is visible while it works.
+            if let Some(path) = self.pending_import.take() {
+                self.run_pending_import(&path)?;
+                continue;
+            }
 
             if event::poll(Duration::from_millis(120))? {
                 match event::read()? {
@@ -745,6 +758,32 @@ impl App {
             } else {
                 session.review_done = session.review_done.saturating_sub(1);
             }
+
+            // Take back the copy `again` pushed into the queue, if it is still there.
+            if entry.requeued {
+                let position = session
+                    .queue
+                    .iter()
+                    .position(|card| card.word.id == entry.word_id);
+                if let Some(position) = position {
+                    session.queue.remove(position);
+                    session.review_total = session.review_total.saturating_sub(1);
+                }
+            }
+
+            // The user may have already moved on to another card. Put it back so the
+            // undone card does not silently swallow it.
+            let current_is_other = session
+                .current
+                .as_ref()
+                .map(|card| card.word.id != entry.word_id)
+                .unwrap_or(false);
+            if current_is_other {
+                if let Some(current) = session.current.take() {
+                    session.queue.push_front(current);
+                }
+            }
+
             session.revealed = true;
             session.hint = false;
             session.graded = None;
@@ -966,6 +1005,18 @@ impl App {
             self.fail(format!("file not found: {path}"));
             return Ok(());
         }
+        self.push(Message::tool(
+            ToolView::new("import")
+                .accent(Accent::Info)
+                .result(path.to_string())
+                .muted("reading the file · the window may pause for a large dictionary"),
+        ));
+        self.pending_import = Some(path.to_string());
+        Ok(())
+    }
+
+    /// The blocking half of `/import`, run right after a frame is painted.
+    fn run_pending_import(&mut self, path: &str) -> Result<()> {
         match self.store.import_file(Path::new(path)) {
             Ok(report) => {
                 self.push(Message::table(crate::cli::report_table(&report)));
@@ -1149,11 +1200,25 @@ impl App {
         if !session.revealed {
             return self.reveal();
         }
-        // Peeked but never graded: skip without recording.
-        if let Some(session) = self.session.as_mut() {
-            session.current = None;
-        }
+        // Peeked but never graded: skip without recording, but keep the totals honest
+        // so the progress badge does not stall one card short of the end.
+        self.drop_current_ungraded();
         self.next_card()
+    }
+
+    /// Remove the current card from the session without writing a review.
+    fn drop_current_ungraded(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let Some(card) = session.current.take() else {
+            return;
+        };
+        if card.is_new {
+            session.new_total = session.new_total.saturating_sub(1);
+        } else {
+            session.review_total = session.review_total.saturating_sub(1);
+        }
     }
 
     /// Grade the current card. Pressing another 1-4 afterwards replaces the rating
@@ -1195,6 +1260,7 @@ impl App {
                 before: card.card.clone(),
                 message: card_message,
                 was_new,
+                requeued: rating == Rating::Again,
             });
             if self.undo.len() > MAX_UNDO {
                 self.undo.remove(0);
@@ -1216,7 +1282,9 @@ impl App {
         }
 
         // A forgotten card comes back later in the same session, like Anki.
-        if rating == Rating::Again {
+        // Only on the first rating: re-picking 1-4 on the same card must not queue
+        // a second copy.
+        if first_time && rating == Rating::Again {
             let requeued = StudyCard::review(card.word.clone(), after);
             if let Some(session) = self.session.as_mut() {
                 let at = 4.min(session.queue.len());
@@ -1656,6 +1724,91 @@ mod tests {
         );
         // A new card is untouched: no review row, no card row.
         assert!(app.store.word(&word.word.lemma).unwrap().is_some());
+    }
+
+    #[test]
+    fn undo_after_again_takes_the_requeued_copy_back_out() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        let before_len = app.session.as_ref().unwrap().queue.len();
+        let before_total = app.session.as_ref().unwrap().review_total;
+
+        app.grade(Rating::Again).unwrap();
+        assert_eq!(app.session.as_ref().unwrap().queue.len(), before_len + 1);
+
+        app.undo_last().unwrap();
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(
+            session.queue.len(),
+            before_len,
+            "the requeued copy must be removed"
+        );
+        assert_eq!(session.review_total, before_total, "total shrinks back");
+    }
+
+    #[test]
+    fn regrading_again_does_not_queue_a_second_copy() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        let before = app.session.as_ref().unwrap().queue.len();
+
+        app.grade(Rating::Again).unwrap();
+        // Re-pick on the same card: amend, not a second review.
+        app.grade(Rating::Again).unwrap();
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(
+            session.queue.len(),
+            before + 1,
+            "only the first `again` may requeue"
+        );
+        assert_eq!(app.store.daily(time::today()).unwrap().reviews, 1);
+    }
+
+    #[test]
+    fn undo_after_advancing_keeps_the_next_card() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(4))).unwrap();
+        let graded = app.session.as_ref().unwrap().current.clone().unwrap();
+
+        app.grade(Rating::Good).unwrap();
+        app.advance().unwrap(); // moves on to the next card
+        let next = app.session.as_ref().unwrap().current.clone().unwrap();
+        let queue_len = app.session.as_ref().unwrap().queue.len();
+
+        app.undo_last().unwrap();
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(
+            session.current.as_ref().map(|card| card.word.id),
+            Some(graded.word.id),
+            "the undone card is current again"
+        );
+        // The card we had moved on to is back in the queue, not lost.
+        assert!(
+            session.queue.iter().any(|card| card.word.id == next.word.id),
+            "the next card must be requeued"
+        );
+        assert_eq!(session.queue.len(), queue_len + 1);
+    }
+
+    #[test]
+    fn skipping_an_ungraded_card_keeps_totals_in_step() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        let before = app.session.as_ref().unwrap().total();
+
+        app.reveal().unwrap(); // peek without grading
+        app.advance().unwrap(); // skip it
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(
+            session.total(),
+            before - 1,
+            "a skipped card must leave the denominator"
+        );
+        assert_eq!(app.store.daily(time::today()).unwrap().reviews, 0);
     }
 
     #[test]

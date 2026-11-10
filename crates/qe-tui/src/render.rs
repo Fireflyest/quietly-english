@@ -54,10 +54,8 @@ pub struct DrawInfo {
     pub transcript: Rect,
     pub scrollbar_x: Option<u16>,
     pub max_back: u16,
-    /// Screen row of the first transcript line (after padding/scroll).
-    pub first_row: u16,
     /// For each visible transcript row, the message index it belongs to.
-    /// `u16::MAX` marks padding above the transcript.
+    /// `usize::MAX` marks padding above the transcript.
     pub row_message: Vec<usize>,
     /// Line offset of each message inside its own block, parallel to `row_message`.
     pub row_offset: Vec<usize>,
@@ -195,7 +193,6 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
         transcript: area,
         scrollbar_x,
         max_back,
-        first_row: area.y,
         row_message,
         row_offset,
     }
