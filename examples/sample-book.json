@@ -1,0 +1,33 @@
+{
+  "name": "示例词书",
+  "slug": "demo",
+  "description": "用于验证 JSON 导入格式",
+  "words": [
+    {
+      "lemma": "inspect",
+      "phonetic": "/ɪnˈspekt/",
+      "translation": "v. 检查；视察",
+      "definition": "to look at something carefully",
+      "roots": [
+        { "part": "in-", "gloss": "向内", "kind": "prefix" },
+        { "part": "spect", "gloss": "看", "kind": "root" }
+      ],
+      "examples": [
+        {
+          "en": "Engineers inspect the bridge every year.",
+          "zh": "工程师每年检查这座桥。"
+        }
+      ],
+      "tags": ["demo", "cet4"]
+    },
+    {
+      "word": "resilient",
+      "phonetic": "/rɪˈzɪliənt/",
+      "translation": "adj. 有韧性的；能恢复的",
+      "roots": "re-:向后:prefix;sil:跳:root;-ent:形容词后缀:suffix",
+      "example": "Children are often more resilient than adults.",
+      "example_zh": "孩子往往比大人更能恢复过来。",
+      "tags": ["demo", "cet6"]
+    }
+  ]
+}

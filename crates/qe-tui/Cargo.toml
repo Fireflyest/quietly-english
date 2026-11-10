@@ -1,0 +1,12 @@
+[package]
+name = "qe-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qe-core = { path = "../qe-core" }
+anyhow.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true

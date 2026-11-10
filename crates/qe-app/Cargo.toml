@@ -1,0 +1,21 @@
+[package]
+name = "quietly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "quietly"
+path = "src/main.rs"
+
+[dependencies]
+qe-core = { path = "../qe-core" }
+qe-store = { path = "../qe-store" }
+qe-tui = { path = "../qe-tui" }
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
