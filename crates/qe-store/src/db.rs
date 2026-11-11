@@ -1458,6 +1458,26 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn db_files(&self) -> Vec<(String, String, u64)> {
+        let size = |path: &Path| {
+            fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        vec![
+            (
+                "study".to_string(),
+                self.path.display().to_string(),
+                size(&self.path),
+            ),
+            (
+                "words".to_string(),
+                self.words_path.display().to_string(),
+                size(&self.words_path),
+            ),
+        ]
+    }
+
     fn import_plan(&mut self, plan: &ImportPlan) -> Result<ImportReport> {
         let tx = self.conn.transaction()?;
         // 同名词书复用已有 slug，避免 “CET-4 核心词” 与 “cet-4” 重复。

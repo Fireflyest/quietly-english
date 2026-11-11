@@ -108,7 +108,11 @@ pub trait Store {
     // ---- 设置 ----
     fn setting(&self, key: &str) -> Result<Option<String>>;
     fn set_setting(&self, key: &str, value: &str) -> Result<()>;
-
+    /// 数据文件清单：`(用途, 显示路径, 字节数)`。
+    ///
+    /// 学习库和词典库是两个文件，`/db` 与 `quietly db` 都从这里取，
+    /// 免得上层再去关心具体实现里的路径字段。
+    fn db_files(&self) -> Vec<(String, String, u64)>;
     // ---- 导入 ----
     fn import_plan(&mut self, plan: &ImportPlan) -> Result<ImportReport>;
     fn add_examples(&mut self, examples: &[(String, Example)]) -> Result<u32>;

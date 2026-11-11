@@ -21,7 +21,9 @@ use crate::editor::Editor;
 use crate::session::StudySession;
 
 const DUE_BATCH: usize = 300;
-const MAX_SUGGESTIONS: usize = 5;
+/// How many completions to show at once. 命令有近三十条，5 行太少，但也不能
+/// 把整个终端吃掉；超出的条数以 `+N more` 提示。
+const MAX_SUGGESTIONS: usize = 12;
 /// Caret blink half-period. Typing resets the phase so the caret is always visible
 /// right after a keystroke.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -143,6 +145,7 @@ impl App {
             let meta = self.meta_line();
             let ghost = command::ghost(&input);
             let suggestions = build_suggestions(&input, self.suggestion_index);
+            let suggestions_more = hidden_suggestions(&input);
             let mode = if self.session.is_some() {
                 ViewMode::Study
             } else {
@@ -166,6 +169,7 @@ impl App {
                 placeholder,
                 ghost: ghost.as_deref(),
                 suggestions: &suggestions,
+                suggestions_more,
                 scroll_back: self.scroll_back,
                 cursor_on: self.cursor_on,
                 unread: self.unread,
@@ -692,6 +696,7 @@ impl App {
     fn execute(&mut self, command: Command) -> Result<()> {
         match command {
             Command::Help => self.help(),
+            Command::Db => self.show_db(),
             Command::Study(limit) => self.start_study(limit),
             Command::Books => self.show_books(),
             Command::Book(target) => self.switch_book(&target),
@@ -767,20 +772,40 @@ impl App {
         let mut body = String::from("commands\n");
         for spec in command::SPECS {
             body.push_str(&format!(
-                "  {:<14} {}\n",
-                format!("{}{}", spec.name, spec.args),
+                "  {:<26} {}\n",
+                format!("{}{}", spec.label(), spec.args),
                 spec.help
             ));
         }
         body.push_str(
             "\ntype an English word to look it up.\n\
              in a session: 1-4 grade · enter next · tab hint · esc end\n\
+             reading: enter/→ next · ← prev · 1-9 open a word · tab translation\n\
              \n\
              F2 releases the mouse so you can select and copy text; press it again \
              to get scroll and click back. Most terminals also accept shift+drag \
              while capture is on.",
         );
         self.push(Message::agent(body));
+        Ok(())
+    }
+
+    /// `/db`：两个数据文件在哪、多大。
+    fn show_db(&mut self) -> Result<()> {
+        let files = self.store.db_files();
+        let mut view = ToolView::new("db")
+            .accent(Accent::Note)
+            .result(format!("{} files", files.len()));
+        for (label, path, bytes) in &files {
+            let size = if *bytes >= 1_048_576 {
+                format!("{:.1} MB", *bytes as f64 / 1_048_576.0)
+            } else {
+                format!("{:.0} KB", *bytes as f64 / 1024.0)
+            };
+            view = view.kv(label.clone(), format!("{size}  {path}"));
+        }
+        view = view.muted("study 存词书/卡片/阅读，可进 git；words 是词典，可重建");
+        self.push(Message::tool(view));
         Ok(())
     }
 
@@ -1706,6 +1731,13 @@ fn build_suggestions(input: &str, selected: usize) -> Vec<Suggestion> {
         .collect()
 }
 
+/// 命中但没显示出来的条数。
+fn hidden_suggestions(input: &str) -> usize {
+    command::matches(input)
+        .len()
+        .saturating_sub(MAX_SUGGESTIONS)
+}
+
 fn rating_from_char(ch: char) -> Rating {
     match ch {
         '1' => Rating::Again,
@@ -2011,13 +2043,30 @@ mod tests {
 
     #[test]
     fn suggestions_and_ghost_track_the_input() {
+        // `/st` 命中 /study 和 /summary（别名 stats）两条，规范名那条排前面。
         let ghost = command::ghost("/st");
         assert_eq!(ghost.as_deref(), Some("udy"));
         let suggestions = build_suggestions("/st", 0);
-        assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].name, "/study");
         assert!(suggestions[0].selected);
         assert!(build_suggestions("inspect", 0).is_empty());
+
+        // 唯一命中时 tab 补成规范名。
+        assert_eq!(command::complete("/stu"), Some("/study ".to_string()));
+    }
+
+    #[test]
+    fn aliases_are_completable() {
+        // 短写也要出现在提示里，否则用户只能靠记。
+        assert_eq!(
+            command::ghost("/n").as_deref(),
+            Some("ext"),
+            "alias n -> /next"
+        );
+        assert_eq!(command::complete("/n"), Some("/next ".to_string()));
+        assert_eq!(command::complete("/go"), Some("/goto ".to_string()));
+        assert!(command::matches("/db").iter().any(|s| s.name == "/db"));
+        assert!(command::matches("/where").iter().any(|s| s.name == "/db"));
     }
 
     #[test]

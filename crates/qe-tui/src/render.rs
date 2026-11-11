@@ -41,6 +41,8 @@ pub struct View<'a> {
     /// Dimmed completion of the word currently being typed.
     pub ghost: Option<&'a str>,
     pub suggestions: &'a [Suggestion],
+    /// 命中但没显示的条数，大于 0 时底部补一行 `+N more`。
+    pub suggestions_more: usize,
     pub scroll_back: u16,
     /// Blink phase of the input caret.
     pub cursor_on: bool,
@@ -74,12 +76,10 @@ pub fn draw(frame: &mut Frame, view: &View) -> DrawInfo {
         return DrawInfo::default();
     }
 
-    // One row per suggestion, capped so the transcript keeps at least 3 rows.
-    let suggestion_rows = view
-        .suggestions
-        .len()
-        .min(5)
-        .min((area.height as usize).saturating_sub(8)) as u16;
+    // One row per suggestion (plus a `+N more` line), capped so the transcript
+    // keeps at least 3 rows.
+    let want_rows = view.suggestions.len() + usize::from(view.suggestions_more > 0);
+    let suggestion_rows = want_rows.min(13).min((area.height as usize).saturating_sub(8)) as u16;
 
     let rows = Layout::vertical([
         Constraint::Length(1),               // header
@@ -220,6 +220,15 @@ fn render_suggestions(frame: &mut Frame, area: Rect, view: &View) {
             Span::styled(marker.to_string(), theme::accent_plain()),
             Span::styled(format!("{:<name_width$}", name), style),
             Span::styled(format!("  {}", suggestion.help), theme::dim()),
+        ]));
+    }
+    if view.suggestions_more > 0 && lines.len() < area.height as usize {
+        lines.push(Line::from(vec![
+            Span::styled("  ", theme::dim()),
+            Span::styled(
+                format!("+{} more · keep typing to narrow", view.suggestions_more),
+                theme::dim(),
+            ),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -409,6 +418,7 @@ mod tests {
             placeholder: "ask anything · /help",
             ghost: Some("dy"),
             suggestions: &suggestions,
+            suggestions_more: 0,
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
@@ -444,6 +454,7 @@ mod tests {
             placeholder: "",
             ghost: None,
             suggestions: &[],
+            suggestions_more: 0,
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
@@ -470,6 +481,7 @@ mod tests {
             placeholder: "",
             ghost: None,
             suggestions: &[],
+            suggestions_more: 0,
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
@@ -498,6 +510,7 @@ mod tests {
             placeholder,
             ghost: None,
             suggestions: &[],
+            suggestions_more: 0,
             scroll_back: 0,
             cursor_on,
             unread: 0,
@@ -565,6 +578,7 @@ mod tests {
             placeholder: "",
             ghost: None,
             suggestions: &[],
+            suggestions_more: 0,
             scroll_back: 0,
             cursor_on: true,
             unread: 0,

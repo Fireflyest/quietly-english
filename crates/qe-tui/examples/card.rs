@@ -53,6 +53,7 @@ fn main() {
         placeholder: "",
         ghost: None,
         suggestions: &[],
+        suggestions_more: 0,
         scroll_back: 0,
         cursor_on: false,
         unread: 0,
