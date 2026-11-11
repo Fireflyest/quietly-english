@@ -81,28 +81,40 @@ StarDict 是二进制格式：`.idx` 存"词条 + 偏移 + 长度"，`.dict` 是
 
 ### 叠第二本、第三本词典
 
-ECDICT 是「简明」词典，义项少而精。想补全释义（尤其是生僻义）可以再叠一本，
+ECDICT 是「简明」词典，义项少而精。想补全释义（尤其是生僻义、专业义）可以再叠一本，
 关键是加 `--merge`，否则后导入的会**整体覆盖**已有释义：
 
 ```bash
 quietly dict stardict-langdao-ec-gb.ifo --merge
 ```
 
-合并以**释义行**为单位：已有条目里没有的行追加到末尾，重复的行（忽略空格与
-全角标点差异）跳过。所以 AB 两本词典里都有的词，行数只增不减，顺序也不会变。
+合并以**释义行**为单位：已有条目里没有的行追加到末尾，重复的行跳过。判重时会忽略
+空白、全角标点（`，` / `【】`）和词性缩写差异（`adv.` = `ad.`、`adj.` = `a.`），
+所以「`[医] 库`」和「`【医】 库`」不会被存成两条。
 
-可叠的 StarDict 词典（<http://download.huzheng.org/zh_CN/>，解压后取 `.ifo`，每本 3–9 MB）：
+导入结束会报 `N senses grown`——**这个数字才是判断该不该叠的依据**：
+
+| 词典 | 叠进去后增长 |
+| --- | --- |
+| `stardict-langdao-ec-gb` | 32,261 / 429,904 词（7.5%） |
+| `stardict-21cen` | 不建议：条目是长篇原文，按行合并会产生大量伪义项 |
+| `stardict-oald-cn` | 不建议：同上，且带 `(idm 习语)` 等原文标记 |
+| `stardict-21shijishuangyukejicidian` | 无意义：中文词头为主，会被词条过滤挡掉 |
+
+可下载的 StarDict 词典（<http://download.huzheng.org/zh_CN/>，解压后取 `.ifo`）：
 
 | 文件 | 内容 |
 | --- | --- |
-| `stardict-langdao-ec-gb-2.4.2.tar.bz2` | 朗道英汉，义项较全 |
-| `stardict-21shijishuangxiangcidian-2.4.2.tar.bz2` | 21 世纪英汉双解，百科式释义 |
-| `stardict-oald-cn-2.4.2.tar.bz2` | 牛津高阶英汉，含搭配与用法 |
+| `stardict-langdao-ec-gb-2.4.2.tar.bz2` | 朗道英汉字典 5.0，**唯一推荐叠的** |
+| `stardict-21cen-2.4.2.tar.bz2` | 21 世纪英汉汉英双向 |
+| `stardict-oald-cn-2.4.2.tar.bz2` | 牛津高阶英汉双解 |
 | `stardict-lazyworm-ec-2.4.2.tar.bz2` | 懒虫简明英汉 |
-| `stardict-xdict-ec-gb-2.4.2.tar.bz2` | 人教社 xdict 英汉，义项精简 |
-| `stardict-ProECCE-2.4.2.tar.bz2` | 英汉汉英专业词典（计算机方向） |
+| `stardict-xdict-ec-gb-2.4.2.tar.bz2` | 人教社 xdict 英汉 |
 
-> ⚠️ 这些词典多数是纸质词典的电子化转换，**版权状态不明**。仅作个人离线查词用，
+> 这些包的 `.dict` 是 dictzip 的 `.dict.dz`（带 FEXTRA 的 gzip），导入器能直接读，
+> 不必手动解压。索引里的偏移是解压后偏移，所以是按顺序流式解压的。
+>
+> ⚠️ 多数是纸质词典的电子化转换，**版权状态不明**。仅作个人离线查词用，
 > 不要随应用分发。商用请换用有明确授权的语料。
 > 下载建议直接用浏览器，命令行 `curl` 很容易在 3 MB 左右断流。
 
@@ -113,7 +125,9 @@ quietly dict stardict-langdao-ec-gb.ifo --merge
 | Wiktionary 中文翻译（kaikki `translations`） | ❌ 全库仅 4144 条带 `lang: Chinese`，且多为东干语/闽南语标签，普通话释义几乎没有 |
 | 汉典 / 有道 / 必应 网页 | ❌ 无开放接口，抓取违反服务条款 |
 | CC-CEDICT | ❌ 方向相反，是「汉 → 英」 |
-| 朗道 / 21 世纪 / 牛津高阶 StarDict | ✅ 可用，见上表，走 `--merge` |
+| 懒虫 / xdict | ⚠️ 可用，但与 ECDICT 重合度极高，叠了几乎不涨 |
+| 朗道英汉 | ✅ 补 7.5% 的词，且带「相关词组」，见下 |
+
 
 ## 3. 词源：kaikki.org（Wiktionary，CC BY-SA）
 

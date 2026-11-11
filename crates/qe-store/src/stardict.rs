@@ -18,12 +18,17 @@
 //! ```
 //!
 //! 首行是音标，其余行是释义。`sametypesequence=m` 表示片段本身就是纯文本。
+//!
+//! 数据区有两种存放方式：未压缩的 `.dict`（ECDICT），以及 dictzip 压缩的
+//! `.dict.dz`（胡正站的绝大多数词典）。后者是带 FEXTRA 的 gzip 流，可以整体
+//! 顺序解压；索引里的偏移是**解压后**的偏移，所以解压流上的跳过是逐字节丢弃。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use flate2::read::MultiGzDecoder;
 
 use qe_core::model::{Example, Word};
 
@@ -41,9 +46,16 @@ pub struct Meta {
 pub struct Stardict {
     meta: Meta,
     idx: BufReader<File>,
-    dict: BufReader<File>,
+    dict: DictData,
     /// 已按顺序读取的下一个数据位置；索引通常递增，顺序读比 seek 快一个量级。
     dict_pos: u64,
+}
+
+/// 数据区。压缩的只能顺序读，但索引里的偏移本来也是递增的。
+enum DictData {
+    Plain(BufReader<File>),
+    /// dictzip（`.dict.dz`）是带 FEXTRA 的 gzip，整体顺序解压即可。
+    Compressed(BufReader<MultiGzDecoder<File>>),
 }
 
 impl Stardict {
@@ -57,10 +69,27 @@ impl Stardict {
             256 * 1024,
             File::open(&idx_path).with_context(|| format!("无法打开 {}", idx_path.display()))?,
         );
-        let dict = BufReader::with_capacity(
-            512 * 1024,
-            File::open(&dict_path).with_context(|| format!("无法打开 {}", dict_path.display()))?,
-        );
+
+        let dict = if dict_path.exists() {
+            DictData::Plain(BufReader::with_capacity(
+                512 * 1024,
+                File::open(&dict_path)
+                    .with_context(|| format!("无法打开 {}", dict_path.display()))?,
+            ))
+        } else {
+            let dz = PathBuf::from(format!("{}.dz", dict_path.to_string_lossy()));
+            let file = File::open(&dz).with_context(|| {
+                format!(
+                    "缺少数据区：{} 和 {} 都不存在",
+                    dict_path.display(),
+                    dz.display()
+                )
+            })?;
+            DictData::Compressed(BufReader::with_capacity(
+                512 * 1024,
+                MultiGzDecoder::new(file),
+            ))
+        };
 
         Ok(Self {
             meta,
@@ -148,22 +177,44 @@ impl Stardict {
 
     /// 读取 `dict` 中 `[offset, offset+len)` 的内容，尽量顺序前进。
     fn read_at(&mut self, offset: u64, target: &mut [u8]) -> Result<()> {
-        if offset >= self.dict_pos && offset - self.dict_pos < 1024 * 1024 {
-            // 顺序读，丢弃中间的差值。
-            let mut skip = offset - self.dict_pos;
-            let mut hole = [0u8; 8192];
-            while skip > 0 {
-                let take = skip.min(hole.len() as u64) as usize;
-                self.dict.read_exact(&mut hole[..take])?;
-                skip -= take as u64;
+        let gap = offset as i64 - self.dict_pos as i64;
+        if gap != 0 {
+            match &mut self.dict {
+                DictData::Plain(file) => {
+                    if (0..1024 * 1024).contains(&gap) {
+                        skip_forward(file, gap as u64)?;
+                    } else {
+                        file.seek(SeekFrom::Start(offset))?;
+                    }
+                }
+                DictData::Compressed(reader) => {
+                    // 解压流无法回退；索引本身递增，正向跳过是唯一需要的方向。
+                    if gap < 0 {
+                        bail!("索引偏移不是递增的，压缩数据区无法回退");
+                    }
+                    skip_forward(reader, gap as u64)?;
+                }
             }
-        } else {
-            self.dict.seek(SeekFrom::Start(offset))?;
         }
-        self.dict.read_exact(target)?;
+        match &mut self.dict {
+            DictData::Plain(file) => file.read_exact(target)?,
+            DictData::Compressed(reader) => reader.read_exact(target)?,
+        }
         self.dict_pos = offset + target.len() as u64;
         Ok(())
     }
+}
+
+/// 丢弃 `count` 字节。压缩流上等价于解压后跳过。
+fn skip_forward(reader: &mut impl Read, count: u64) -> Result<()> {
+    let mut skip = count;
+    let mut hole = [0u8; 8192];
+    while skip > 0 {
+        let take = skip.min(hole.len() as u64) as usize;
+        reader.read_exact(&mut hole[..take])?;
+        skip -= take as u64;
+    }
+    Ok(())
 }
 
 /// 只保留能用键盘打出来、长度合理的词条，过滤掉符号条目与超长短语。

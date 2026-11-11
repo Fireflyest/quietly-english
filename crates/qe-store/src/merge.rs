@@ -38,19 +38,30 @@ pub fn merge_translations(existing: &str, incoming: &str) -> String {
     lines.join("\n")
 }
 
-/// 归一化：去掉空白、统一大小写，并把全角逗号当作半角，好让
-/// 「n. 目的,缘故」和「n. 目的，缘故」被认成同一条。
+/// 归一化：去掉空白、统一大小写，并把全角标点当半角，好让
+/// 「n. 目的,缘故」和「n. 目的，缘故」、「[医] 库」和「【医】 库」被认成同一条。
 fn normalise(line: &str) -> String {
-    line.chars()
+    let collapsed: String = line
+        .chars()
         .filter(|ch| !ch.is_whitespace())
         .map(|ch| match ch {
             '，' => ',',
             '；' => ';',
             '：' => ':',
+            '【' => '[',
+            '】' => ']',
             other => other,
         })
         .collect::<String>()
-        .to_lowercase()
+        .to_lowercase();
+
+    // 同一词性常有多种缩写写法，不统一就会把同一条释义存两次。
+    for (long, short) in [("adv.", "ad."), ("adj.", "a."), ("prep.", "pr.")] {
+        if let Some(rest) = collapsed.strip_prefix(long) {
+            return format!("{short}{rest}");
+        }
+    }
+    collapsed
 }
 
 #[cfg(test)]
@@ -71,8 +82,29 @@ mod tests {
 
     #[test]
     fn ignores_whitespace_and_fullwidth_punctuation_differences() {
-        let merged = merge_translations("n. 目的, 缘故", "n.目的，缘故");
-        assert_eq!(merged, "n. 目的, 缘故", "same sense, different spelling");
+        assert_eq!(
+            merge_translations("n. 目的, 缘故", "n.目的，缘故"),
+            "n. 目的, 缘故",
+            "same sense, different spelling"
+        );
+        assert_eq!(
+            merge_translations("[医] 库", "【医】 库"),
+            "[医] 库",
+            "same label, different brackets"
+        );
+    }
+
+    #[test]
+    fn treats_equivalent_pos_abbreviations_as_the_same_sense() {
+        assert_eq!(
+            merge_translations("adv. 公平地", "ad. 公平地"),
+            "adv. 公平地",
+            "ad. 就是 adv."
+        );
+        assert_eq!(
+            merge_translations("a. 公平的", "adj. 公平的"),
+            "a. 公平的"
+        );
     }
 
     #[test]

@@ -592,7 +592,8 @@ fn sense_rows(index: usize, label: &str, text: &str, width: usize) -> Vec<Vec<Sp
 }
 
 /// A fixed expression: `for the sake of  →  为了`.
-fn phrase_rows(phrase: &str, gloss: &str, width: usize) -> Vec<Vec<Span<'static>>> {    const INDENT: usize = 2;
+fn phrase_rows(phrase: &str, gloss: &str, width: usize) -> Vec<Vec<Span<'static>>> {
+    const INDENT: usize = 2;
     // Phrases are short but can be long; cap the column so the gloss still fits.
     let phrase_width = display_width(phrase).clamp(8, 26);
     let lead_width = INDENT + phrase_width;
@@ -600,18 +601,16 @@ fn phrase_rows(phrase: &str, gloss: &str, width: usize) -> Vec<Vec<Span<'static>
 
     let mut rows = Vec::new();
     if gloss.trim().is_empty() {
-        for (line_no, piece) in wrap(phrase, width.saturating_sub(INDENT).max(8))
+        // 只有搭配、没有释义时，整行留给搭配本身（词典里常见，比如朗道的「相关词组」）。
+        return wrap(phrase, width.saturating_sub(INDENT).max(8))
             .into_iter()
-            .enumerate()
-        {
-            let head = if line_no == 0 {
-                Span::styled(" ".repeat(INDENT), Style::default())
-            } else {
-                Span::styled(" ".repeat(INDENT), Style::default())
-            };
-            rows.push(vec![head, Span::styled(piece, theme::value())]);
-        }
-        return rows;
+            .map(|piece| {
+                vec![
+                    Span::styled(" ".repeat(INDENT), Style::default()),
+                    Span::styled(piece, theme::value()),
+                ]
+            })
+            .collect();
     }
 
     for (line_no, piece) in wrap(gloss, body).into_iter().enumerate() {
@@ -966,6 +965,19 @@ mod tests {
     fn truncate_respects_width() {
         let cut = truncate("abcdefghij", 5);
         assert_eq!(display_width(&cut), 5);
+    }
+
+    #[test]
+    fn a_phrase_without_a_gloss_still_renders_one_entry() {
+        // 词典抽出来的搭配只有词组、没有释义，不能渲染出空箭头。
+        let rows = phrase_rows("for God's sake", "", 60);
+        let text: Vec<String> = rows
+            .into_iter()
+            .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text.len(), 1);
+        assert!(text[0].contains("for God's sake"));
+        assert!(!text[0].contains("->"));
     }
 
     #[test]

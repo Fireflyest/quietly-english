@@ -94,7 +94,7 @@ impl Example {
 }
 
 /// 常用词组 / 固定搭配，例如 `for the sake of → 为了`。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Collocation {
     pub phrase: String,
     #[serde(default)]
@@ -392,6 +392,20 @@ impl ImportReport {
             }
         }
     }
+}
+
+/// 导入 StarDict 词典的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DictReport {
+    /// 新建的词条数。
+    pub inserted: u32,
+    /// 已存在、被覆盖或补全的词条数。
+    pub updated: u32,
+    /// 其中因为合并而真的多出义项的词条数；不带 `--merge` 时恒为 0。
+    ///
+    /// 这个数字是判断「这本词典值不值得叠」的唯一依据：如果叠完几乎不涨，
+    /// 说明它的内容已经被库里的词典覆盖了。
+    pub grown: u32,
 }
 
 /// 一次性导入到某个词书的计划，由解析层产出、存储层消费。

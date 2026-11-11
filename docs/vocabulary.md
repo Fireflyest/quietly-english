@@ -147,6 +147,27 @@ inspect,Engineers inspect the bridge every year.,工程师每年检查这座桥�
 ECDICT 本身没有搭配数据，`sake` 的「清酒」这类生僻义也不在它的条目里，所以搭配与补充义
 单独维护，导入时**只更新已有词条**，不会凭空造词。
 
+### 从词典里抽
+
+朗道英汉字典在词条末尾有 `相关词组:` 段，是编者列的固定搭配。`quietly dict ... --merge`
+（或不带 `--merge`）导入时会自动把它抽出来存进搭配字段，`sake` 就一次拿到 13 条：
+
+```
+│ sake  /seik/
+│ 1 n.   目的, 缘故, 理由
+│
+│ phrases
+│   for the sake of
+│   for God's sake
+│   art for art's sake
+│   ...
+```
+
+抽取只认显式标记（`相关词组:` / `相关短语:` / `[词组]`），不做任何推导；
+只有词组没有释义时，卡片就只显示词组本身，不画空的箭头。
+
+### 自备表格
+
 ```bash
 quietly phrases phrases.tsv
 ```
@@ -162,8 +183,11 @@ bank	bank on	指望，依赖
 - 逗号分隔同样可用，分隔符是探测出来的
 - 同一词的重复 `phrase` 会被忽略，可反复导入
 
-单条补录用 `/phrase`，语序是「词 空格 搭配 = 释义」：
+单条补录用 `quietly phrase` 或 `/phrase`，语序是「词 空格 搭配 = 释义」：
 
+```bash
+quietly phrase "sake for the sake of = 为了"
+```
 ```
 /phrase sake for the sake of = 为了
 ```

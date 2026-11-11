@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
-    Book, BookProgress, Collocation, DailyStats, Example, ImportPlan, ImportReport, Phase, Rating,
-    SessionLog, SrsCard, StudyCard, Word,
+    Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
+    Phase, Rating, SessionLog, SrsCard, StudyCard, Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -332,8 +332,43 @@ fn upsert_word_tx(
     Ok((id, existed.is_none()))
 }
 
-fn decode_word(row: &Row<'_>) -> rusqlite::Result<Word> {
-    let roots_raw: String = row.get(5)?;
+/// 把抽出来的搭配并进已有词条。词条不存在就跳过——导入词典不该凭空造词。
+fn add_collocations_tx(
+    tx: &Transaction<'_>,
+    lemma: &str,
+    phrases: &[Collocation],
+) -> Result<()> {
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT collocations FROM words WHERE lemma = ?1",
+            [lemma],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(()) };
+
+    let mut list: Vec<Collocation> = serde_json::from_str(&raw).unwrap_or_default();
+    let before = list.len();
+    for phrase in phrases {
+        if list
+            .iter()
+            .any(|existing| existing.phrase.eq_ignore_ascii_case(&phrase.phrase))
+        {
+            continue;
+        }
+        list.push(phrase.clone());
+    }
+    if list.len() == before {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+        params![serde_json::to_string(&list)?, lemma],
+    )?;
+    Ok(())
+}
+
+fn decode_word(row: &Row<'_>) -> rusqlite::Result<Word> {    let roots_raw: String = row.get(5)?;
     let examples_raw: String = row.get(6)?;
     let tags_raw: String = row.get(7)?;
     let collocations_raw: String = row.get(8)?;
@@ -1008,20 +1043,24 @@ impl Store for SqliteStore {
         path: &Path,
         merge: bool,
         progress: &mut dyn FnMut(u64),
-    ) -> Result<(u32, u32)> {
-        use crate::stardict::Stardict;
+    ) -> Result<DictReport> {
+        use crate::{collocations, merge as merge_mod, stardict::Stardict};
 
         let mut dict = Stardict::open(path)?;
         let tx = self.conn.transaction()?;
-        let mut inserted = 0u32;
-        let mut updated = 0u32;
+        let mut report = DictReport::default();
 
         dict.for_each_word(progress, |word| {
+            // 词条末尾的「相关词组」段属于搭配，不属于义项。必须先摘掉，
+            // 否则合并时这些行会被当成新义项追加进 `translation`。
+            let parts = collocations::split(&word.translation);
+
             // `merge` layers a second dictionary on top of the first: senses the
             // existing entry does not have are appended instead of replacing it.
             // Without it, importing 朗道 after ECDICT would wipe ECDICT's text.
-            let translation = if merge {
-                match tx
+            let mut translation = parts.senses.clone();
+            if merge {
+                if let Some(existing) = tx
                     .query_row(
                         "SELECT translation FROM words WHERE lemma = ?1",
                         [word.lemma.as_str()],
@@ -1029,14 +1068,15 @@ impl Store for SqliteStore {
                     )
                     .optional()?
                 {
-                    Some(existing) => crate::merge::merge_translations(&existing, &word.translation),
-                    None => word.translation.clone(),
+                    let merged = merge_mod::merge_translations(&existing, &translation);
+                    if merged != existing {
+                        report.grown += 1;
+                    }
+                    translation = merged;
                 }
-            } else {
-                word.translation.clone()
-            };
+            }
 
-            let (id, is_new) = upsert_word_tx(
+            let (_, is_new) = upsert_word_tx(
                 &tx,
                 &word.lemma,
                 word.phonetic.as_deref(),
@@ -1047,17 +1087,20 @@ impl Store for SqliteStore {
                 "[]",
                 "ecdict-stardict",
             )?;
-            let _ = id;
             if is_new {
-                inserted += 1;
+                report.inserted += 1;
             } else {
-                updated += 1;
+                report.updated += 1;
+            }
+
+            if !parts.phrases.is_empty() {
+                add_collocations_tx(&tx, &word.lemma, &parts.phrases)?;
             }
             Ok(())
         })?;
 
         tx.commit()?;
-        Ok((inserted, updated))
+        Ok(report)
     }
 
     fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)> {

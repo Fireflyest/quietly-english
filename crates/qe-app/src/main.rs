@@ -39,7 +39,15 @@ fn run() -> Result<()> {
                 let value = args.next().context("--db 需要一个路径")?;
                 db_override = Some(PathBuf::from(value));
             }
-            flag if flag.starts_with('-') => bail!("未知参数 {flag}（用 --help 查看用法）"),
+            flag if flag.starts_with('-') => {
+                // 子命令自带开关（如 `dict --merge`），交回给它们自己解析；
+                // 顶层出现未知开关才算用法错误。
+                if command.is_some() {
+                    rest.push(flag.to_string());
+                } else {
+                    bail!("未知参数 {flag}（用 --help 查看用法）");
+                }
+            }
             other => {
                 if command.is_none() {
                     command = Some(other.to_string());
@@ -89,12 +97,19 @@ fn run() -> Result<()> {
                 if merge { " (merging into existing senses)" } else { "" }
             );
             let started = std::time::Instant::now();
-            let (inserted, updated) =
+            let report =
                 store.import_stardict_with(std::path::Path::new(path), merge, &mut |count| {
                     eprintln!("  {count} entries …");
                 })?;
             println!(
-                "added {inserted} · updated {updated} · {:.1}s",
+                "added {} · updated {} · {}senses grown · {:.1}s",
+                report.inserted,
+                report.updated,
+                if merge {
+                    format!("{} ", report.grown)
+                } else {
+                    String::new()
+                },
                 started.elapsed().as_secs_f32()
             );
             println!("database: {}", store.path().display());
@@ -191,6 +206,38 @@ fn run() -> Result<()> {
         }
         Some("where") | Some("path") => {
             println!("{}", store.path().display());
+            Ok(())
+        }
+        Some("word") | Some("lookup") => {
+            // 一次性查看词条，专供核对导入 / 合并结果，不进 TUI。
+            let lemma = rest.first().context("用法：quietly word <lemma>")?;
+            let Some(word) = store.word(lemma)? else {
+                println!("没有收录 {lemma}");
+                return Ok(());
+            };
+            println!("{}  {}", word.lemma, word.phonetic.as_deref().unwrap_or(""));
+            for (index, sense) in word.senses().senses.iter().enumerate() {
+                println!("{}. {:<5} {}", index + 1, sense.pos, sense.text);
+            }
+            if let Some(forms) = &word.senses().forms {
+                println!("forms: {forms}");
+            }
+            for colloc in &word.collocations {
+                println!("phrase: {}  ->  {}", colloc.phrase, colloc.gloss);
+            }
+            for gloss in &word.glosses {
+                println!("gloss: {}", gloss.text);
+            }
+            for root in word.roots() {
+                println!("root: {:<8} {:<6} {}", root.part, root.kind.as_str(), root.gloss);
+            }
+            for example in &word.examples {
+                println!(
+                    "eg: {} — {}",
+                    example.en,
+                    example.zh.as_deref().unwrap_or("")
+                );
+            }
             Ok(())
         }
         Some("books") => {

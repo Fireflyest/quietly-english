@@ -43,8 +43,11 @@ quietly  CET-4 核心词                          due 8 · new 4/20 · streak 3
 ## 功能（单词模块）
 
 - **词书**：内置 CET-4 / CET-6 / TOEFL 试读词书，支持从 ECDICT、JSON、CSV、TXT 导入任意词书
-- **词根分解**：词库自带 `roots` 字段优先；缺失时用内置 400+ 词缀表自动推测（会标注“推测”）
+- **词根分解**：只认 Wiktionary 词源模板、词典条目或自备词根表，每段都带 `source`；
+  没有数据的词就不显示词根区块，**不推测、不生成**
+- **词组搭配**：从词典的 `相关词组:` 段抽取，或用 `quietly phrases` / `/phrase` 自己补
 - **例句**：每词最多 3 条例句（中英对照），可用 Tatoeba 等语料批量合并
+- **多义词**：按词性分行编号，带 `[医]` `[古]` 等标签的生僻义单独归组
 - **记忆曲线**：Anki 风格的学习步骤 + SM-2 难度因子，1/2/3/4 四档评价
 - **复习**：按到期时间排队，新词与复习交替出现，每日新词上限可调
 - **每日总结**：新学/复习/评价分布/专注时长/连续天数，未来 7 天复习压力
@@ -80,11 +83,12 @@ quietly examples cmn_sentences.tsv eng_sentences.tsv links.csv  # Tatoeba 中英
 | 数据 | 作用 | 来源 |
 | --- | --- | --- |
 | 词书 JSON | 考试大纲词汇，按文件名自动归入 `cet4`/`cet6`/`ky`/`toefl`/`ielts`/`gre` | [qwerty-learner](https://github.com/RealKai42/qwerty-learner)（MIT） |
-| StarDict | 查词覆盖，含音标与中英释义；加 `--merge` 可叠多本 | [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）· [huzheng](http://download.huzheng.org/zh_CN/) |
+| StarDict | 查词覆盖，含音标与中英释义；`--merge` 叠朗道可补 7.5% 的生僻义与搭配 | [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）· [huzheng](http://download.huzheng.org/zh_CN/) |
 | 词源 JSONL | 词根分解 + 出处，卡片显示 `source:` | [kaikki.org](https://kaikki.org/dictionary/English/)（CC BY-SA） |
 | 例句 TSV | 中英对照例句，每词最多 3 条 | [Tatoeba](https://tatoeba.org/en/downloads)（CC-BY 2.0 FR） |
 
 **词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，没有数据的词就不显示词根区块。
+**搭配也不靠统计猜**：只从词典里显式标出的 `相关词组:` 段或自备 TSV 读取。
 详细下载地址、体积和字段说明见 [docs/data-sources.md](docs/data-sources.md)。
 
 ### 其他格式
@@ -95,7 +99,9 @@ quietly import words.csv      # word,translation,phonetic,roots,example,example_
 quietly import examples.csv   # word,sentence,translation —— 只合并例句
 quietly import list.txt       # 一行一词，释义从已导入的词典里补
 quietly phrases words.tsv     # lemma,phrase,gloss —— 补常用词组/固定搭配
+quietly phrase "bank bank on = 指望"   # 单条补录搭配
 quietly etymology roots.tsv   # lemma/part/gloss/kind/source 五列，自备词根表
+quietly word inspect          # 不走 TUI，直接看一个词条
 ```
 
 格式细节与字段说明见 [docs/vocabulary.md](docs/vocabulary.md)。
@@ -151,7 +157,7 @@ graph LR
 | crate | 职责 |
 | --- | --- |
 | `qe-core` | 纯领域层：`Word`/`SrsCard` 等模型、`srs` 记忆曲线、`affix` 词缀表、`view` 视图模型、`Store` trait |
-| `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`stardict` 词典、`etymology` 词源、`tatoeba` 例句、`seed` 内置词书 |
+| `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`stardict` 词典、`collocations` 搭配抽取、`merge` 多词典合并、`etymology` 词源、`tatoeba` 例句、`seed` 内置词书 |
 | `qe-tui` | 只消费视图模型：`lines`（换行/排版）、`render`（帧布局）、`theme`、`terminal` |
 | `qe-app` | `Command` 解析、单行编辑器、`StudySession` 会话、`App` 状态机与事件循环 |
 

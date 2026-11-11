@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
-    Book, BookProgress, DailyStats, Example, ImportPlan, ImportReport, Rating, SessionLog, SrsCard,
-    StudyCard, Word,
+    Book, BookProgress, DailyStats, DictReport, Example, ImportPlan, ImportReport, Rating,
+    SessionLog, SrsCard, StudyCard, Word,
 };
 
 pub trait Store {
@@ -98,8 +98,7 @@ pub trait Store {
     ) -> Result<(u32, u32)>;
 
     /// 导入 StarDict 词典（ECDICT 的 `ecdict-stardict` 包），写入 `words` 表。
-    /// 返回 `(新增, 更新)`。
-    fn import_stardict(&mut self, path: &Path) -> Result<(u32, u32)> {
+    fn import_stardict(&mut self, path: &Path) -> Result<DictReport> {
         self.import_stardict_with(path, false, &mut |_| {})
     }
 
@@ -110,5 +109,5 @@ pub trait Store {
         path: &Path,
         merge: bool,
         progress: &mut dyn FnMut(u64),
-    ) -> Result<(u32, u32)>;
+    ) -> Result<DictReport>;
 }
