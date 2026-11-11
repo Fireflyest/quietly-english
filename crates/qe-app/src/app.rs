@@ -808,9 +808,11 @@ impl App {
         };
         let until = time::day_start(time::today()) + chrono::Duration::days(1);
         self.store.postpone(card.word.id, until)?;
-        if let Some(session) = self.session.as_mut() {
-            session.current = None;
-        }
+        // Take it out of the session the same way a skip does, so the `2/12` badge
+        // still lands on `12/12` at the end. A new word has no `cards` row yet, so
+        // the UPDATE above changed nothing — dropping it from the queue is the only
+        // thing that keeps it out of the rest of this session.
+        self.drop_current_ungraded();
         self.push(Message::tool(
             ToolView::new("bury")
                 .accent(Accent::Warn)
@@ -1388,17 +1390,31 @@ impl App {
                     session.review_done += 1;
                 }
             }
-        }
 
-        // A forgotten card comes back later in the same session, like Anki.
-        // Only on the first rating: re-picking 1-4 on the same card must not queue
-        // a second copy.
-        if first_time && rating == Rating::Again {
-            let requeued = StudyCard::review(card.word.clone(), after);
-            if let Some(session) = self.session.as_mut() {
+            // A forgotten card comes back later in the same session, like Anki.
+            // The queue must follow the *current* rating, not just the first one:
+            // changing 1 to 3 has to take the queued copy back out, otherwise the
+            // same word gets graded twice and the second pass runs off a stale
+            // snapshot of the card.
+            let has_copy = session
+                .queue
+                .iter()
+                .any(|queued| queued.word.id == card.word.id);
+            let wants_copy = rating == Rating::Again;
+            if wants_copy && !has_copy {
+                let requeued = StudyCard::review(card.word.clone(), after);
                 let at = 4.min(session.queue.len());
                 session.queue.insert(at, requeued);
                 session.review_total = session.review_total.saturating_add(1);
+            } else if !wants_copy && has_copy {
+                if let Some(position) = session
+                    .queue
+                    .iter()
+                    .position(|queued| queued.word.id == card.word.id)
+                {
+                    session.queue.remove(position);
+                    session.review_total = session.review_total.saturating_sub(1);
+                }
             }
         }
 
@@ -1751,6 +1767,25 @@ mod tests {
     }
 
     #[test]
+    fn regrading_from_again_to_good_does_not_leave_a_ghost_card() {
+        // Pressing 1 requeues the word so it comes back later in the session.
+        // Changing the answer to 3 afterwards must take that copy back out,
+        // otherwise the same word is graded twice.
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(1))).unwrap();
+        app.grade(Rating::Again).unwrap();
+        let requeued = app.session.as_ref().unwrap().queue.len();
+        assert_eq!(requeued, 1, "again requeues the word");
+
+        app.grade(Rating::Good).unwrap();
+        assert_eq!(
+            app.session.as_ref().unwrap().queue.len(),
+            0,
+            "the requeued copy must go away when the rating changes"
+        );
+    }
+
+    #[test]
     fn summary_and_session_log_written_on_exit() {
         let Harness { mut app, _dir } = harness();
         app.execute(Command::Study(Some(2))).unwrap();
@@ -2008,6 +2043,29 @@ mod tests {
             .messages
             .iter()
             .any(|m| matches!(&m.body, Body::Tool(t) if t.name == "bury")));
+    }
+
+    #[test]
+    fn burying_a_new_word_shrinks_the_session_instead_of_leaving_it_short() {
+        // A new word has no `cards` row, so postponing it writes nothing. It still
+        // has to leave the session's totals, or the badge stops at 2/3 forever.
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        app.bury_current().unwrap();
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(session.new_total, 2, "the buried word leaves the count");
+        assert_eq!(session.total(), session.done() as usize + 2, "badge stays reachable");
+
+        // Grade the rest and the session must consider itself complete.
+        for _ in 0..2 {
+            app.grade(Rating::Good).unwrap();
+            app.advance().unwrap();
+        }
+        assert!(
+            app.session.is_none(),
+            "grading every remaining card ends the session"
+        );
     }
 
     #[test]

@@ -58,6 +58,12 @@ pub fn split(text: &str) -> Split {
             continue;
         }
 
+        // 有的词条会重复写一次标记（一个词性一段搭配）；遇到就继续收集，
+        // 不要把 `相关词组:` 当成一条释义塞回去。
+        if is_marker(trimmed) {
+            continue;
+        }
+
         let candidate = clean_phrase(trimmed);
         if !looks_like_phrase(&candidate) {
             // 不是搭配的杂行，结束这一段，并把它留作释义。
@@ -220,6 +226,18 @@ mod tests {
     fn accepts_fullwidth_colon_and_bracket_form() {
         assert_eq!(phrases("相关词组：\n  bank on sb"), vec!["bank on sb"]);
         assert_eq!(phrases("[词组]\n  bank on sb"), vec!["bank on sb"]);
+    }
+
+    #[test]
+    fn a_repeated_marker_keeps_collecting() {
+        // 一个词性一段搭配时标记会出现两次；第二次不能被当成释义。
+        let text = "相关词组:\n  bank on sb\n相关词组:\n  bank with sb";
+        let result = split(text);
+        assert_eq!(
+            result.phrases.iter().map(|c| c.phrase.as_str()).collect::<Vec<_>>(),
+            vec!["bank on sb", "bank with sb"]
+        );
+        assert_eq!(result.senses, "", "the marker must not leak into senses");
     }
 
     #[test]
