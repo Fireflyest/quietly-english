@@ -256,7 +256,14 @@ fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
     out.push(rail_line(rail, 0, head));
 
     if let Some(result) = &tool.result {
-        out.extend(rail_text(result, width, rail, theme::bold()));
+        let mut rows = rail_text(result, width, rail, theme::bold());
+        if let Some(meta) = &tool.result_meta {
+            // Rides on the last line of the result so it stays on the headword row.
+            if let Some(last) = rows.last_mut() {
+                last.spans.push(Span::styled(format!("  {meta}"), theme::muted()));
+            }
+        }
+        out.extend(rows);
     }
 
     // Two columns when the terminal allows it: details on the left, examples on the
@@ -323,8 +330,21 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
     let inner = width.saturating_sub(RAIL_WIDTH).max(8);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
 
-    for line in lines {
-        match line {
+    let mut cursor = 0;
+    while cursor < lines.len() {
+        // Phrases are a set, not a list: gather the whole run so one column width
+        // fits all of them, which is what makes it read as a table.
+        if matches!(lines[cursor], ToolLine::Phrase { .. }) {
+            let mut entries: Vec<(&str, &str)> = Vec::new();
+            while let Some(ToolLine::Phrase { phrase, gloss }) = lines.get(cursor) {
+                entries.push((phrase.as_str(), gloss.as_str()));
+                cursor += 1;
+            }
+            rows.extend(phrase_table(&entries, inner));
+            continue;
+        }
+
+        match &lines[cursor] {
             ToolLine::Text(text) => {
                 for piece in wrap(text, inner) {
                     rows.push(vec![Span::styled(piece, palette.text)]);
@@ -346,8 +366,8 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
                 let key_width = 14.min(inner.saturating_sub(4));
                 let key_text = truncate(key, key_width);
                 let wrapped = wrap(value, inner.saturating_sub(key_width + 2).max(8));
-                for (index, piece) in wrapped.iter().enumerate() {
-                    let lead = if index == 0 {
+                for (i, piece) in wrapped.iter().enumerate() {
+                    let lead = if i == 0 {
                         pad_right(&key_text, key_width)
                     } else {
                         " ".repeat(key_width)
@@ -394,9 +414,7 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
             ToolLine::Sense { label, text } => {
                 rows.extend(sense_rows(label, text, inner));
             }
-            ToolLine::Phrase { phrase, gloss } => {
-                rows.extend(phrase_rows(phrase, gloss, inner));
-            }
+            ToolLine::Phrase { .. } => unreachable!("handled as a run above"),
             ToolLine::Gloss { text, tags } => {
                 rows.extend(gloss_rows(text, tags, inner));
             }
@@ -423,6 +441,7 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
             }
             ToolLine::Spacer => rows.push(Vec::new()),
         }
+        cursor += 1;
     }
 
     rows
@@ -568,8 +587,7 @@ fn example_rows(
 ///
 /// The label is the part of speech, or the bracketed domain tag (`[医]`) for a
 /// secondary sense.
-fn sense_rows(label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
-    // Wide enough for `[网络]`, narrow enough to leave room for the gloss.
+fn sense_rows(label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> {    // Wide enough for `[网络]`, narrow enough to leave room for the gloss.
     const LABEL_WIDTH: usize = 6;
     let lead = format!("{} ", pad_right(label, LABEL_WIDTH));
     let lead_width = display_width(&lead);
@@ -587,44 +605,98 @@ fn sense_rows(label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> 
     rows
 }
 
-/// A fixed expression: `for the sake of  →  为了`.
-fn phrase_rows(phrase: &str, gloss: &str, width: usize) -> Vec<Vec<Span<'static>>> {
-    const INDENT: usize = 2;
-    // Phrases are short but can be long; cap the column so the gloss still fits.
-    let phrase_width = display_width(phrase).clamp(8, 26);
-    let lead_width = INDENT + phrase_width;
-    let body = width.saturating_sub(lead_width + 4).max(8);
+/// Fixed expressions as a boxed two-column table.
+///
+/// ```text
+/// ┌─────────────────┬────────────────────────┐
+/// │ phrase          │ meaning                │
+/// ├─────────────────┼────────────────────────┤
+/// │ for the sake of │ 为了；为了……的缘故     │
+/// │ for God's sake  │ 看在上帝面上, 千万     │
+/// └─────────────────┴────────────────────────┘
+/// ```
+///
+/// The header names both columns, so the caller must not also print a `phrases`
+/// label above it. Box-drawing glyphs are single-width, so a full frame aligns
+/// cleanly; every row is padded to the same display width, which is what keeps
+/// the right wall straight when a cell holds CJK text.
+fn phrase_table(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>>> {
+    /// Space on each side of a cell's text.
+    const PAD: usize = 1;
+    /// Two inner walls + two outer walls + PAD on both sides of both cells.
+    const FRAME: usize = 4 + 4 * PAD;
 
-    let mut rows = Vec::new();
-    if gloss.trim().is_empty() {
-        // 只有搭配、没有释义时，整行留给搭配本身（词典里常见，比如朗道的「相关词组」）。
-        return wrap(phrase, width.saturating_sub(INDENT).max(8))
-            .into_iter()
-            .map(|piece| {
-                vec![
-                    Span::styled(" ".repeat(INDENT), Style::default()),
-                    Span::styled(piece, theme::value()),
-                ]
-            })
-            .collect();
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    if entries.is_empty() {
+        return rows;
     }
 
-    for (line_no, piece) in wrap(gloss, body).into_iter().enumerate() {
-        let head = if line_no == 0 {
-            Span::styled(
-                format!("{}{}", " ".repeat(INDENT), pad_right(phrase, phrase_width)),
-                theme::value(),
-            )
+    let usable = width.saturating_sub(FRAME).max(16);
+    let widest = entries
+        .iter()
+        .map(|(phrase, _)| display_width(phrase))
+        .max()
+        .unwrap_or(0);
+    // The phrase column hugs its longest entry but never takes more than half the
+    // table: the meaning is the part people actually read.
+    let phrase_width = widest.clamp(8, (usable / 2).max(8));
+
+    // Same idea on the other side: a table that spans the whole card for two short
+    // glosses reads as a stray box. Long glosses still wrap inside the available
+    // room.
+    let room = usable.saturating_sub(phrase_width).max(8);
+    let natural = entries
+        .iter()
+        .map(|(_, gloss)| display_width(gloss.trim()))
+        .max()
+        .unwrap_or(0)
+        .max("meaning".len());
+    let meaning_width = natural.clamp(8, room);
+
+    let rule = |left: char, mid: char, right: char| -> Vec<Span<'static>> {
+        vec![Span::styled(
+            format!(
+                "{left}{}{mid}{}{right}",
+                "─".repeat(phrase_width + 2 * PAD),
+                "─".repeat(meaning_width + 2 * PAD),
+            ),
+            theme::faint(),
+        )]
+    };
+
+    let cell = |key: &str, value: &str, key_style: Style, value_style: Style| {
+        vec![
+            Span::styled("│", theme::faint()),
+            Span::styled(" ".repeat(PAD), Style::default()),
+            Span::styled(pad_right(key, phrase_width), key_style),
+            Span::styled(" ".repeat(PAD), Style::default()),
+            Span::styled("│", theme::faint()),
+            Span::styled(" ".repeat(PAD), Style::default()),
+            Span::styled(pad_right(value, meaning_width), value_style),
+            Span::styled(" ".repeat(PAD), Style::default()),
+            Span::styled("│", theme::faint()),
+        ]
+    };
+
+    rows.push(rule('┌', '┬', '┐'));
+    rows.push(cell("phrase", "meaning", theme::label(), theme::label()));
+    rows.push(rule('├', '┼', '┤'));
+
+    for (phrase, gloss) in entries {
+        let left = wrap(phrase, phrase_width);
+        let right = if gloss.trim().is_empty() {
+            Vec::new()
         } else {
-            Span::styled(" ".repeat(lead_width), Style::default())
+            wrap(gloss, meaning_width)
         };
-        let arrow = if line_no == 0 { " -> " } else { "    " };
-        rows.push(vec![
-            head,
-            Span::styled(arrow, theme::faint()),
-            Span::styled(piece, theme::text()),
-        ]);
+        for line_no in 0..left.len().max(right.len()) {
+            let key = left.get(line_no).map(String::as_str).unwrap_or("");
+            let value = right.get(line_no).map(String::as_str).unwrap_or("");
+            rows.push(cell(key, value, theme::value(), theme::text()));
+        }
     }
+
+    rows.push(rule('└', '┴', '┘'));
     rows
 }
 
@@ -963,17 +1035,78 @@ mod tests {
         assert_eq!(display_width(&cut), 5);
     }
 
+    fn flatten(rows: Vec<Vec<Span<'static>>>) -> Vec<String> {
+        rows.into_iter()
+            .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
     #[test]
     fn a_phrase_without_a_gloss_still_renders_one_entry() {
-        // 词典抽出来的搭配只有词组、没有释义，不能渲染出空箭头。
-        let rows = phrase_rows("for God's sake", "", 60);
-        let text: Vec<String> = rows
-            .into_iter()
-            .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
+        // 词典抽出来的搭配只有词组、没有释义，不能渲染出箭头或空单元格。
+        let text = flatten(phrase_table(&[("for God's sake", "")], 60));
+        let row = text
+            .iter()
+            .find(|line| line.contains("for God's sake"))
+            .expect("the phrase gets a row");
+        assert!(!row.contains("->"), "an empty meaning draws no arrow: {row}");
+        assert!(
+            row.ends_with('│'),
+            "the empty cell is still framed: {row}"
+        );
+    }
+
+    #[test]
+    fn phrases_share_one_column_width() {
+        // 每行宽度一致才算表格；原来逐行按自己的词长对齐，列位置跳来跳去。
+        let text = flatten(phrase_table(
+            &[
+                ("for the sake of", "为了"),
+                ("for God's sake", "看在上帝面上"),
+                ("no matter how", ""),
+            ],
+            70,
+        ));
+        assert!(text[0].starts_with('┌'), "a box starts the table: {text:?}");
+        assert!(text[0].ends_with('┐'), "{text:?}");
+        assert!(text[1].contains("phrase") && text[1].contains("meaning"));
+        assert!(text[2].starts_with('├') && text[2].ends_with('┤'));
+        assert!(text.last().unwrap().starts_with('└'));
+
+        let column = |line: &str| line.find('为').or_else(|| line.find("看在"));
+        let a = column(&text[3]).expect("meaning column");
+        let b = column(&text[4]).expect("meaning column");
+        assert_eq!(a, b, "meanings line up: {text:?}");
+    }
+
+    #[test]
+    fn every_table_row_has_the_same_display_width() {
+        // 右墙歪了就是没对齐：CJK 是双宽，宽度必须按显示宽度算而不是字节数。
+        let rows = phrase_table(
+            &[
+                ("for the sake of", "为了；为了……的缘故"),
+                ("no matter how", ""),
+                (
+                    "a rather long phrase that must wrap",
+                    "这是一条很长的释义，用来确认换行之后表格依然对齐",
+                ),
+            ],
+            64,
+        );
+        let widths: Vec<usize> = rows
+            .iter()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| display_width(&span.content))
+                    .sum()
+            })
             .collect();
-        assert_eq!(text.len(), 1);
-        assert!(text[0].contains("for God's sake"));
-        assert!(!text[0].contains("->"));
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "ragged columns: {widths:?}"
+        );
+        assert!(widths[0] <= 64, "table overflows the card: {widths:?}");
     }
 
     #[test]

@@ -113,6 +113,9 @@ pub struct ToolView {
     pub badge: Option<String>,
     /// First line after `⎿`.
     pub result: Option<String>,
+    /// Secondary text on the result line, drawn grey: frequency stars, a word
+    /// count, anything that qualifies the result without being part of it.
+    pub result_meta: Option<String>,
     /// Indented detail lines.
     pub lines: Vec<ToolLine>,
     /// Optional right-hand column, rendered beside `lines` when the terminal is
@@ -127,6 +130,7 @@ impl ToolView {
             name: name.into(),
             badge: None,
             result: None,
+            result_meta: None,
             lines: Vec::new(),
             aside: Vec::new(),
             accent: Accent::Neutral,
@@ -198,20 +202,22 @@ impl ToolView {
             result.push_str("  ");
             result.push_str(phonetic);
         }
-        // Frequency belongs on the headword line: it describes the word as a
-        // whole, and sitting under the glosses it read as part of them.
-        if let Some(freq) = crate::text::freq(&word.translation) {
-            result.push_str("  ");
-            result.push_str(&crate::text::stars(freq));
-            if freq.oxford {
-                result.push_str(" oxford");
-            }
-        }
 
         let mut view = Self::new(state.name.clone())
             .badge(state.badge.clone())
             .accent(state.accent)
             .result(result);
+
+        // Frequency belongs next to the headword: it describes the word as a whole,
+        // and under the glosses it read as if it qualified the last one. Grey, so
+        // it sits behind the word itself.
+        if let Some(freq) = crate::text::freq(&word.translation) {
+            let mut meta = crate::text::stars(freq);
+            if freq.oxford {
+                meta.push_str(" oxford");
+            }
+            view.result_meta = Some(meta);
+        }
 
         if !state.revealed {
             for line in state.hint_lines() {
@@ -282,7 +288,9 @@ impl ToolView {
         }
 
         if !word.collocations.is_empty() {
-            view = view.spacer().muted("phrases".to_string());
+            // No `phrases` label here: the table names its own columns, and a label
+            // on top of a `phrase | meaning` header just says it twice.
+            view = view.spacer();
             for collocation in &word.collocations {
                 view = view.line(ToolLine::Phrase {
                     phrase: collocation.phrase.clone(),
@@ -791,8 +799,13 @@ mod tests {
         let view = ToolView::word_card(&state);
         let headline = view.result.clone().expect("headline");
         assert!(headline.contains("sake"), "{headline}");
-        assert!(headline.contains("★★★★★"), "stars on the headword: {headline}");
-        assert!(headline.contains("oxford"), "{headline}");
+        let meta = view.result_meta.clone().expect("frequency meta");
+        assert!(meta.contains("★★★★★"), "stars ride the headword: {meta}");
+        assert!(meta.contains("oxford"), "{meta}");
+        assert!(
+            !headline.contains('★'),
+            "the stars are meta, drawn grey and apart: {headline}"
+        );
 
         // And they must not linger in the body.
         assert!(
