@@ -91,19 +91,20 @@ quietly dict stardict-langdao-ec-gb.ifo --merge
 合并以**释义行**为单位：已有条目里没有的行追加到末尾，重复的行（忽略空格与
 全角标点差异）跳过。所以 AB 两本词典里都有的词，行数只增不减，顺序也不会变。
 
-可叠的 StarDict 词典（<http://download.huzheng.org/zh_CN/>，均为 StarDict 格式，
-解压后直接 `.ifo`）：
+可叠的 StarDict 词典（<http://download.huzheng.org/zh_CN/>，解压后取 `.ifo`，每本 3–9 MB）：
 
-| 文件 | 体积 | 内容 |
-| --- | --- | --- |
-| `stardict-langdao-ec-gb-2.4.2.tar.bz2` | 8.3 MB | 朗道英汉，义项较全 |
-| `stardict-21shijianji-ec-2.4.2.tar.bz2` | 8.0 MB | 21 世纪英汉，百科式释义 |
-| `stardict-oald-cn-2.4.2.tar.bz2` | 7.4 MB | 牛津高阶，含搭配与例句片段 |
-| `stardict-ProECCE-2.4.2.tar.bz2` | 8.2 MB | 专业计算机词汇 |
-| `stardict-xdict-ec-gb-2.4.2.tar.bz2` | 3.4 MB | 人教社 xdict，义项精简 |
+| 文件 | 内容 |
+| --- | --- |
+| `stardict-langdao-ec-gb-2.4.2.tar.bz2` | 朗道英汉，义项较全 |
+| `stardict-21shijishuangxiangcidian-2.4.2.tar.bz2` | 21 世纪英汉双解，百科式释义 |
+| `stardict-oald-cn-2.4.2.tar.bz2` | 牛津高阶英汉，含搭配与用法 |
+| `stardict-lazyworm-ec-2.4.2.tar.bz2` | 懒虫简明英汉 |
+| `stardict-xdict-ec-gb-2.4.2.tar.bz2` | 人教社 xdict 英汉，义项精简 |
+| `stardict-ProECCE-2.4.2.tar.bz2` | 英汉汉英专业词典（计算机方向） |
 
 > ⚠️ 这些词典多数是纸质词典的电子化转换，**版权状态不明**。仅作个人离线查词用，
 > 不要随应用分发。商用请换用有明确授权的语料。
+> 下载建议直接用浏览器，命令行 `curl` 很容易在 3 MB 左右断流。
 
 ### 中文翻译的其它来源，以及为什么没用
 
