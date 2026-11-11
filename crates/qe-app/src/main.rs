@@ -112,6 +112,12 @@ fn run() -> Result<()> {
                 },
                 started.elapsed().as_secs_f32()
             );
+            if report.phrases > 0 {
+                println!(
+                    "{} phrases extracted · {} translated",
+                    report.phrases, report.phrases_translated
+                );
+            }
             println!("database: {}", store.path().display());
             Ok(())
         }
@@ -153,12 +159,21 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("phrases") | Some("collocations") => {
+            // `quietly phrases --translate` 不给文件时就只补缺失的中文释义。
+            if rest.iter().any(|arg| arg == "--translate" || arg == "-t") {
+                let filled = store.resolve_collocation_glosses()?;
+                println!("{filled} phrases translated");
+                println!("database: {}", store.path().display());
+                return Ok(());
+            }
             let path = rest
                 .first()
-                .context("用法：quietly phrases <lemma,phrase,gloss.tsv>")?;
+                .context("用法：quietly phrases <lemma,phrase,gloss.tsv> | --translate")?;
             println!("reading phrases from {path} …");
             let (words, added) = store.import_phrases(std::path::Path::new(path))?;
             println!("{added} phrases added across {words} words");
+            let filled = store.resolve_collocation_glosses()?;
+            println!("{filled} phrases translated");
             println!("database: {}", store.path().display());
             Ok(())
         }

@@ -221,7 +221,20 @@ quietly phrase "sake for the sake of = 为了"
 
 ECDICT 的中文释义并不完整：`sake` 只有「目的, 缘故, 理由」，没有「清酒」。
 `quietly etymology` 在导入词根时会**顺带**收集 Wiktionary 的英文释义，
-存在 `glosses` 字段，卡片上以 `more meanings` 展示：
+存在 `glosses` 字段。
+
+这部分**默认折叠**，卡片上只留一行提示：
+
+```
+│ sake  /seik/
+│ 1 n.   目的, 缘故, 理由
+│
+│ more meanings · 5 · m
+│
+│ 1 again · 2 hard · 3 good · 4 easy · m more
+```
+
+按 `m` 展开当前这张卡（旧卡片保持各自的样子，不会被追溯改写）：
 
 ```
 │ sake  /seik/
@@ -231,10 +244,9 @@ ECDICT 的中文释义并不完整：`sake` 只有「目的, 缘故, 理由」�
 │   • Cause, interest or account.
 │   • Purpose or end; reason.
 │   • Rice wine; a drink made from filtered fermented rice.
-│
-│ phrases
-│   for the sake of   ->  为了；为了……的缘故
 ```
+
+`quietly word <lemma>` 这种显式查询则直接显示全部，不用按 `m`。
 
 几个细节：
 

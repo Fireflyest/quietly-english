@@ -314,6 +314,10 @@ impl App {
                     self.toggle_hint()?;
                     return Ok(());
                 }
+                KeyCode::Char('m') => {
+                    self.toggle_glosses();
+                    return Ok(());
+                }
                 KeyCode::Esc => {
                     return self.request_end_session();
                 }
@@ -441,14 +445,13 @@ impl App {
         };
         if let Some(word) = words.get(row_index) {
             let word = word.clone();
-            self.push(Message::tool(ToolView::word_card(
-                &CardState::new(word, "lookup").revealed(),
-            )));
+            self.push(Message::card(
+                CardState::new(word, "lookup").revealed().with_glosses(),
+            ));
         }
     }
 
-    fn scroll_by(&mut self, delta: i32) {
-        let next = self.scroll_back as i32 + delta;
+    fn scroll_by(&mut self, delta: i32) {        let next = self.scroll_back as i32 + delta;
         self.scroll_back = next.clamp(0, self.draw_info.max_back as i32) as u16;
         if self.scroll_back == 0 {
             self.unread = 0;
@@ -596,9 +599,9 @@ impl App {
             return false;
         };
         let _ = index;
-        self.push(Message::tool(ToolView::word_card(
-            &CardState::new(word, "lookup").revealed(),
-        )));
+        self.push(Message::card(
+            CardState::new(word, "lookup").revealed().with_glosses(),
+        ));
         true
     }
 
@@ -914,9 +917,9 @@ impl App {
     fn lookup(&mut self, text: &str) -> Result<()> {
         if !text.contains(char::is_whitespace) {
             if let Some(word) = self.store.word(text)? {
-                self.push(Message::tool(ToolView::word_card(
-                    &CardState::new(word, "lookup").revealed(),
-                )));
+                self.push(Message::card(
+                    CardState::new(word, "lookup").revealed().with_glosses(),
+                ));
                 return Ok(());
             }
         }
@@ -929,9 +932,11 @@ impl App {
                 Ok(())
             }
             1 => {
-                self.push(Message::tool(ToolView::word_card(
-                    &CardState::new(hits[0].clone(), "lookup").revealed(),
-                )));
+                self.push(Message::card(
+                    CardState::new(hits[0].clone(), "lookup")
+                        .revealed()
+                        .with_glosses(),
+                ));
                 Ok(())
             }
             _ => {
@@ -1218,7 +1223,7 @@ impl App {
             ));
         }
 
-        let message = Message::tool(ToolView::word_card(&state));
+        let message = Message::card(state);
         match session.card_msg {
             Some(index) if index < self.messages.len() => self.messages[index] = message,
             _ => {
@@ -1243,6 +1248,36 @@ impl App {
         self.render_card()?;
         self.scroll_back = 0;
         Ok(())
+    }
+
+    /// Fold or unfold the `more meanings` block on every card at once.
+    ///
+    /// The Wiktionary glosses are English and often five or six lines; they push
+    /// the Chinese senses off a short terminal, so they start folded.
+    fn toggle_glosses(&mut self) {
+        // Only the card the reader is looking at. A study card is tracked by
+        // `card_msg`; outside a session the newest card is the one on screen.
+        let target = self
+            .session
+            .as_ref()
+            .and_then(|session| session.card_msg)
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .rposition(|message| message.card_state().is_some())
+            });
+        let Some(index) = target else {
+            return;
+        };
+        let Some(state) = self.messages[index].card_state_mut() else {
+            return;
+        };
+        state.expand_glosses = !state.expand_glosses;
+        self.status = if state.expand_glosses {
+            "more meanings: shown".to_string()
+        } else {
+            "more meanings: hidden".to_string()
+        };
     }
 
     fn toggle_hint(&mut self) -> Result<()> {
@@ -1619,10 +1654,7 @@ mod tests {
     }
 
     fn card_count(app: &App) -> usize {
-        app.messages
-            .iter()
-            .filter(|m| matches!(&m.body, Body::Tool(t) if t.name == "word"))
-            .count()
+        app.messages.iter().filter(|m| m.card_state().is_some()).count()
     }
 
     #[test]
@@ -1675,6 +1707,39 @@ mod tests {
     }
 
     #[test]
+    fn m_unfolds_only_the_card_in_front() {
+        let Harness { mut app, _dir } = harness();
+        app.lookup("inspect").unwrap();
+        let lookup_card = app
+            .messages
+            .iter()
+            .rposition(|message| message.card_state().is_some())
+            .expect("the lookup pushed a card");
+        app.execute(Command::Study(Some(1))).unwrap();
+        app.advance().unwrap();
+
+        let expanded = |app: &App, index: usize| {
+            app.messages[index]
+                .card_state()
+                .expect("a card message")
+                .expand_glosses
+        };
+        let study_card = app.session.as_ref().unwrap().card_msg.unwrap();
+        assert!(expanded(&app, lookup_card), "a lookup shows everything");
+        assert!(!expanded(&app, study_card), "a study card starts folded");
+
+        app.toggle_glosses();
+        assert_eq!(app.session.as_ref().unwrap().card_msg, Some(study_card));
+        assert!(expanded(&app, study_card), "m opens the current card");
+
+        // The second press closes only that card; the older lookup keeps its
+        // own expanded state, so the key never rewrites history.
+        app.toggle_glosses();
+        assert!(!expanded(&app, study_card));
+        assert!(expanded(&app, lookup_card));
+    }
+
+    #[test]
     fn enter_after_grading_advances() {
         let Harness { mut app, _dir } = harness();
         app.execute(Command::Study(Some(3))).unwrap();
@@ -1702,10 +1767,10 @@ mod tests {
     fn lookup_and_root_commands_produce_tool_blocks() {
         let Harness { mut app, _dir } = harness();
         app.lookup("inspect").unwrap();
-        assert!(app
-            .messages
-            .iter()
-            .any(|m| matches!(&m.body, Body::Tool(t) if t.name == "word")));
+        assert!(
+            app.messages.iter().any(|m| m.card_state().is_some()),
+            "lookup renders a word card"
+        );
 
         app.show_root("spect").unwrap();
         assert!(app

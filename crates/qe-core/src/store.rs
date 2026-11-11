@@ -82,6 +82,11 @@ pub trait Store {
     fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)>;
     /// 给一个词追加一条搭配；词不存在时返回 `false`。
     fn add_collocation(&mut self, lemma: &str, phrase: &str, gloss: &str) -> Result<bool>;
+    /// 给缺释义的搭配补中文：直接在 `words` 里查该搭配自己的条目。
+    ///
+    /// 从词典抽出来的搭配只有英文（`相关词组:` 段不带翻译），但 `for the sake of`
+    /// 这类短语在 ECDICT 里本身就是词条，查一下就拿到了。返回补上的条数。
+    fn resolve_collocation_glosses(&mut self) -> Result<u32>;
     /// 按文件后缀与表头自动选择导入器（ECDICT / JSON / CSV / TXT）。
     fn import_file(&mut self, path: &Path) -> Result<ImportReport>;
     /// 导入有出处的词源数据（kaikki/Wiktionary JSONL 或 TSV），只更新已有词条。

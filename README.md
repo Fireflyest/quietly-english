@@ -137,6 +137,8 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 
 - `1`~`4` 评分（`1` 忘记会在这轮稍后重现），`enter`/`space` 下一张
 - `tab` 只显示词根提示；`esc` 需按两次才会结束会话
+- `m` 折叠 / 展开**当前这张卡**的 `more meanings`（Wiktionary 的英文释义默认收起，
+  卡片上只留一行 `more meanings · 5 · m`）；已经翻过去的旧卡片不受影响
 - 底部状态栏显示「还剩 N 新词 / M 复习」
 - 往回翻时新输出不会把你拽回底部，状态栏提示 `↓ N new · end to jump`
 - 中途 `ctrl+c` 退出会先确认，并把已用时间写入日志

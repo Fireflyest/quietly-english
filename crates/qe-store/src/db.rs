@@ -368,6 +368,56 @@ fn add_collocations_tx(
     Ok(())
 }
 
+/// 查一个短语自己的词条，取出中文释义。
+///
+/// 只取第一条常用义，去掉词性缩写和方括号标签——卡片上的搭配行空间很小，
+/// 放一整段多义项会挤成一坨。找不到就返回 `None`。
+fn lookup_phrase_tx(tx: &Transaction<'_>, phrase: &str) -> Result<Option<String>> {
+    let key = phrase.trim().to_lowercase();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT translation FROM words WHERE lemma = ?1",
+            [key.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+
+    let parsed = qe_core::text::parse_senses(&raw);
+    let Some(sense) = parsed
+        .senses
+        .iter()
+        .find(|sense| sense.label.is_empty() && !sense.text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let text = strip_pos_prefix(sense.text.trim());
+    // 太长的不适合塞进搭配行，宁可留空。
+    if text.is_empty() || text.chars().count() > 40 {
+        return Ok(None);
+    }
+    Ok(Some(text.to_string()))
+}
+
+/// 有些冷僻词性缩写（`na.`、`phr.`）不在 `POS_TABLE` 里，会跟着释义一起留下。
+/// 搭配行只有一个字段，剥掉开头的 `<字母>.` 更干净。
+fn strip_pos_prefix(text: &str) -> &str {
+    let Some((head, rest)) = text.split_once(' ') else {
+        return text;
+    };
+    let is_pos = head.ends_with('.')
+        && head.len() <= 6
+        && head[..head.len() - 1].chars().all(|ch| ch.is_ascii_alphabetic());
+    if is_pos {
+        rest.trim()
+    } else {
+        text
+    }
+}
+
 fn decode_word(row: &Row<'_>) -> rusqlite::Result<Word> {    let roots_raw: String = row.get(5)?;
     let examples_raw: String = row.get(6)?;
     let tags_raw: String = row.get(7)?;
@@ -1094,13 +1144,71 @@ impl Store for SqliteStore {
             }
 
             if !parts.phrases.is_empty() {
+                report.phrases += parts.phrases.len() as u32;
                 add_collocations_tx(&tx, &word.lemma, &parts.phrases)?;
             }
             Ok(())
         })?;
 
         tx.commit()?;
+
+        // 搭配只有英文，趁词条都在库里补上中文（`for the sake of` 本身就是词条）。
+        if report.phrases > 0 {
+            report.phrases_translated = self.resolve_collocation_glosses()?;
+        }
         Ok(report)
+    }
+
+    fn resolve_collocation_glosses(&mut self) -> Result<u32> {
+        // 从词典抽出来的搭配只有英文，但短语本身往往就是词条：
+        // `for the sake of` / `bank on` 在 ECDICT 里都有中文释义。
+        // 一遍扫全表；有改动的行才写回。
+        let pending: Vec<(String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT lemma, collocations FROM words WHERE collocations != '[]'")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+
+        let tx = self.conn.transaction()?;
+        let mut filled = 0u32;
+        for (lemma, raw) in pending {
+            let mut list: Vec<Collocation> = serde_json::from_str(&raw).unwrap_or_default();
+            let mut changed = false;
+            for colloc in list.iter_mut() {
+                // 已有的释义也可能带着漏网的词性缩写，顺手清一遍。
+                let trimmed = colloc.gloss.trim().to_string();
+                let cleaned = strip_pos_prefix(&trimmed).to_string();
+                if cleaned != colloc.gloss {
+                    colloc.gloss = cleaned;
+                    changed = true;
+                }
+                if !colloc.gloss.trim().is_empty() {
+                    continue;
+                }
+                let Some(gloss) = lookup_phrase_tx(&tx, &colloc.phrase)? else {
+                    continue;
+                };
+                colloc.gloss = gloss;
+                filled += 1;
+                changed = true;
+            }
+            if changed {
+                tx.execute(
+                    "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+                    params![serde_json::to_string(&list)?, lemma],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(filled)
     }
 
     fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)> {

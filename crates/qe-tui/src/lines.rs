@@ -139,6 +139,7 @@ pub fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
             Role::System => body("  ", text, theme::muted(), theme::dim(), width),
         },
         Body::Tool(tool) => tool_lines(tool, width),
+        Body::Card(state) => tool_lines(&ToolView::word_card(state), width),
         Body::Table(table) => table_lines(table, width),
     }
 }
@@ -1013,5 +1014,26 @@ mod tests {
         assert_eq!(user[0], "› hello");
         let agent = flat(&message_lines(&Message::agent("ok"), 80));
         assert_eq!(agent[0], "│ ok");
+    }
+
+    #[test]
+    fn a_card_message_renders_through_the_rail() {
+        // Cards are stored as state and painted on demand, which is what lets
+        // `m` fold or unfold every one of them at once.
+        let mut word = qe_core::model::Word::new("sake", "n. 目的");
+        word.glosses = vec![qe_core::text::Gloss::new("Rice wine.")];
+        let state = qe_core::view::CardState::new(word, "1/9").revealed();
+
+        let text = flat(&message_lines(&Message::card(state.clone()), 80));
+        assert!(text[0].starts_with('│'));
+        assert!(
+            text.iter().any(|line| line.contains("more meanings · 1 · m")),
+            "folded by default: {text:?}"
+        );
+
+        let mut open = state;
+        open.expand_glosses = true;
+        let text = flat(&message_lines(&Message::card(open), 80));
+        assert!(text.iter().any(|line| line.contains("Rice wine.")));
     }
 }

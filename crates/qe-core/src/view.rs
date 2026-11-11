@@ -62,6 +62,30 @@ impl Message {
         }
     }
 
+    /// A word card. Stored as state so the whole transcript can be re-rendered
+    /// when the gloss fold setting changes.
+    pub fn card(state: CardState) -> Self {
+        Self {
+            role: Role::Agent,
+            body: Body::Card(Box::new(state)),
+        }
+    }
+
+    /// The card state behind this message, when it is one.
+    pub fn card_state(&self) -> Option<&CardState> {
+        match &self.body {
+            Body::Card(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub fn card_state_mut(&mut self) -> Option<&mut CardState> {
+        match &mut self.body {
+            Body::Card(state) => Some(state),
+            _ => None,
+        }
+    }
+
     pub fn table(view: TableView) -> Self {
         Self {
             role: Role::Agent,
@@ -74,6 +98,9 @@ impl Message {
 pub enum Body {
     Text(String),
     Tool(Box<ToolView>),
+    /// A word card kept as state, not pixels, so `m` can fold or unfold every
+    /// card already on screen without the app remembering what it drew.
+    Card(Box<CardState>),
     Table(Box<TableView>),
 }
 
@@ -224,13 +251,22 @@ impl ToolView {
 
         // Wiktionary's English glosses fill in what ECDICT lacks: `sake` has no
         // "Japanese rice wine" in the Chinese source, so it shows up here.
+        // Folded by default — it is supporting detail, and up to six lines of it
+        // would push the Chinese senses off the screen.
         if !word.glosses.is_empty() {
-            view = view.spacer().muted("more meanings".to_string());
-            for gloss in &word.glosses {
-                view = view.line(ToolLine::Gloss {
-                    text: gloss.text.clone(),
-                    tags: gloss.tags.clone(),
-                });
+            if state.expand_glosses {
+                view = view.spacer().muted("more meanings".to_string());
+                for gloss in &word.glosses {
+                    view = view.line(ToolLine::Gloss {
+                        text: gloss.text.clone(),
+                        tags: gloss.tags.clone(),
+                    });
+                }
+            } else {
+                view = view.spacer().muted(format!(
+                    "more meanings · {} · m",
+                    word.glosses.len()
+                ));
             }
         }
 
@@ -348,6 +384,11 @@ pub struct CardState {
     pub footer: Option<String>,
     /// Rail colour: new cards vs review cards.
     pub accent: Accent,
+    /// Show every Wiktionary gloss instead of a one-line count.
+    ///
+    /// The English glosses are a nice-to-have next to the Chinese senses, so they
+    /// stay folded until asked for; `m` flips this on every card at once.
+    pub expand_glosses: bool,
 }
 
 impl CardState {
@@ -362,6 +403,7 @@ impl CardState {
             show_ratings: false,
             footer: None,
             accent: Accent::Neutral,
+            expand_glosses: false,
         }
     }
 
@@ -373,6 +415,13 @@ impl CardState {
     pub fn revealed(mut self) -> Self {
         self.revealed = true;
         self.show_ratings = true;
+        self
+    }
+
+    /// Show the Wiktionary glosses right away. Lookup is an explicit "tell me
+    /// everything" so it opts in; the study card stays folded.
+    pub fn with_glosses(mut self) -> Self {
+        self.expand_glosses = true;
         self
     }
 
@@ -442,7 +491,16 @@ impl CardState {
         if self.graded.is_some() {
             "enter/s to continue".to_string()
         } else if self.revealed {
-            "1 again · 2 hard · 3 good · 4 easy".to_string()
+            let mut line = "1 again · 2 hard · 3 good · 4 easy".to_string();
+            // Only advertise the fold when there is something folded.
+            if !self.word.glosses.is_empty() {
+                line.push_str(if self.expand_glosses {
+                    " · m fold"
+                } else {
+                    " · m more"
+                });
+            }
+            line
         } else {
             "1-4 to grade · tab for a hint · space to peek".to_string()
         }
@@ -869,5 +927,67 @@ mod tests {
             line,
             ToolLine::Muted(text) if text.contains("no etymology")
         )));
+    }
+
+    fn gloss_texts(view: &ToolView) -> Vec<String> {
+        view.lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Gloss { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn muted_texts(view: &ToolView) -> Vec<String> {
+        view.lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Muted(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn word_with_glosses() -> crate::model::Word {
+        let mut word = crate::model::Word::new("sake", "n. 目的, 缘故");
+        word.glosses = ["Cause, interest or account.", "Rice wine."]
+            .iter()
+            .map(|text| crate::text::Gloss::new(*text))
+            .collect();
+        word
+    }
+
+    #[test]
+    fn more_meanings_are_folded_by_default() {
+        // Six lines of English glosses push the Chinese senses off a short
+        // terminal, so the card asks first.
+        let view = ToolView::word_card(&CardState::new(word_with_glosses(), "1/9").revealed());
+        assert!(gloss_texts(&view).is_empty(), "glosses stay hidden");
+        assert!(
+            muted_texts(&view)
+                .iter()
+                .any(|text| text.contains("more meanings · 2 · m")),
+            "the fold advertises its size and the key that opens it"
+        );
+    }
+
+    #[test]
+    fn pressing_m_unfolds_the_glosses() {
+        let mut state = CardState::new(word_with_glosses(), "1/9").revealed();
+        state.expand_glosses = true;
+        let view = ToolView::word_card(&state);
+        assert_eq!(gloss_texts(&view).len(), 2);
+        assert!(!muted_texts(&view).iter().any(|t| t.contains("more meanings ·")));
+    }
+
+    #[test]
+    fn lookup_opens_with_the_glosses_already_shown() {
+        let view = ToolView::word_card(&CardState::new(word_with_glosses(), "lookup").revealed().with_glosses());
+        assert_eq!(
+            gloss_texts(&view).len(),
+            2,
+            "an explicit lookup shows everything"
+        );
     }
 }
