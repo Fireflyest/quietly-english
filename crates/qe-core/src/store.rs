@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
-    Book, BookProgress, DailyStats, DictReport, Example, ImportPlan, ImportReport, Rating,
-    SessionLog, SrsCard, StudyCard, Word,
+    Book, BookProgress, DailyStats, DictReport, Example, ImportPlan, ImportReport, Quiz, Rating,
+    ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
 };
 
 pub trait Store {
@@ -63,6 +63,41 @@ pub trait Store {
     fn search(&self, needle: &str, limit: usize) -> Result<Vec<Word>>;
     /// 所有词书里出现过的词（小写），用于给例句挑选候选。
     fn deck_lemmas(&self) -> Result<Vec<String>>;
+
+    // ---- 阅读 ----
+    /// 保存（或更新）一篇文章，按标题去重。返回文本 id。
+    fn save_text(&mut self, text: &crate::reading::Text) -> Result<i64>;
+    /// 列出所有已导入的文本，最近导入的在前。
+    fn texts(&self) -> Result<Vec<crate::reading::Text>>;
+    /// 按标题取文本（不区分大小写）。
+    fn text_by_title(&self, title: &str) -> Result<Option<crate::reading::Text>>;
+    /// 删除一篇文章及其进度、标注、测验。
+    fn delete_text(&mut self, id: i64) -> Result<()>;
+    /// 上次读到哪一段、用的哪种模式。
+    fn reading_progress(&self, text_id: i64) -> Result<Option<(usize, crate::reading::ReadMode)>>;
+    /// 记住进度。
+    fn save_reading_progress(
+        &mut self,
+        text_id: i64,
+        paragraph: usize,
+        mode: crate::reading::ReadMode,
+    ) -> Result<()>;
+    /// 用户标记过哪些词（`text_id = 0` 表示不限文章）。
+    fn reading_marks(&self, text_id: i64) -> Result<Vec<String>>;
+    /// 标记一个词；已存在返回 `false`。
+    fn add_reading_mark(&mut self, text_id: i64, lemma: &str, paragraph: usize) -> Result<bool>;
+    /// 取消标记；不存在返回 `false`。
+    fn remove_reading_mark(&mut self, text_id: i64, lemma: &str) -> Result<bool>;
+    /// 写一条阅读日志（结束阅读时调用）。
+    fn record_reading(&mut self, log: &ReadingLog) -> Result<()>;
+    /// 当天的阅读统计。
+    fn daily_reading(&self, day: NaiveDate) -> Result<ReadingStats>;
+    /// 某篇文章的测验题。
+    fn quizzes(&self, text_id: i64) -> Result<Vec<Quiz>>;
+    /// 写入测验题（按 `(text_id, paragraph, prompt)` 去重）。返回新增条数。
+    fn add_quiz(&mut self, quiz: &Quiz) -> Result<bool>;
+    /// 记录一次作答。
+    fn record_attempt(&mut self, quiz_id: i64, correct: bool) -> Result<()>;
 
     // ---- 统计 ----
     fn daily(&self, day: NaiveDate) -> Result<DailyStats>;

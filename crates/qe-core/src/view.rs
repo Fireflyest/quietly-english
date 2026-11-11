@@ -4,7 +4,17 @@
 //! The look is deliberately modelled on a command-line agent: `⏺ name` followed by
 //! `⎿ result`, with indented detail lines and no big borders.
 
-use crate::model::{DailyStats, Example, Rating, Word};
+use crate::model::{DailyStats, Example, Quiz, Rating, ReadingStats, Word};
+
+/// 一个可以按序号打开的候选词（精读模式下段落里的词）。
+#[derive(Debug, Clone, Default)]
+pub struct Candidate {
+    pub lemma: String,
+    /// 词性与中文释义；查不到词条时为空。
+    pub gloss: String,
+    /// 是否已经被读者标记。
+    pub marked: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -189,6 +199,158 @@ impl ToolView {
     pub fn spacer(mut self) -> Self {
         self.lines.push(ToolLine::Spacer);
         self
+    }
+
+    /// 阅读卡片：原文（已标记的词高亮）+ 可选译文 + 可选的候选词列表。
+    ///
+    /// 全篇模式一次给出全部段落；精读模式只给当前段，并带上译文与候选项。
+    pub fn reading_card(
+        session: &crate::reading::ReadingSession,
+        candidates: &[Candidate],
+    ) -> Self {
+        let text = &session.text;
+        let mut badge = format!("{} · {}", session.mode.label(), session.progress());
+        if session.mode == crate::reading::ReadMode::Intensive {
+            badge = format!(
+                "{} · {}/{}",
+                session.mode.label(),
+                session.paragraph + 1,
+                session.total()
+            );
+        }
+        let mut view = Self::new("read")
+            .badge(badge)
+            .accent(Accent::Note)
+            .result(text.title.clone());
+
+        let marked: Vec<String> = session.marked.iter().map(|m| m.lemma.clone()).collect();
+        let is_marked = |word: &str| marked.iter().any(|lemma| lemma == word);
+
+        match session.mode {
+            crate::reading::ReadMode::Full => {
+                // 全篇：连续输出，靠终端滚动阅读。段落之间空一行。
+                for (index, paragraph) in text.paragraphs().iter().enumerate() {
+                    if index > 0 {
+                        view = view.spacer();
+                    }
+                    view = view.line(ToolLine::Marked {
+                        segments: crate::reading::highlight_segments(paragraph, is_marked),
+                    });
+                }
+            }
+            crate::reading::ReadMode::Intensive => {
+                if let Some(paragraph) = session.current() {
+                    view = view.line(ToolLine::Marked {
+                        segments: crate::reading::highlight_segments(paragraph, is_marked),
+                    });
+                }
+                if let Some(translation) = session.current_translation() {
+                    view = view.spacer().muted("translation".to_string());
+                    for line in translation.lines() {
+                        // 缩进与原文对齐，读起来像同一段的两种语言。
+                        view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                    }
+                }
+                if !candidates.is_empty() {
+                    view = view.spacer().muted(format!(
+                        "words · {} marked · m <word> to mark any",
+                        session.marked.len()
+                    ));
+                    for (index, candidate) in candidates.iter().enumerate() {
+                        view = view.line(ToolLine::Pick {
+                            index: index + 1,
+                            lemma: candidate.lemma.clone(),
+                            gloss: candidate.gloss.clone(),
+                            marked: candidate.marked,
+                        });
+                    }
+                }
+            }
+        }
+
+        view
+    }
+
+    /// 阅读结束时的统计块。
+    pub fn reading_summary(
+        text: &str,
+        paragraphs: u32,
+        opened: u32,
+        added: u32,
+        marked: &[String],
+        seconds: u32,
+    ) -> Self {
+        let mut view = Self::new("read")
+            .badge("done".to_string())
+            .accent(Accent::Success)
+            .result(text.to_string());
+        view = view.kv(
+            "read",
+            format!("{paragraphs} paragraphs · {} min", (seconds + 30) / 60),
+        );
+        view = view.kv("opened", format!("{opened} words"));
+        view = view.kv("added", format!("{added} to deck"));
+        if !marked.is_empty() {
+            view = view.kv("marked", marked.join(", "));
+        }
+        view
+    }
+
+    /// 每日阅读统计，供 `/summary` 与 `quietly stats` 使用。
+    pub fn reading_stats(stats: &ReadingStats) -> Self {
+        let mut view = Self::new("reading")
+            .badge("today".to_string())
+            .accent(Accent::Note)
+            .result(format!(
+                "{} paragraphs · {} min",
+                stats.paragraphs,
+                stats.minutes()
+            ));
+        if stats.texts > 0 {
+            view = view.kv("texts", format!("{}", stats.texts));
+        }
+        if stats.words_opened > 0 {
+            view = view.kv(
+                "words",
+                format!("{} opened · {} added", stats.words_opened, stats.words_added),
+            );
+        }
+        if stats.quizzes > 0 {
+            view = view.kv(
+                "quiz",
+                format!("{}/{} correct", stats.correct, stats.quizzes),
+            );
+        }
+        view
+    }
+
+    /// 一道测验题。选择题把选项列出来，填空题只给题干。
+    pub fn quiz_card(quiz: &Quiz, index: usize, total: usize, answered: Option<bool>) -> Self {
+        let mut view = Self::new("quiz")
+            .badge(format!("{}/{}", index + 1, total))
+            .accent(match answered {
+                Some(true) => Accent::Success,
+                Some(false) => Accent::Danger,
+                None => Accent::Info,
+            })
+            .result(quiz.prompt.clone());
+        if quiz.is_choice() {
+            for (i, choice) in quiz.choices.iter().enumerate() {
+                view = view.line(ToolLine::Kv {
+                    key: format!("{})", i + 1),
+                    value: choice.clone(),
+                });
+            }
+        }
+        view = view.muted(format!("source: {}", quiz.source));
+        if let Some(correct) = answered {
+            view = view.muted(if correct {
+                format!("correct · {}", quiz.answer)
+            } else {
+                format!("answer: {}", quiz.answer)
+            });
+        }
+        view
     }
 
     /// A word block used by both study and lookup.
@@ -536,6 +698,16 @@ pub enum ToolLine {
         /// Part of speech (`n.`) or a bracketed domain tag (`[医]`).
         label: String,
         text: String,
+    },
+    /// A reading paragraph. `true` marks a word the reader flagged, so it is drawn
+    /// in the accent colour inside otherwise plain prose.
+    Marked { segments: Vec<(String, bool)> },
+    /// One word from the current paragraph, selectable by its number.
+    Pick {
+        index: usize,
+        lemma: String,
+        gloss: String,
+        marked: bool,
     },
     /// A fixed expression: `for the sake of → 为了`.
     Phrase { phrase: String, gloss: String },

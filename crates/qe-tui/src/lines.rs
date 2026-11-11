@@ -414,6 +414,17 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
             ToolLine::Sense { label, text } => {
                 rows.extend(sense_rows(label, text, inner));
             }
+            ToolLine::Marked { segments } => {
+                rows.extend(marked_rows(segments, inner));
+            }
+            ToolLine::Pick {
+                index,
+                lemma,
+                gloss,
+                marked,
+            } => {
+                rows.extend(pick_rows(*index, lemma, gloss, *marked, inner));
+            }
             ToolLine::Phrase { .. } => unreachable!("handled as a run above"),
             ToolLine::Gloss { text, tags } => {
                 rows.extend(gloss_rows(text, tags, inner));
@@ -700,9 +711,84 @@ fn phrase_table(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>
     rows
 }
 
+/// 阅读段落：普通文字用正文色，读者标记过的词用强调色并加底部标记。
+///
+/// 复用 `wrap_spans` 做换行，因为它已经能按词边界断行并保留逐段样式。
+fn marked_rows(segments: &[(String, bool)], width: usize) -> Vec<Vec<Span<'static>>> {
+    const INDENT: usize = 2;
+
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(INDENT), Style::default())];
+    for (text, marked) in segments {
+        let style = if *marked {
+            theme::mark()
+        } else {
+            theme::text()
+        };
+        spans.push(Span::styled(text.clone(), style));
+    }
+    // 换行后缩进与首行对齐，读起来像一段引文。
+    wrap_spans(&spans, width)
+        .into_iter()
+        .map(|row| {
+            let mut out = row;
+            if out.is_empty() {
+                out = vec![Span::styled(" ".repeat(INDENT), Style::default())];
+            }
+            out
+        })
+        .collect()
+}
+
+/// 候选词行：`1 tyranny   n. 专制, 暴政   ●`（● 表示已标记）。
+fn pick_rows(
+    index: usize,
+    lemma: &str,
+    gloss: &str,
+    marked: bool,
+    width: usize,
+) -> Vec<Vec<Span<'static>>> {
+    const INDENT: usize = 2;
+    const NUM_WIDTH: usize = 2;
+    let lemma_width = display_width(lemma).clamp(6, 20);
+    let lead_width = INDENT + NUM_WIDTH + lemma_width + 2;
+    let body = width.saturating_sub(lead_width + 3).max(8);
+
+    let marker = if marked { " ●" } else { "" };
+    let mut rows = Vec::new();
+    if gloss.trim().is_empty() {
+        rows.push(vec![
+            Span::styled(" ".repeat(INDENT), Style::default()),
+            Span::styled(format!("{:<NUM_WIDTH$}", index), theme::faint()),
+            Span::styled(pad_right(lemma, lemma_width), theme::value()),
+            Span::styled("  ", Style::default()),
+            Span::styled("(no entry)", theme::faint()),
+            Span::styled(marker.to_string(), theme::accent()),
+        ]);
+        return rows;
+    }
+    for (line_no, piece) in wrap(gloss, body).into_iter().enumerate() {
+        let lead = if line_no == 0 {
+            vec![
+                Span::styled(" ".repeat(INDENT), Style::default()),
+                Span::styled(format!("{:<NUM_WIDTH$}", index), theme::faint()),
+                Span::styled(pad_right(lemma, lemma_width), theme::value()),
+                Span::styled("  ", Style::default()),
+            ]
+        } else {
+            vec![Span::styled(" ".repeat(lead_width), Style::default())]
+        };
+        let mut row = lead;
+        row.push(Span::styled(piece, theme::muted()));
+        if line_no == 0 && marked {
+            row.push(Span::styled(marker.to_string(), theme::accent()));
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// One English gloss: `• Japanese rice wine   archaic`.
-fn gloss_rows(text: &str, tags: &[String], width: usize) -> Vec<Vec<Span<'static>>> {
-    const BULLET: &str = "  • ";
+fn gloss_rows(text: &str, tags: &[String], width: usize) -> Vec<Vec<Span<'static>>> {    const BULLET: &str = "  • ";
     let suffix = if tags.is_empty() {
         String::new()
     } else {
@@ -1181,5 +1267,57 @@ mod tests {
             !row.contains("1 n.") && !row.contains("│ 1"),
             "no numbering: {row}"
         );
+    }
+
+    fn reading_session(mode: qe_core::reading::ReadMode) -> qe_core::reading::ReadingSession {
+        let mut text = qe_core::reading::Text::new(
+            "Why I Write",
+            "From a very early age I knew I should be a writer.\n\nI had the lonely child's habit.",
+        );
+        text.translation = "从很小的时候，我就知道我要当作家。".to_string();
+        let mut session = qe_core::reading::ReadingSession::new(text, mode, 0);
+        session.mark("writer", None);
+        session
+    }
+
+    #[test]
+    fn intensive_mode_shows_the_translation_and_the_word_list() {
+        let session = reading_session(qe_core::reading::ReadMode::Intensive);
+        let candidates = vec![
+            qe_core::view::Candidate {
+                lemma: "writer".into(),
+                gloss: "n. 作家".into(),
+                marked: true,
+            },
+            qe_core::view::Candidate {
+                lemma: "lonely".into(),
+                gloss: "a. 孤独的".into(),
+                marked: false,
+            },
+        ];
+        let text = flat(&message_lines(
+            &Message::tool(ToolView::reading_card(&session, &candidates)),
+            80,
+        ));
+        let joined = text.join("\n");
+        assert!(joined.contains("writer"), "marked word is in the paragraph");
+        assert!(joined.contains("translation"), "translation header");
+        assert!(joined.contains("从很小的时候"), "translation body");
+        assert!(joined.contains("1 writer"), "numbered picks: {joined}");
+        assert!(joined.contains("●"), "marked picks carry a dot");
+    }
+
+    #[test]
+    fn full_mode_renders_every_paragraph_without_a_word_list() {
+        let session = reading_session(qe_core::reading::ReadMode::Full);
+        let text = flat(&message_lines(
+            &Message::tool(ToolView::reading_card(&session, &[])),
+            80,
+        ));
+        let joined = text.join("\n");
+        assert!(joined.contains("From a very early age"), "{joined}");
+        assert!(joined.contains("lonely child's habit"), "second paragraph");
+        assert!(!joined.contains("translation"), "full mode is原文 only");
+        assert!(!joined.contains("words ·"), "no pick list in full mode");
     }
 }

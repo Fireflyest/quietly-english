@@ -360,6 +360,91 @@ impl DailyStats {
     }
 }
 
+/// 一次阅读的记录。
+#[derive(Debug, Clone)]
+pub struct ReadingLog {
+    pub text_id: i64,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    /// 看过几段。
+    pub paragraphs: u32,
+    /// 打开过几个词条。
+    pub words_opened: u32,
+    /// 收进词书几个词。
+    pub words_added: u32,
+}
+
+/// 当天的阅读统计。
+#[derive(Debug, Clone, Default)]
+pub struct ReadingStats {
+    pub day: Option<NaiveDate>,
+    /// 几篇文章（去重）。
+    pub texts: u32,
+    pub paragraphs: u32,
+    pub seconds: u32,
+    pub words_opened: u32,
+    pub words_added: u32,
+    /// 这天做了几道题，答对几道。
+    pub quizzes: u32,
+    pub correct: u32,
+}
+
+impl ReadingStats {
+    pub fn minutes(&self) -> u32 {
+        (self.seconds + 30) / 60
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paragraphs == 0 && self.seconds == 0 && self.quizzes == 0
+    }
+}
+
+/// 阅读理解题。
+///
+/// `source` 必须写明出处（原文段落、语料库或用户自备文件）；没有出处的题目
+/// 不写入——凭空生成的题目无法核对对错。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Quiz {
+    pub id: i64,
+    pub text_id: i64,
+    /// 题目基于第几段（从 0 开始）。
+    pub paragraph: usize,
+    pub prompt: String,
+    pub answer: String,
+    /// 选择题的选项；为空表示填空/简答。
+    pub choices: Vec<String>,
+    pub source: String,
+}
+
+impl Quiz {
+    pub fn new(prompt: impl Into<String>, answer: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            answer: answer.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn choices(mut self, choices: Vec<String>) -> Self {
+        self.choices = choices;
+        self
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
+    }
+
+    pub fn at_paragraph(mut self, paragraph: usize) -> Self {
+        self.paragraph = paragraph;
+        self
+    }
+
+    pub fn is_choice(&self) -> bool {
+        self.choices.len() >= 2
+    }
+}
+
 /// 一次学习会话的日志。
 #[derive(Debug, Clone)]
 pub struct SessionLog {

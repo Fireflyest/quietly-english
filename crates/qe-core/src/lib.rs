@@ -4,6 +4,7 @@
 
 pub mod affix;
 pub mod model;
+pub mod reading;
 pub mod srs;
 pub mod store;
 pub mod text;
@@ -11,5 +12,6 @@ pub mod time;
 pub mod view;
 
 pub use model::*;
+pub use reading::{ReadMode, ReadingSession, Text};
 pub use store::Store;
 pub use view::*;

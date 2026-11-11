@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod command;
 mod editor;
+mod reader;
 mod session;
 
 use std::path::PathBuf;
@@ -284,6 +285,117 @@ fn run() -> Result<()> {
         Some("stats") => {
             let daily = store.daily(qe_core::time::today())?;
             println!("{}", cli::format_stats(&daily, store.streak()?));
+            let reading = store.daily_reading(qe_core::time::today())?;
+            if !reading.is_empty() {
+                println!(
+                    "reading: {} paragraphs · {} min · {} words opened · {} added",
+                    reading.paragraphs,
+                    reading.minutes(),
+                    reading.words_opened,
+                    reading.words_added
+                );
+                if reading.quizzes > 0 {
+                    println!("quiz: {}/{} correct", reading.correct, reading.quizzes);
+                }
+            }
+            Ok(())
+        }
+        Some("read") => {
+            // `quietly read <file>` 导入文本；不给文件就列出已导入的。
+            match rest.iter().find(|arg| !arg.starts_with('-')) {
+                Some(path) => {
+                    let text = reader::load_text(std::path::Path::new(path))?;
+                    let paragraphs = text.paragraph_count();
+                    let has_translation = !text.translation.trim().is_empty();
+                    let id = store.save_text(&text)?;
+                    store.set_setting("last_text", &text.title)?;
+                    println!(
+                        "imported \"{}\" · {paragraphs} paragraphs{}",
+                        text.title,
+                        if has_translation { " · bilingual" } else { "" }
+                    );
+                    if let Some(source) = &text.source {
+                        println!("source: {source}");
+                    }
+                    if let Some(license) = &text.license {
+                        println!("license: {license}");
+                    }
+                    println!("id: {id} · open it with /read {}", text.title);
+                    Ok(())
+                }
+                None => {
+                    let texts = store.texts()?;
+                    if texts.is_empty() {
+                        println!("（没有文本，先运行 quietly read <文件>）");
+                    }
+                    for text in texts {
+                        let progress = store
+                            .reading_progress(text.id)?
+                            .map(|(paragraph, mode)| {
+                                format!(
+                                    "{}/{} {}",
+                                    paragraph + 1,
+                                    text.paragraph_count(),
+                                    mode.label()
+                                )
+                            })
+                            .unwrap_or_else(|| format!("{} paragraphs", text.paragraph_count()));
+                        println!("{:<28} {}", text.title, progress);
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Some("quiz") => {
+            // `quietly quiz <text-title> <file.tsv>` 往某篇里导入题目。
+            let mut args = rest.iter().filter(|arg| !arg.starts_with('-'));
+            let title = args.next().context("用法：quietly quiz <text> <file.tsv>")?;
+            let path = args.next().context("用法：quietly quiz <text> <file.tsv>")?;
+            let text = store
+                .text_by_title(title)?
+                .with_context(|| format!("没有这篇文本：{title}"))?;
+            let raw = std::fs::read_to_string(path)?;
+            let mut added = 0u32;
+            let mut skipped = 0u32;
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 4 {
+                    skipped += 1;
+                    continue;
+                }
+                let paragraph = cols[0]
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let choices: Vec<String> = cols
+                    .get(4)
+                    .map(|raw| {
+                        raw.split('|')
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut quiz = qe_core::model::Quiz::new(cols[1].trim(), cols[2].trim())
+                    .at_paragraph(paragraph)
+                    .with_source(cols[3].trim());
+                if !choices.is_empty() {
+                    quiz = quiz.choices(choices);
+                }
+                quiz.text_id = text.id;
+                if store.add_quiz(&quiz)? {
+                    added += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            println!("{added} questions added · {skipped} skipped");
+            println!("database: {}", store.path().display());
             Ok(())
         }
         Some(other) => bail!("未知子命令 {other}（用 --help 查看用法）"),
@@ -303,6 +415,8 @@ USAGE:
     quietly phrases <file>        批量导入常用词组（lemma,phrase,gloss）
     quietly phrase <词> <搭配> = <释义>   单条补录词组
     quietly word <lemma>          查看词条（含义项、搭配、词根、例句）
+    quietly read [file]           导入一篇文本，或不带参数列出已导入的
+    quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
     quietly stats                 今日统计
     quietly where                 打印数据库路径
@@ -317,7 +431,16 @@ TUI 命令：
     /book <slug> 切换词书      /search <q>  搜索
     /root <affix> 查词根       /summary     每日总结
     /phrase <词> <搭配> = <释义>   补录固定搭配
-    /import <p>  导入文件      /help        帮助"
+    /import <p>  导入文件      /help        帮助
+
+阅读：
+    /read [file|title]  开始阅读   /texts  已导入的文本
+    /mode [full|intensive]        切换全篇 / 精读
+    /mark <word> · /mark all      标记 / 取消标记生词
+    /take <n>                     收第 n 个词进词书
+    /next · /prev · /goto <n>     翻页
+    /translate                    显示 / 隐藏译文
+    /quiz [file]                  读后测验"
     );
 }
 

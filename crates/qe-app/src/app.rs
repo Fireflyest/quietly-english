@@ -41,13 +41,13 @@ struct UndoEntry {
 }
 
 pub struct App {
-    store: Box<dyn Store>,
+    pub(crate) store: Box<dyn Store>,
     book: Option<Book>,
-    messages: Vec<Message>,
+    pub(crate) messages: Vec<Message>,
     editor: Editor,
-    session: Option<StudySession>,
+    pub(crate) session: Option<StudySession>,
     status: String,
-    scroll_back: u16,
+    pub(crate) scroll_back: u16,
     quit: bool,
     daily_new_limit: u32,
     /// Discreet mode: hide the deck name so the window looks like a plain agent.
@@ -71,6 +71,16 @@ pub struct App {
     /// Import queued by `/import`; it runs after the next frame so the user sees
     /// the "importing" line instead of a frozen window.
     pending_import: Option<String>,
+    /// 当前阅读会话。与 `session`（学习）互斥。
+    pub(crate) reading: Option<qe_core::reading::ReadingSession>,
+    /// 待作答的测验题。
+    pub(crate) quizzes: Vec<qe_core::model::Quiz>,
+    pub(crate) quiz_index: usize,
+    /// `Some(答对与否)`：已作答，再按一次翻下一题。
+    pub(crate) quiz_answered: Option<bool>,
+    pub(crate) quiz_correct: u32,
+    /// 精读时是否显示译文（`/translate` 切换）。
+    pub(crate) show_translation: bool,
 }
 
 impl App {
@@ -108,6 +118,12 @@ impl App {
             undo: Vec::new(),
             toggle_mouse: false,
             pending_import: None,
+            reading: None,
+            quizzes: Vec::new(),
+            quiz_index: 0,
+            quiz_answered: None,
+            quiz_correct: 0,
+            show_translation: true,
         };
         app.load_history();
         app.greet()?;
@@ -297,6 +313,56 @@ impl App {
                 return Ok(());
             }
             _ => {}
+        }
+
+        // 测验快捷键：有题目待答时，数字选选项，回车提交/翻页。
+        if !self.quizzes.is_empty() && self.editor.is_empty() {
+            match key.code {
+                KeyCode::Char(ch @ '1'..='9') => {
+                    let index = ch.to_digit(10).unwrap_or(1) as usize;
+                    self.answer_quiz(Some(index))?;
+                    return Ok(());
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.answer_quiz(None)?;
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.quizzes.clear();
+                    self.note("quiz closed");
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // 阅读快捷键：同样只在输入行为空时生效，字母键留给查词与 `/命令`。
+        // 只用非字母键，所以想输入 `n` 开头的单词不会被吞掉。
+        if self.reading.is_some() && self.editor.is_empty() {
+            match key.code {
+                KeyCode::Char(ch @ '1'..='9') => {
+                    let index = ch.to_digit(10).unwrap_or(1) as usize;
+                    self.open_word_at(index)?;
+                    return Ok(());
+                }
+                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => {
+                    self.reading_next()?;
+                    return Ok(());
+                }
+                KeyCode::Left => {
+                    self.reading_prev()?;
+                    return Ok(());
+                }
+                KeyCode::Tab => {
+                    self.toggle_translation()?;
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.finish_reading()?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         // Study shortcuts, only while the input line is empty so commands still work.
@@ -637,6 +703,44 @@ impl App {
             Command::Limit(value) => self.set_limit(value),
             Command::Add(word) => self.add_word(&word),
             Command::Phrase(spec) => self.add_phrase(&spec),
+            Command::Read(query) => self.start_reading(&query),
+            Command::Texts => self.list_texts(),
+            Command::Mode(arg) => self.set_reading_mode(&arg),
+            Command::Mark(word) => self.mark_word(&word),
+            Command::Words => self.list_reading_words(),
+            Command::Next => {
+                if self.reading.is_some() {
+                    self.reading_next()
+                } else if self.session.is_some() {
+                    self.advance()
+                } else {
+                    self.note("nothing to advance");
+                    Ok(())
+                }
+            }
+            Command::Prev => self.reading_prev(),
+            Command::Translate => self.toggle_translation(),
+            Command::Quiz(arg) => {
+                if arg.trim().is_empty() {
+                    self.start_quiz()
+                } else {
+                    self.import_quiz(&arg)
+                }
+            }
+            Command::Goto(arg) => match arg.trim().parse::<usize>() {
+                Ok(n) => self.reading_goto(n.saturating_sub(1)),
+                Err(_) => {
+                    self.note("usage: /goto <paragraph number>");
+                    Ok(())
+                }
+            },
+            Command::Take(arg) => match arg.trim().parse::<usize>() {
+                Ok(n) => self.add_reading_word(n),
+                Err(_) => {
+                    self.note("usage: /take <word number>");
+                    Ok(())
+                }
+            },
             Command::Bury => self.bury_current(),
             Command::Undo => self.undo_last(),
             Command::Skip => {
@@ -714,7 +818,7 @@ impl App {
     }
 
     /// `/add <word>` puts a word into the active deck.
-    fn add_word(&mut self, term: &str) -> Result<()> {
+    pub(crate) fn add_word(&mut self, term: &str) -> Result<()> {
         let term = term.trim();
         if term.is_empty() {
             self.note("usage: /add <word>");
@@ -916,7 +1020,7 @@ impl App {
 
     // ---------------------------------------------------------------- lookup
 
-    fn lookup(&mut self, text: &str) -> Result<()> {
+    pub(crate) fn lookup(&mut self, text: &str) -> Result<()> {
         if !text.contains(char::is_whitespace) {
             if let Some(word) = self.store.word(text)? {
                 self.push(Message::card(
@@ -1443,7 +1547,7 @@ impl App {
         self.finish_session()
     }
 
-    fn finish_session(&mut self) -> Result<()> {
+    pub(crate) fn finish_session(&mut self) -> Result<()> {
         let Some(session) = self.session.take() else {
             return Ok(());
         };
@@ -1525,7 +1629,7 @@ impl App {
         Ok(())
     }
 
-    fn push(&mut self, message: Message) {
+    pub(crate) fn push(&mut self, message: Message) {
         self.messages.push(message);
         // Keep the reader's place when new output arrives while scrolled back.
         if self.scroll_back > 0 {
@@ -1545,7 +1649,7 @@ impl App {
         }
     }
 
-    fn note(&mut self, text: impl Into<String>) {
+    pub(crate) fn note(&mut self, text: impl Into<String>) {
         self.push(Message::hint(text));
     }
 
@@ -1558,7 +1662,7 @@ impl App {
         ));
     }
 
-    fn refresh_status(&mut self) {
+    pub(crate) fn refresh_status(&mut self) {
         self.status = match &self.session {
             Some(session) => {
                 let word = session

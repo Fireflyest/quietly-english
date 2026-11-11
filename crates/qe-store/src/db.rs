@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
     Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
-    Phase, Rating, SessionLog, SrsCard, StudyCard, Word,
+    Phase, Quiz, Rating, ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -90,6 +90,73 @@ CREATE INDEX IF NOT EXISTS idx_reviews_word ON reviews(word_id);
 
 const WORD_COLS: &str = "w.id, w.lemma, w.phonetic, w.translation, w.definition, w.roots, w.examples, w.tags, w.collocations, w.glosses";
 
+/// v4：阅读模块。
+///
+/// `texts.translation` 与 `body` 用同一套段落切分，所以两者按空行对齐；
+/// 译文可以只写前几段（未译的段落留空），读取时按索引取。
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS texts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL UNIQUE,
+    source      TEXT,
+    license     TEXT,
+    body        TEXT NOT NULL,
+    translation TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reading_progress (
+    text_id     INTEGER PRIMARY KEY REFERENCES texts(id) ON DELETE CASCADE,
+    paragraph   INTEGER NOT NULL DEFAULT 0,
+    mode        TEXT NOT NULL DEFAULT 'full',
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reading_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    text_id     INTEGER NOT NULL,
+    day         TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT NOT NULL,
+    seconds     INTEGER NOT NULL DEFAULT 0,
+    paragraphs  INTEGER NOT NULL DEFAULT 0,
+    words_opened INTEGER NOT NULL DEFAULT 0,
+    words_added  INTEGER NOT NULL DEFAULT 0
+);
+
+-- 用户手动标注的词。`text_id = 0` 表示「阅读中随手标记、不归属某篇文章」。
+CREATE TABLE IF NOT EXISTS reading_marks (
+    text_id     INTEGER NOT NULL,
+    lemma       TEXT NOT NULL COLLATE NOCASE,
+    paragraph   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (text_id, lemma)
+);
+
+-- 读后测验。题目必须带出处，`source` 指回具体语料或用户自备文件。
+CREATE TABLE IF NOT EXISTS quizzes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    text_id     INTEGER NOT NULL,
+    paragraph   INTEGER NOT NULL DEFAULT 0,
+    prompt      TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    choices     TEXT NOT NULL DEFAULT '[]',
+    source      TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quiz_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    quiz_id     INTEGER NOT NULL,
+    day         TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    correct     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_reading_log_day ON reading_log(day);
+CREATE INDEX IF NOT EXISTS idx_quizzes_text ON quizzes(text_id);
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -154,6 +221,11 @@ impl SqliteStore {
                 "ALTER TABLE words ADD COLUMN glosses TEXT NOT NULL DEFAULT '[]';",
             )?;
             self.conn.execute_batch("PRAGMA user_version = 3")?;
+        }
+        if version < 4 {
+            // 阅读模块。文本与译文都存原文，段落切分在读取时做，所以只需要一张表。
+            self.conn.execute_batch(SCHEMA_V4)?;
+            self.conn.execute_batch("PRAGMA user_version = 4")?;
         }
         Ok(())
     }
@@ -731,6 +803,271 @@ impl Store for SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let word = stmt.query_row([lemma.trim()], decode_word).optional()?;
         Ok(word)
+    }
+
+    // ---------------------------------------------------------------- 阅读
+
+    fn save_text(&mut self, text: &qe_core::reading::Text) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        // 按标题去重：重新导入同一篇时更新正文与译文，但保留已有进度与标注。
+        self.conn.execute(
+            "INSERT INTO texts(title, source, license, body, translation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(title) DO UPDATE SET
+                source = COALESCE(NULLIF(excluded.source, ''), texts.source),
+                license = COALESCE(NULLIF(excluded.license, ''), texts.license),
+                body = excluded.body,
+                translation = CASE WHEN excluded.translation = '' THEN texts.translation
+                                   ELSE excluded.translation END",
+            params![
+                text.title.trim(),
+                text.source.as_deref(),
+                text.license.as_deref(),
+                text.body,
+                text.translation,
+                now,
+            ],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM texts WHERE title = ?1",
+            [text.title.trim()],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    fn texts(&self) -> Result<Vec<qe_core::reading::Text>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, source, license, body, translation FROM texts
+             ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(qe_core::reading::Text {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                source: row.get(2)?,
+                license: row.get(3)?,
+                body: row.get(4)?,
+                translation: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn text_by_title(&self, title: &str) -> Result<Option<qe_core::reading::Text>> {
+        let text = self
+            .conn
+            .query_row(
+                "SELECT id, title, source, license, body, translation FROM texts
+                 WHERE lower(title) = lower(?1)",
+                [title.trim()],
+                |row| {
+                    Ok(qe_core::reading::Text {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        source: row.get(2)?,
+                        license: row.get(3)?,
+                        body: row.get(4)?,
+                        translation: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(text)
+    }
+
+    fn delete_text(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM quizzes WHERE text_id = ?1", [id])?;
+        tx.execute("DELETE FROM reading_marks WHERE text_id = ?1", [id])?;
+        tx.execute("DELETE FROM reading_log WHERE text_id = ?1", [id])?;
+        tx.execute("DELETE FROM reading_progress WHERE text_id = ?1", [id])?;
+        tx.execute("DELETE FROM texts WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn reading_progress(&self, text_id: i64) -> Result<Option<(usize, qe_core::reading::ReadMode)>> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT paragraph, mode FROM reading_progress WHERE text_id = ?1",
+                [text_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(paragraph, mode)| {
+            (
+                paragraph.max(0) as usize,
+                qe_core::reading::ReadMode::parse(&mode).unwrap_or_default(),
+            )
+        }))
+    }
+
+    fn save_reading_progress(
+        &mut self,
+        text_id: i64,
+        paragraph: usize,
+        mode: qe_core::reading::ReadMode,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reading_progress(text_id, paragraph, mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(text_id) DO UPDATE SET
+                paragraph = excluded.paragraph,
+                mode = excluded.mode,
+                updated_at = excluded.updated_at",
+            params![
+                text_id,
+                paragraph as i64,
+                mode.as_str(),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn reading_marks(&self, text_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lemma FROM reading_marks WHERE text_id = ?1 ORDER BY created_at, lemma",
+        )?;
+        let rows = stmt.query_map([text_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn add_reading_mark(&mut self, text_id: i64, lemma: &str, paragraph: usize) -> Result<bool> {
+        let lemma = lemma.trim().to_ascii_lowercase();
+        if lemma.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO reading_marks(text_id, lemma, paragraph, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![text_id, lemma, paragraph as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn remove_reading_mark(&mut self, text_id: i64, lemma: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM reading_marks WHERE text_id = ?1 AND lemma = ?2",
+            params![text_id, lemma.trim()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn record_reading(&mut self, log: &ReadingLog) -> Result<()> {
+        let seconds = (log.ended_at - log.started_at)
+            .num_seconds()
+            .clamp(0, i64::from(u32::MAX)) as u32;
+        self.conn.execute(
+            "INSERT INTO reading_log(text_id, day, started_at, ended_at, seconds,
+                                     paragraphs, words_opened, words_added)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                log.text_id,
+                time::format_day(time::local_day(log.ended_at)),
+                log.started_at.to_rfc3339(),
+                log.ended_at.to_rfc3339(),
+                seconds as i64,
+                log.paragraphs as i64,
+                log.words_opened as i64,
+                log.words_added as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn daily_reading(&self, day: NaiveDate) -> Result<ReadingStats> {
+        let key = time::format_day(day);
+        let (texts, paragraphs, seconds, opened, added): (i64, i64, i64, i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT text_id), COALESCE(SUM(paragraphs), 0),
+                        COALESCE(SUM(seconds), 0), COALESCE(SUM(words_opened), 0),
+                        COALESCE(SUM(words_added), 0)
+                 FROM reading_log WHERE day = ?1",
+                [&key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        let (quizzes, correct): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(correct), 0) FROM quiz_attempts WHERE day = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(ReadingStats {
+            day: Some(day),
+            texts: texts as u32,
+            paragraphs: paragraphs as u32,
+            seconds: seconds as u32,
+            words_opened: opened as u32,
+            words_added: added as u32,
+            quizzes: quizzes as u32,
+            correct: correct as u32,
+        })
+    }
+
+    fn quizzes(&self, text_id: i64) -> Result<Vec<Quiz>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text_id, paragraph, prompt, answer, choices, source
+             FROM quizzes WHERE text_id = ?1 ORDER BY paragraph, id",
+        )?;
+        let rows = stmt.query_map([text_id], |row| {
+            let choices: String = row.get(5)?;
+            Ok(Quiz {
+                id: row.get(0)?,
+                text_id: row.get(1)?,
+                paragraph: row.get::<_, i64>(2)?.max(0) as usize,
+                prompt: row.get(3)?,
+                answer: row.get(4)?,
+                choices: serde_json::from_str(&choices).unwrap_or_default(),
+                source: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn add_quiz(&mut self, quiz: &Quiz) -> Result<bool> {
+        // 没有出处的题目不写：无法核对对错的题不如不要。
+        if quiz.prompt.trim().is_empty() || quiz.source.trim().is_empty() {
+            return Ok(false);
+        }
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO quizzes(text_id, paragraph, prompt, answer, choices, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                quiz.text_id,
+                quiz.paragraph as i64,
+                quiz.prompt.trim(),
+                quiz.answer.trim(),
+                serde_json::to_string(&quiz.choices)?,
+                quiz.source.trim(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn record_attempt(&mut self, quiz_id: i64, correct: bool) -> Result<()> {
+        let now = Utc::now();
+        self.conn.execute(
+            "INSERT INTO quiz_attempts(quiz_id, day, at, correct) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                quiz_id,
+                time::format_day(time::local_day(now)),
+                now.to_rfc3339(),
+                if correct { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
     }
 
     fn postpone(&mut self, word_id: i64, until: DateTime<Utc>) -> Result<()> {

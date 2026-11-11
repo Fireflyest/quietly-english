@@ -113,13 +113,13 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | 模块 | 状态 | 设计 |
 | --- | --- | --- |
 | 单词 | ✅ 可用 | [docs/vocabulary.md](docs/vocabulary.md) |
-| 阅读 | 📋 已规划 | [docs/reading.md](docs/reading.md) |
+| 阅读 | ✅ 可用 | [docs/reading.md](docs/reading.md) |
 | 翻译 | ⏳ 待规划 | — |
 | 写作 | ⏳ 待规划 | — |
 
-阅读模块的定位是把「正在读的这段文本」接进已有的卡片系统：就地标出生词、按序号看卡片、
-`a` 收进词书，复习仍走同一套记忆曲线。生词判定只用 ECDICT 的柯林斯星级和词频排名，
-不生成词表、不猜难度。
+阅读分两种模式：**全篇**连续读完，**精读**一段一段。生词由你选——标记的词在原文里
+高亮，按数字看完整卡片，`/take` 收进词书，然后照常走记忆曲线。双语文本用 `---`
+分隔原文与译文；读后测验的题目必须带出处，导入时无出处的条目会被跳过。
 
 ## 命令
 
@@ -134,6 +134,12 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | `/limit [n]` | 查看 / 设置每日新词上限（持久化） |
 | `/add <word>` | 把生词加入当前词书（词典里没有就用搜索补全） |
 | `/phrase <w> <phrase> = <释义>` | 给一个词补一条固定搭配，如 `/phrase sake for the sake of = 为了` |
+| `/read [file\|title]` | 开始阅读；不带参数续上次那篇 |
+| `/texts` | 列出已导入的文本与进度 |
+| `/mode [full\|intensive]` | 切换全篇 / 精读 |
+| `/mark [word]` | 标记生词（`/mark all` 标全部） |
+| `/take <n>` | 把当前段第 n 个词收进词书 |
+| `/quiz [file]` | 读后测验 |
 | `/bury` | 把当前卡推迟到明天 |
 | `/undo` | 撤销上一次评分，回到那张卡 |
 | `/quiet` | 低调模式，隐藏顶栏词书名 |
@@ -173,7 +179,7 @@ graph LR
 
 | crate | 职责 |
 | --- | --- |
-| `qe-core` | 纯领域层：`Word`/`SrsCard` 等模型、`srs` 记忆曲线、`affix` 词缀表、`view` 视图模型、`Store` trait |
+| `qe-core` | 纯领域层：`Word`/`SrsCard` 等模型、`srs` 记忆曲线、`reading` 切段与分词、`affix` 词缀表、`view` 视图模型、`Store` trait |
 | `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`stardict` 词典、`collocations` 搭配抽取、`merge` 多词典合并、`etymology` 词源、`tatoeba` 例句、`seed` 内置词书 |
 | `qe-tui` | 只消费视图模型：`lines`（换行/排版）、`render`（帧布局）、`theme`、`terminal` |
 | `qe-app` | `Command` 解析、单行编辑器、`StudySession` 会话、`App` 状态机与事件循环 |

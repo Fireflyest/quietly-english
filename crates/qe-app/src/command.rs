@@ -18,6 +18,27 @@ pub enum Command {
     Limit(Option<u32>),
     Add(String),
     Phrase(String),
+    /// `/read <title | path>`：开始阅读。不带参数时续读上次那篇。
+    Read(String),
+    /// `/texts`：列出已导入的文本。
+    Texts,
+    /// `/mode full|intensive`：切换阅读模式。
+    Mode(String),
+    /// `/mark <word>`：标记/取消标记当前段里的一个词。
+    Mark(String),
+    /// `/words`：列出当前段的所有候选词。
+    Words,
+    /// `/next` `/prev`：翻页（阅读中）。
+    Next,
+    Prev,
+    /// `/translate`：显示/隐藏译文。
+    Translate,
+    /// `/quiz [file]`：开始测验；给文件则先导入题目。
+    Quiz(String),
+    /// `/goto <n>`：跳到第 n 段。
+    Goto(String),
+    /// `/take <n>`：把当前段第 n 个候选词收进词书。
+    Take(String),
     Bury,
     Undo,
     Skip,
@@ -91,6 +112,61 @@ pub const SPECS: &[Spec] = &[
         help: "add a fixed expression to a word",
     },
     Spec {
+        name: "/read",
+        args: " [title|path]",
+        help: "read a text, or resume the last one",
+    },
+    Spec {
+        name: "/texts",
+        args: "",
+        help: "list imported texts",
+    },
+    Spec {
+        name: "/mode",
+        args: " [full|intensive]",
+        help: "switch between full reading and close reading",
+    },
+    Spec {
+        name: "/mark",
+        args: " <word>",
+        help: "mark or unmark a word while reading",
+    },
+    Spec {
+        name: "/words",
+        args: "",
+        help: "list the words in the current paragraph",
+    },
+    Spec {
+        name: "/next",
+        args: "",
+        help: "next paragraph",
+    },
+    Spec {
+        name: "/prev",
+        args: "",
+        help: "previous paragraph",
+    },
+    Spec {
+        name: "/translate",
+        args: "",
+        help: "show or hide the translation",
+    },
+    Spec {
+        name: "/quiz",
+        args: " [file]",
+        help: "answer the questions for this text, or import a quiz file",
+    },
+    Spec {
+        name: "/goto",
+        args: " <n>",
+        help: "jump to paragraph n",
+    },
+    Spec {
+        name: "/take",
+        args: " <n>",
+        help: "add the nth word of this paragraph to the deck",
+    },
+    Spec {
         name: "/bury",
         args: "",
         help: "postpone the current card to tomorrow",
@@ -145,9 +221,20 @@ impl Command {
             "limit" | "daily" => Command::Limit(arg.parse::<u32>().ok()),
             "add" => Command::Add(arg),
             "phrase" | "collocation" => Command::Phrase(arg),
+            "read" | "r" => Command::Read(arg),
+            "texts" | "library" => Command::Texts,
+            "mode" => Command::Mode(arg),
+            "mark" | "m" => Command::Mark(arg),
+            "words" => Command::Words,
+            "next" | "n" => Command::Next,
+            "prev" | "p" => Command::Prev,
+            "translate" | "tr" => Command::Translate,
+            "quiz" | "test" => Command::Quiz(arg),
+            "goto" | "g" => Command::Goto(arg),
+            "take" | "keep" => Command::Take(arg),
             "bury" | "later" => Command::Bury,
             "undo" | "back" => Command::Undo,
-            "skip" | "next" => Command::Skip,
+            "skip" => Command::Skip,
             "exit" | "stop" | "end" => Command::Exit,
             "quit" | "q" => Command::Quit,
             other => Command::Unknown(other.to_string()),
