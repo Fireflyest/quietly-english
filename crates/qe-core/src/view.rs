@@ -219,15 +219,14 @@ impl ToolView {
         if parsed.senses.is_empty() {
             view = view.text("(no definition yet)".to_string());
         } else {
-            // Common senses are numbered so the card reads like a dictionary entry;
-            // domain-tagged ones (`[医]`, `[古]`) are grouped below, which is how the
-            // "rare meaning" case gets separated from everyday usage.
+            // Common senses come first, domain-tagged ones (`[医]`, `[古]`) are
+            // grouped below, which is how the "rare meaning" case gets separated
+            // from everyday usage.
             let (common, secondary): (Vec<&crate::text::Sense>, Vec<&crate::text::Sense>) =
                 parsed.senses.iter().partition(|sense| !sense.is_secondary());
 
-            for (index, sense) in common.iter().enumerate() {
+            for sense in common {
                 view = view.line(ToolLine::Sense {
-                    index: index + 1,
                     label: sense.pos.clone(),
                     text: sense.text.clone(),
                 });
@@ -237,7 +236,6 @@ impl ToolView {
                 view = view.muted("rare / technical".to_string());
                 for sense in &secondary {
                     view = view.line(ToolLine::Sense {
-                        index: 0,
                         label: format!("[{}]", sense.label),
                         text: sense.text.clone(),
                     });
@@ -525,7 +523,6 @@ pub enum ToolLine {
     },
     /// One dictionary sense. `index == 0` means no number (a secondary sense).
     Sense {
-        index: usize,
         /// Part of speech (`n.`) or a bracketed domain tag (`[医]`).
         label: String,
         text: String,
@@ -856,20 +853,18 @@ mod tests {
         assert!(hint_texts(&view).is_empty());
     }
 
-    fn senses(view: &ToolView) -> Vec<(usize, String, String)> {
+    fn senses(view: &ToolView) -> Vec<(String, String)> {
         view.lines
             .iter()
             .filter_map(|line| match line {
-                ToolLine::Sense { index, label, text } => {
-                    Some((*index, label.clone(), text.clone()))
-                }
+                ToolLine::Sense { label, text } => Some((label.clone(), text.clone())),
                 _ => None,
             })
             .collect()
     }
 
     #[test]
-    fn common_senses_are_numbered_and_rare_ones_follow() {
+    fn common_senses_come_first_and_rare_ones_follow() {
         let word = crate::model::Word::new(
             "bank",
             "-K1\nn. 银行, 堤, 岸\n[医] 库\n[时态] banked, banking, banks",
@@ -878,10 +873,9 @@ mod tests {
 
         let rows = senses(&view);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 1, "common sense is numbered from 1");
-        assert_eq!(rows[0].1, "n.");
-        assert_eq!(rows[1].0, 0, "secondary sense is unnumbered");
-        assert_eq!(rows[1].1, "[医]");
+        assert_eq!(rows[0].0, "n.");
+        assert_eq!(rows[0].1, "银行, 堤, 岸");
+        assert_eq!(rows[1].0, "[医]");
 
         let texts: Vec<String> = view
             .lines

@@ -231,10 +231,18 @@ fn run() -> Result<()> {
                 return Ok(());
             };
             println!("{}  {}", word.lemma, word.phonetic.as_deref().unwrap_or(""));
-            for (index, sense) in word.senses().senses.iter().enumerate() {
-                println!("{}. {:<5} {}", index + 1, sense.pos, sense.text);
+            let parsed = word.senses();
+            for sense in &parsed.senses {
+                // 词性（或领域标签）在前，译文在后，不编号：编号只有在这一行
+                // 需要被引用时才有用，而查词不需要指代某条义项。
+                let label = if sense.label.is_empty() {
+                    sense.pos.clone()
+                } else {
+                    format!("[{}]", sense.label)
+                };
+                println!("{}{}", pad_label(&label), sense.text);
             }
-            if let Some(forms) = &word.senses().forms {
+            if let Some(forms) = &parsed.forms {
                 println!("forms: {forms}");
             }
             for colloc in &word.collocations {
@@ -294,6 +302,7 @@ USAGE:
     quietly etymology <file>      导入有出处的词根（kaikki jsonl / roots.tsv）
     quietly phrases <file>        批量导入常用词组（lemma,phrase,gloss）
     quietly phrase <词> <搭配> = <释义>   单条补录词组
+    quietly word <lemma>          查看词条（含义项、搭配、词根、例句）
     quietly books                 列出词书与进度
     quietly stats                 今日统计
     quietly where                 打印数据库路径
@@ -306,6 +315,17 @@ OPTIONS:
 TUI 命令：
     /study [n]   开始学习      /books       词书列表
     /book <slug> 切换词书      /search <q>  搜索
-    /root <affix> 查词根       /summary     每日总结    /phrase <词> <搭配> = <释义>   补录固定搭配    /import <p>  导入文件      /help        帮助"
+    /root <affix> 查词根       /summary     每日总结
+    /phrase <词> <搭配> = <释义>   补录固定搭配
+    /import <p>  导入文件      /help        帮助"
     );
+}
+
+/// 让译文从同一列开始。中文按两个字符宽度算，否则 `[医]` 之后会错位。
+fn pad_label(label: &str) -> String {
+    let width: usize = label
+        .chars()
+        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+        .sum();
+    format!("{label}{}", " ".repeat(7usize.saturating_sub(width)))
 }

@@ -166,10 +166,14 @@ const POS_TABLE: &[(&str, &str)] = &[
 ];
 
 /// 把 `[医]`、`[时态]` 这类方括号前缀拆出来。
+///
+/// 朗道用全角 `【医】`，词典之间不统一，所以两种都认。
 fn split_bracket(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix('[')?;
-    let end = rest.find(']')?;
-    Some((&rest[..end], rest[end + 1..].trim_start()))
+    let rest = line.strip_prefix('[').or_else(|| line.strip_prefix('【'))?;
+    let (end, closing) = rest
+        .char_indices()
+        .find(|(_, ch)| *ch == ']' || *ch == '】')?;
+    Some((&rest[..end], rest[end + closing.len_utf8()..].trim_start()))
 }
 
 /// 拆出词性前缀，返回 `(词性, 剩余释义)`。
@@ -390,6 +394,18 @@ mod tests {
         assert_eq!(parsed.senses[0].label, "口");
         assert_eq!(parsed.senses[0].pos, "vt.");
         assert_eq!(parsed.senses[0].text, "糊弄");
+    }
+
+    #[test]
+    fn fullwidth_domain_tags_are_recognised() {
+        // 朗道用【医】，ECDICT 用 [医]；不统一就会被当成普通释义，整行显示
+        // 成 `【医】 矿泉, 泉` 而不是带标签的义项。
+        let parsed = parse_senses("n. 春天\n【医】 矿泉, 泉\n【经】 春季");
+        assert_eq!(parsed.senses.len(), 3);
+        assert_eq!(parsed.senses[1].label, "医");
+        assert_eq!(parsed.senses[1].text, "矿泉, 泉");
+        assert_eq!(parsed.senses[2].label, "经");
+        assert_eq!(parsed.senses[2].text, "春季");
     }
 
     #[test]

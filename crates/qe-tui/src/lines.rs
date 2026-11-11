@@ -391,8 +391,8 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
                     inner,
                 ));
             }
-            ToolLine::Sense { index, label, text } => {
-                rows.extend(sense_rows(*index, label, text, inner));
+            ToolLine::Sense { label, text } => {
+                rows.extend(sense_rows(label, text, inner));
             }
             ToolLine::Phrase { phrase, gloss } => {
                 rows.extend(phrase_rows(phrase, gloss, inner));
@@ -564,19 +564,14 @@ fn example_rows(
     rows
 }
 
-/// One dictionary sense: `1  n.   银行, 堤, 岸`, wrapping under the gloss column.
+/// One dictionary sense: `n.   银行, 堤, 岸`, wrapping under the gloss column.
 ///
-/// `index == 0` renders an unnumbered secondary sense, whose label is the bracketed
-/// domain tag instead of a part of speech.
-fn sense_rows(index: usize, label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
-    let gutter = if index > 0 {
-        format!("{index} ")
-    } else {
-        "  ".to_string()
-    };
+/// The label is the part of speech, or the bracketed domain tag (`[医]`) for a
+/// secondary sense.
+fn sense_rows(label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> {
     // Wide enough for `[网络]`, narrow enough to leave room for the gloss.
-    let label_width = if index > 0 { 5 } else { 7 };
-    let lead = format!("{gutter}{}", pad_right(label, label_width));
+    const LABEL_WIDTH: usize = 6;
+    let lead = format!("{} ", pad_right(label, LABEL_WIDTH));
     let lead_width = display_width(&lead);
     let body = width.saturating_sub(lead_width + 2).max(8);
 
@@ -1019,7 +1014,7 @@ mod tests {
     #[test]
     fn a_card_message_renders_through_the_rail() {
         // Cards are stored as state and painted on demand, which is what lets
-        // `m` fold or unfold every one of them at once.
+        // `m` fold or unfold the card in front of the reader.
         let mut word = qe_core::model::Word::new("sake", "n. 目的");
         word.glosses = vec![qe_core::text::Gloss::new("Rice wine.")];
         let state = qe_core::view::CardState::new(word, "1/9").revealed();
@@ -1035,5 +1030,23 @@ mod tests {
         open.expand_glosses = true;
         let text = flat(&message_lines(&Message::card(open), 80));
         assert!(text.iter().any(|line| line.contains("Rice wine.")));
+    }
+
+    #[test]
+    fn a_sense_starts_with_its_label_not_a_number() {
+        // 词性（或领域标签）在最前面，义项本身不编号。
+        let word = qe_core::model::Word::new("bank", "n. 银行, 堤, 岸\n[医] 库");
+        let state = qe_core::view::CardState::new(word, "lookup").revealed();
+        let text = flat(&message_lines(&Message::card(state), 80));
+
+        let row = text
+            .iter()
+            .find(|line| line.contains("银行"))
+            .unwrap_or_else(|| panic!("sense row missing: {text:?}"));
+        assert!(row.contains("│ n."), "label right after the rail: {row}");
+        assert!(
+            !row.contains("1 n.") && !row.contains("│ 1"),
+            "no numbering: {row}"
+        );
     }
 }
