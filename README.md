@@ -106,6 +106,21 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 
 格式细节与字段说明见 [docs/vocabulary.md](docs/vocabulary.md)。
 
+## 路线图
+
+单词模块已经完成，接下来是阅读、翻译、写作：
+
+| 模块 | 状态 | 设计 |
+| --- | --- | --- |
+| 单词 | ✅ 可用 | [docs/vocabulary.md](docs/vocabulary.md) |
+| 阅读 | 📋 已规划 | [docs/reading.md](docs/reading.md) |
+| 翻译 | ⏳ 待规划 | — |
+| 写作 | ⏳ 待规划 | — |
+
+阅读模块的定位是把「正在读的这段文本」接进已有的卡片系统：就地标出生词、按序号看卡片、
+`a` 收进词书，复习仍走同一套记忆曲线。生词判定只用 ECDICT 的柯林斯星级和词频排名，
+不生成词表、不猜难度。
+
 ## 命令
 
 | 命令 | 说明 |
