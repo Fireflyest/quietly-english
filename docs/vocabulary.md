@@ -9,10 +9,13 @@ quietly 不内置完整词库（体积与授权都不合适），而是把“词
 
 ## 推荐来源
 
+> 各文件的具体下载地址、体积和导入命令汇总在 [data-sources.md](data-sources.md)。
+> **词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，见下方「词根与词源」。
+
 | 来源 | 内容 | 授权 | 用法 |
 | --- | --- | --- | --- |
-| [ECDICT](https://github.com/skywind3000/ECDICT) | 77 万英汉词条，含音标、释义、`tag`（中高考/四六级/考研/托福/雅思/GRE）、柯林斯星级、BNC/COCA 词频 | MIT | **首选**。下载 `ecdict-csv.7z` 解压出 `stardict.csv` 后 `quietly import stardict.csv`，自动生成 8 本词书 |
-| [qwerty-learner](https://github.com/Kaiyiwing/qwerty-learner) 词库 | CET-4/6、考研、IELTS、TOEFL、GRE、GMAT、SAT、专四专八、商务英语等 JSON 词表，每词带释义与例句 | MIT | 把 `public/dicts/*.json` 转成下面的通用 JSON 格式导入 |
+| [ECDICT](https://github.com/skywind3000/ECDICT) | 77 万英汉词条，含音标、释义、`tag`（中高考/四六级/考研/托福/雅思/GRE）、柯林斯星级、BNC/COCA 词频 | MIT | **查词底库**。下载 `ecdict-stardict-28.zip` 后 `quietly dict stardict-ecdict-2.4.2.ifo`；或用 `ecdict-csv.7z` 里的 `stardict.csv` 走 `quietly import` |
+| [qwerty-learner](https://github.com/Kaiyiwing/qwerty-learner) 词库 | CET-4/6、考研、IELTS、TOEFL、GRE、GMAT、SAT、专四专八、商务英语等 JSON 词表，每词带释义与音标 | MIT | **免转换**：直接 `quietly import CET6_T.json`，见下方「按考试直接导入」 |
 | [Tatoeba](https://tatoeba.org/) | 多语例句对，`cmn-eng` 可得到中英对照例句 | CC-BY 2.0 FR | 导出 `sentence_id \t 英文 \t 中文`，转成 `examples.csv` 合并例句 |
 | [kaikki.org / Wiktionary](https://kaikki.org/dictionary/) | 英文词条 + 中文释义的结构化 JSON 抽取 | CC BY-SA | 写个小脚本转成通用 JSON；数据量大，建议只取需要的词 |
 | [COCA / BNC 词频表](https://www.wordfrequency.info/) | 按使用频率排序 | 各站不同，注意商用条款 | 用 `rank` 顺序决定新词出现顺序 |
@@ -23,6 +26,45 @@ quietly 不内置完整词库（体积与授权都不合适），而是把“词
 扇贝、百词斩等产品的词书数据没有公开授权，**不要直接抓取或导出**。
 推荐替代：用 ECDICT 的 `tag`（`cet4`/`cet6`/`ky`/`toefl`/`ielts`/`gre`）直接生成同级别词书，
 或用 qwerty-learner 的 MIT 词表，覆盖范围基本一致。
+
+## 按考试直接导入（最快）
+
+[qwerty-learner 的 `public/dicts/`](https://github.com/RealKai42/qwerty-learner/tree/master/public/dicts)
+里每个考试一个文件，**不需要转换格式**，直接导入即可：
+
+```bash
+# CET-6（2345 词）
+curl -L -o CET6_T.json https://raw.githubusercontent.com/RealKai42/qwerty-learner/master/public/dicts/CET6_T.json
+quietly import CET6_T.json
+
+# CET-4 / 考研 / IELTS / TOEFL / GRE 同理
+curl -L -o CET4_T.json https://raw.githubusercontent.com/RealKai42/qwerty-learner/master/public/dicts/CET4_T.json
+curl -L -o KaoYan_3_T.json https://raw.githubusercontent.com/RealKai42/qwerty-learner/master/public/dicts/KaoYan_3_T.json
+```
+
+GitHub 慢的话在链接前加任意代理前缀，例如
+`https://ghfast.top/https://raw.githubusercontent.com/...`。
+
+导入器认识 `{"name": ..., "trans": [...], "usphone": ...}` 这种 qwerty-learner
+原生结构，并且会**按文件名自动归入对应词书**，不会多出一本 `cet6-t`：
+
+| 文件名（忽略大小写与 `_`/`-`） | 归入词书 |
+| --- | --- |
+| `CET4*` / `CET-4*` | `cet4` · CET-4 核心词 |
+| `CET6*` / `CET-6*` | `cet6` · CET-6 核心词 |
+| `TOEFL*` | `toefl` · TOEFL 核心词 |
+| `IELTS*` | `ielts` · IELTS 核心词 |
+| `GRE*` | `gre` · GRE 核心词 |
+| `KaoYan*` / `KY*` | `ky` · 考研核心词 |
+| `GaoKao*` / `GK*` | `gk` · 高考核心词 |
+| `ZhongKao*` / `ZK*` | `zk` · 中考核心词 |
+
+已验证：`CET6_T.json` 导入后 `cet6` 词书从 12 词变成 2347 词，`added 2321 · updated 24`。
+
+也可以直接在 TUI 里 `/import CET6_T.json`，`tab` 会补全当前目录的文件名。
+
+> 这些词表只有拼写、释义、音标，没有词根和例句。词根会用内置词缀表自动推测
+> （卡片上标注 `guessed`），例句可以用 Tatoeba 单独补。
 
 ## 通用 JSON
 
@@ -106,7 +148,59 @@ inspect,Engineers inspect the bridge every year.,工程师每年检查这座桥�
 - 词书按 `slug` 去重，`book_words.rank` 递增，新词按 `rank` 顺序出现
 - 已存在的学习进度（`cards`）完全不动，可以放心重复导入
 - 导入结果会显示 `added / updated / skipped`
+## 词根与词源
 
+**词根不由程序推测。** 早期版本用内置词缀表做最长匹配，会把 `surgeon` 拆出 `geo`、
+把 `disapproval` 拆成 `dis- + -al`，属于编造，已删除。现在只接受有出处的数据：
+
+```bash
+quietly etymology <kaikki.jsonl>   # Wiktionary 词源模板（CC BY-SA）
+quietly etymology <roots.tsv>      # 自备词根表
+```
+
+### kaikki.org / Wiktionary JSONL
+
+[kaikki.org](https://kaikki.org/dictionary/English/) 把 Wiktionary 的词源模板抽成 JSONL，
+每条词目形如：
+
+```json
+{"word": "unhappy",
+ "etymology_templates": [
+   {"name": "prefix", "args": {"1": "en", "2": "un", "3": "happy"}}
+ ]}
+```
+
+导入器只认这四种模板，因为它们显式列出了构词成分：
+
+| 模板 | 含义 | 分词结果 |
+| --- | --- | --- |
+| `prefix` | 前缀 + 词干 | 第 2 段标 `prefix`，其余 `root` |
+| `suffix` | 词干 + 后缀 | 最后一段标 `suffix`，其余 `root` |
+| `confix` | 前后缀同时 | 首段 `prefix`、末段 `suffix`、中间 `root` |
+| `compound` | 复合词 | 全部 `root` |
+
+`inh`（继承）、`der`（派生）、`bor`（借词）、`af`（合并）等一律**跳过**，不做猜测。
+没有可用模板的词不写入，卡片显示 `no etymology on file`。
+
+每个词素都会记录 `source: "Wiktionary etymology"`，卡片上以 `source:` 一行展示。
+
+### 自备 TSV
+
+```tsv
+lemma	part	gloss	kind	source
+inspect	in-	inward	prefix	OED
+inspect	spect	look	root	OED
+```
+
+- `kind` ∈ `prefix` / `root` / `suffix`
+- `source` 可留空；建议填教材或词典名，方便日后核对
+- 同一 `lemma` 的多行会合并成一个词的多个词素
+
+### 行为
+
+- 只更新**已存在**的词条，词源文件不会新建单词
+- 重复导入会覆盖该词的 `roots` 字段（以最后一次为准）
+- 模型字段：`WordRoot { part, gloss, kind, source }`
 ## 数据位置
 
 | 平台 | 路径 |

@@ -190,28 +190,39 @@ impl ToolView {
             view = view.muted(definition.clone());
         }
 
-        let (roots, guessed) = word.roots_or_guess();
+        let roots = word.roots();
         if roots.is_empty() {
             view = view
                 .spacer()
-                .muted("no roots on file · try /root <affix>");
+                .muted("no etymology on file · /root <affix> looks up affixes");
         } else {
-            // Flowing prose instead of an aligned table: a word usually has two or
-            // three parts, and a sentence reads less like a dashboard.
+            // Morphemes go on one compact line; each gloss gets its own line because
+            // Wiktionary definitions run long and would otherwise blow out the width.
             let parts: Vec<String> = roots
                 .iter()
-                .map(|root| format!("{} ({}, {})", root.part, root.kind.label(), root.gloss))
+                .map(|root| format!("{} ({})", root.part, root.kind.label()))
                 .collect();
             view = view.spacer().text(parts.join("  +  "));
 
-            let glosses: Vec<&str> = roots
+            for root in roots.iter().filter(|r| !r.gloss.is_empty()) {
+                view = view.line(ToolLine::Kv {
+                    key: root.part.clone(),
+                    value: root.gloss.clone(),
+                });
+            }
+
+            // Attribution, so a learner can check where the split came from.
+            let sources: Vec<&str> = roots
                 .iter()
-                .filter(|r| !r.gloss.is_empty())
-                .map(|r| r.gloss.as_str())
+                .filter_map(|r| r.source.as_deref())
                 .collect();
-            if !glosses.is_empty() {
-                let suffix = if guessed { "  (guessed)" } else { "" };
-                view = view.muted(format!("→ {}{suffix}", glosses.join(" + ")));
+            if let Some(first) = sources.first() {
+                let label = if sources.len() > 1 {
+                    format!("source: {first} (+{} more)", sources.len() - 1)
+                } else {
+                    format!("source: {first}")
+                };
+                view = view.muted(label);
             }
         }
 
@@ -307,7 +318,7 @@ impl CardState {
         if !self.hint {
             return Vec::new();
         }
-        let (roots, _) = self.word.roots_or_guess();
+        let roots = self.word.roots();
         if roots.is_empty() {
             let first = self.word.lemma.chars().next().unwrap_or('?');
             return vec![ToolLine::Muted(format!(

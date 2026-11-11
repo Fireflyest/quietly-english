@@ -23,6 +23,8 @@ pub enum FileKind {
     WordsCsv,
     ExamplesCsv,
     Plain,
+    /// Sourced etymology data: kaikki JSONL or a `roots.tsv` table.
+    Etymology,
 }
 
 /// 只读取文件头，判断应该用哪种导入器。
@@ -34,9 +36,22 @@ pub fn inspect(path: &Path) -> Result<FileKind> {
         .to_ascii_lowercase();
     match ext.as_str() {
         "json" => return Ok(FileKind::Json),
+        // kaikki.org ships one JSON object per line.
+        "jsonl" | "ndjson" => return Ok(FileKind::Etymology),
         "txt" | "md" | "list" => return Ok(FileKind::Plain),
-        "csv" | "tsv" => {}
-        other => bail!("不支持的文件类型 .{other}，请使用 csv / tsv / json / txt"),
+        "csv" | "tsv" => {
+            // A roots table (lemma/part/gloss/kind) is etymology, not a deck.
+            let header = first_line(path)?;
+            let lower = header.to_ascii_lowercase();
+            let cells: Vec<&str> = lower
+                .split(['\t', ','])
+                .map(|cell| cell.trim().trim_matches('"'))
+                .collect();
+            if cells.contains(&"part") && cells.contains(&"gloss") && cells.contains(&"lemma") {
+                return Ok(FileKind::Etymology);
+            }
+        }
+        other => bail!("不支持的文件类型 .{other}，请使用 csv / tsv / json / jsonl / txt"),
     }
 
     let header = first_line(path)?;
@@ -262,7 +277,7 @@ pub fn parse_words_csv(path: &Path) -> Result<Vec<ImportPlan>> {
 
 #[derive(Debug, Deserialize)]
 struct JsonWord {
-    #[serde(alias = "word")]
+    #[serde(alias = "word", alias = "name")]
     lemma: String,
     #[serde(default)]
     translation: String,
@@ -284,6 +299,44 @@ struct JsonWord {
     /// 兼容 `"root": "spect:看:root"` 的简写。
     #[serde(default)]
     root: Option<String>,
+    /// qwerty-learner 用 `trans: ["释义", ...]` 存释义。
+    #[serde(default)]
+    trans: Vec<String>,
+    #[serde(default)]
+    ukphone: Option<String>,
+    #[serde(default)]
+    usphone: Option<String>,
+}
+
+impl JsonWord {
+    /// 最终释义：优先 `translation`，退回 `trans` 数组。
+    fn meaning(&self) -> String {
+        if !self.translation.trim().is_empty() {
+            return self.translation.trim().to_string();
+        }
+        self.trans
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// 音标：显式 `phonetic` 优先，其次英式，再次美式。
+    fn sound(&self) -> Option<String> {
+        if self.phonetic.is_some() {
+            return self.phonetic.clone();
+        }
+        let pick = self.ukphone.as_ref().or(self.usphone.as_ref())?;
+        let pick = pick.trim();
+        if pick.is_empty() {
+            None
+        } else if pick.starts_with('/') {
+            Some(pick.to_string())
+        } else {
+            Some(format!("/{pick}/"))
+        }
+    }
 }
 
 fn de_roots<'de, D>(de: D) -> Result<Vec<WordRoot>, D::Error>
@@ -296,6 +349,40 @@ where
         Some(serde_json::Value::String(s)) => parse_roots(&s),
         Some(other) => serde_json::from_value(other).unwrap_or_default(),
     })
+}
+
+/// Map a filename stem to the deck it belongs to, so importing
+/// `CET6_T.json` from qwerty-learner lands in the same `cet6` deck that
+/// ECDICT and the built-in seed data use instead of creating `cet6-t`.
+pub fn book_from_stem(stem: &str) -> Option<(&'static str, &'static str)> {
+    // Normalise `CET6_T`, `cet-6`, `IELTS_4_T` to `CET6-T`, `CET-6`, `IELTS-4-T`.
+    let key: String = stem
+        .chars()
+        .map(|ch| if ch == '_' || ch == ' ' { '-' } else { ch })
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    const TABLE: &[(&[&str], &str, &str)] = &[
+        (&["CET4", "CET-4"], "cet4", "CET-4 核心词"),
+        (&["CET6", "CET-6"], "cet6", "CET-6 核心词"),
+        (&["TOEFL"], "toefl", "TOEFL 核心词"),
+        (&["IELTS"], "ielts", "IELTS 核心词"),
+        (&["GRE"], "gre", "GRE 核心词"),
+        (&["KY", "KAOYAN"], "ky", "考研核心词"),
+        (&["GK", "GAOKAO"], "gk", "高考核心词"),
+        (&["ZK", "ZHONGKAO"], "zk", "中考核心词"),
+    ];
+
+    for (aliases, slug, name) in TABLE {
+        for alias in *aliases {
+            let prefixed = format!("{alias}-");
+            if key == *alias || key.starts_with(&prefixed) {
+                return Some((slug, name));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,23 +404,28 @@ pub fn parse_json(path: &Path) -> Result<Vec<ImportPlan>> {
     let value: serde_json::Value = serde_json::from_str(&content)
         .with_context(|| format!("{} 不是合法 JSON", path.display()))?;
 
-    let default_name = path
+    let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("导入词书")
-        .to_string();
+        .unwrap_or("导入词书");
+    // Recognise exam dictionaries by filename so they merge into the same deck the
+    // built-in seed data and ECDICT use.
+    let (default_slug, default_name) = match book_from_stem(stem) {
+        Some((slug, name)) => (Some(slug.to_string()), name.to_string()),
+        None => (None, stem.to_string()),
+    };
 
     let books: Vec<JsonBook> = if value.is_array() {
         vec![JsonBook {
             name: Some(default_name.clone()),
-            slug: None,
+            slug: default_slug.clone(),
             description: Some("从 JSON 导入".into()),
             words: serde_json::from_value(value).unwrap_or_default(),
         }]
     } else if value.is_object() && value.get("words").is_some() {
         vec![serde_json::from_value(value).unwrap_or(JsonBook {
             name: Some(default_name.clone()),
-            slug: None,
+            slug: default_slug.clone(),
             description: Some("从 JSON 导入".into()),
             words: Vec::new(),
         })]
@@ -375,8 +467,8 @@ pub fn parse_json(path: &Path) -> Result<Vec<ImportPlan>> {
             book.description.unwrap_or_else(|| "从 JSON 导入".into()),
         );
         for entry in book.words {
-            let mut word = Word::new(entry.lemma.trim(), entry.translation);
-            word.phonetic = entry.phonetic;
+            let mut word = Word::new(entry.lemma.trim(), entry.meaning());
+            word.phonetic = entry.sound();
             word.definition = entry.definition;
             word.roots = entry.roots;
             if word.roots.is_empty() {
@@ -463,5 +555,46 @@ mod tests {
         assert_eq!(slugify("CET-4 核心词"), "cet-4");
         assert_eq!(slugify("我的词书"), "imported");
         assert_eq!(slugify("My Book!"), "my-book");
+    }
+
+    #[test]
+    fn exam_filenames_map_to_canonical_decks() {
+        assert_eq!(book_from_stem("CET6_T"), Some(("cet6", "CET-6 核心词")));
+        assert_eq!(book_from_stem("CET-6"), Some(("cet6", "CET-6 核心词")));
+        assert_eq!(book_from_stem("CET4_T"), Some(("cet4", "CET-4 核心词")));
+        assert_eq!(book_from_stem("KaoYan_3_T"), Some(("ky", "考研核心词")));
+        assert_eq!(book_from_stem("IELTS_4_T"), Some(("ielts", "IELTS 核心词")));
+        assert_eq!(book_from_stem("TOEFL_T"), Some(("toefl", "TOEFL 核心词")));
+        assert_eq!(book_from_stem("my-own-list"), None);
+        assert_eq!(book_from_stem("考研核心词"), None);
+    }
+
+    #[test]
+    fn qwerty_learner_shape_is_accepted() {
+        let raw = r#"[
+            {"usphone":"'kænsl","ukphone":"'kænsl","name":"cancel","trans":["取消， 撤销 (vt.)"]},
+            {"name":"numerous","trans":["众多的 (adj.)","许多的"]}
+        ]"#;
+        let dir = std::env::temp_dir().join("qe_qwerty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("CET6_T.json");
+        std::fs::write(&path, raw).unwrap();
+
+        let plans = parse_json(&path).unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.book_slug, "cet6", "must merge into the CET-6 deck");
+        assert_eq!(plan.book_name, "CET-6 核心词");
+        assert_eq!(plan.words.len(), 2);
+
+        let cancel = &plan.words[0];
+        assert_eq!(cancel.lemma, "cancel");
+        assert_eq!(cancel.translation, "取消， 撤销 (vt.)");
+        assert_eq!(cancel.phonetic.as_deref(), Some("/'kænsl/"));
+
+        let numerous = &plan.words[1];
+        assert_eq!(numerous.translation, "众多的 (adj.); 许多的");
+        assert!(numerous.phonetic.is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }

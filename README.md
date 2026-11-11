@@ -67,15 +67,24 @@ cargo run --release -- books # 查看词书
 - macOS / Linux：`~/.local/share/quietly-english/quietly.db`
 - 覆盖：设置环境变量 `QUIETLY_HOME` 或 `--db <path>`
 
-### 导入正式词库（推荐 ECDICT）
+### 导入正式词库
 
 ```bash
-# 从 https://github.com/skywind3000/ECDICT/releases 下载 ecdict-csv.7z，解压得到 stardict.csv
-quietly import stardict.csv
+quietly import CET6_T.json                      # qwerty-learner 词书，免转换
+quietly dict stardict-ecdict-2.4.2.ifo          # ECDICT StarDict 词典（327 万词条）
+quietly etymology kaikki.org-dictionary-English.jsonl   # Wiktionary 词源（有出处）
+quietly examples cmn_sentences.tsv eng_sentences.tsv links.csv  # Tatoeba 中英例句
 ```
 
-ECDICT 的 `tag` 列会自动生成 `zk / gk / cet4 / cet6 / ky / toefl / ielts / gre` 八本词书，
-每次导入约 77 万词条，只写词条和词书关系，不会覆盖你已经学过的卡片。
+| 数据 | 作用 | 来源 |
+| --- | --- | --- |
+| 词书 JSON | 考试大纲词汇，按文件名自动归入 `cet4`/`cet6`/`ky`/`toefl`/`ielts`/`gre` | [qwerty-learner](https://github.com/RealKai42/qwerty-learner)（MIT） |
+| StarDict | 查词覆盖，含音标与中英释义 | [ECDICT](https://github.com/skywind3000/ECDICT)（MIT） |
+| 词源 JSONL | 词根分解 + 出处，卡片显示 `source:` | [kaikki.org](https://kaikki.org/dictionary/English/)（CC BY-SA） |
+| 例句 TSV | 中英对照例句，每词最多 3 条 | [Tatoeba](https://tatoeba.org/en/downloads)（CC-BY 2.0 FR） |
+
+**词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，没有数据的词显示
+`no etymology on file`。详细下载地址、体积和字段说明见 [docs/data-sources.md](docs/data-sources.md)。
 
 ### 其他格式
 
@@ -84,9 +93,10 @@ quietly import words.json     # {"name":"我的词书","words":[{...}]}
 quietly import words.csv      # word,translation,phonetic,roots,example,example_zh
 quietly import examples.csv   # word,sentence,translation —— 只合并例句
 quietly import list.txt       # 一行一词，释义从已导入的词典里补
+quietly etymology roots.tsv   # lemma/part/gloss/kind/source 五列，自备词根表
 ```
 
-格式细节、字段说明和词库来源见 [docs/vocabulary.md](docs/vocabulary.md)。
+格式细节与字段说明见 [docs/vocabulary.md](docs/vocabulary.md)。
 
 ## 命令
 
@@ -138,7 +148,7 @@ graph LR
 | crate | 职责 |
 | --- | --- |
 | `qe-core` | 纯领域层：`Word`/`SrsCard` 等模型、`srs` 记忆曲线、`affix` 词缀表、`view` 视图模型、`Store` trait |
-| `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`seed` 内置词书 |
+| `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`stardict` 词典、`etymology` 词源、`tatoeba` 例句、`seed` 内置词书 |
 | `qe-tui` | 只消费视图模型：`lines`（换行/排版）、`render`（帧布局）、`theme`、`terminal` |
 | `qe-app` | `Command` 解析、单行编辑器、`StudySession` 会话、`App` 状态机与事件循环 |
 

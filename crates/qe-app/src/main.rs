@@ -76,6 +76,82 @@ fn run() -> Result<()> {
             println!("database: {}", store.path().display());
             Ok(())
         }
+        Some("dict") => {
+            let path = rest
+                .first()
+                .context("用法：quietly dict <.ifo | .idx | .dict>")?;
+            println!("reading StarDict from {path} …");
+            let started = std::time::Instant::now();
+            let (inserted, updated) =
+                store.import_stardict_with(std::path::Path::new(path), &mut |count| {
+                    eprintln!("  {count} entries …");
+                })?;
+            println!(
+                "added {inserted} · updated {updated} · {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            println!("database: {}", store.path().display());
+            Ok(())
+        }
+        Some("examples") => {
+            let cmn = rest
+                .first()
+                .context("用法：quietly examples <cmn_sentences.tsv> <eng_sentences.tsv> <links.csv>")?;
+            let eng = rest
+                .get(1)
+                .context("缺少 eng_sentences.tsv")?;
+            let links = rest
+                .get(2)
+                .context("缺少 links.csv")?;
+
+            println!("collecting Tatoeba pairs for deck words …");
+            let started = std::time::Instant::now();
+            let vocabulary: std::collections::HashSet<String> =
+                store.deck_lemmas()?.into_iter().collect();
+            println!("candidate words: {}", vocabulary.len());
+
+            let (examples, stats) = qe_store::tatoeba::collect_examples(
+                std::path::Path::new(cmn),
+                std::path::Path::new(eng),
+                std::path::Path::new(links),
+                &vocabulary,
+                |stage, done| eprintln!("  {stage}: {done}"),
+            )?;
+            println!(
+                "pairs seen {} · examples minted {} · words covered {} · {:.1}s",
+                stats.pairs,
+                stats.attached,
+                stats.words,
+                started.elapsed().as_secs_f32()
+            );
+
+            let added = store.add_examples(&examples)?;
+            println!("attached {added} examples to existing words");
+            println!("database: {}", store.path().display());
+            Ok(())
+        }
+        Some("etymology") | Some("roots") => {
+            let path = rest
+                .first()
+                .context("用法：quietly etymology <kaikki.jsonl | roots.tsv>")?;
+            println!("reading etymology from {path} …");
+            if path.to_ascii_lowercase().ends_with(".jsonl") {
+                println!("(a full kaikki dump is ~1.5M lines; this can take a few minutes)");
+            }
+            let started = std::time::Instant::now();
+            let (words, morphemes) = store.import_etymology_with(
+                std::path::Path::new(path),
+                &mut |scanned| {
+                    eprintln!("  scanned {scanned} lines …");
+                },
+            )?;
+            println!(
+                "{words} words enriched · {morphemes} morphemes attached · {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            println!("database: {}", store.path().display());
+            Ok(())
+        }
         Some("where") | Some("path") => {
             println!("{}", store.path().display());
             Ok(())
@@ -111,6 +187,8 @@ quietly · terminal english tutor
 USAGE:
     quietly                       打开对话式终端界面
     quietly import <file>         导入词库（ECDICT csv / 通用 csv / json / txt）
+    quietly dict <file>           导入 StarDict 词典（ECDICT 的 ecdict-stardict 包）
+    quietly etymology <file>      导入有出处的词根（kaikki jsonl / roots.tsv）
     quietly books                 列出词书与进度
     quietly stats                 今日统计
     quietly where                 打印数据库路径

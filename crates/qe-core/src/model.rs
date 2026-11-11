@@ -47,11 +47,17 @@ impl RootKind {
 }
 
 /// 单词的一个构词成分，例如 `ab- / 远离 / 前缀`。
+///
+/// `source` records where the breakdown came from (a dictionary entry, a
+/// Wiktionary etymology template, a textbook). Roots are never inferred by code:
+/// if a word has no sourced analysis on file, the card shows nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WordRoot {
     pub part: String,
     pub gloss: String,
     pub kind: RootKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl WordRoot {
@@ -60,7 +66,13 @@ impl WordRoot {
             part: part.into(),
             gloss: gloss.into(),
             kind,
+            source: None,
         }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 }
 
@@ -109,13 +121,13 @@ impl Word {
         }
     }
 
-    /// 优先使用词库中人工录入的词根，缺失时退回词缀表推测。
-    /// 返回 `(roots, guessed)`。
-    pub fn roots_or_guess(&self) -> (Vec<WordRoot>, bool) {
-        if !self.roots.is_empty() {
-            return (self.roots.clone(), false);
-        }
-        (crate::affix::decompose(&self.lemma), true)
+    /// Sourced morpheme breakdown, straight from the word record.
+    ///
+    /// Deliberately no fallback: guessing a split from a built-in affix list
+    /// produces plausible-looking but wrong analyses (`surgeon` → `geo`), so an
+    /// empty list means "no etymology on file".
+    pub fn roots(&self) -> &[WordRoot] {
+        &self.roots
     }
 }
 

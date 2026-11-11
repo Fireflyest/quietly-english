@@ -1,9 +1,13 @@
-//! 内置词缀表与自动词根推测。
+//! 内置词缀索引，只用于 `/root <affix>` 这类主动查询。
 //!
-//! 人工录入的词根来自词库字段 `roots`；没有录入时，用这里的常见前缀/词根/后缀
-//! 做一次保守拆分，命中才展示，避免“乱拆”误导学习者。
+//! **这里不负责拆词。** 单词的词根必须来自有据可查的数据（Wiktionary 词源模板、
+//! 词典条目、词根词缀教材），由 `qe-store` 的 `etymology` 导入器写进 `words.roots`。
+//! 早期版本用这张表做“最长匹配拆分”，会把 `surgeon` 拆出 `geo`、把 `disapproval`
+//! 拆成 `dis- + -al`，属于凭空编造，已移除。
+//!
+//! 表内词缀释义取自通行词源学工具书对常见前缀/词根/后缀的共识释义，仅作查阅参考。
 
-use crate::model::{RootKind, WordRoot};
+use crate::model::RootKind;
 
 /// 一条词缀知识。
 #[derive(Debug, Clone, Copy)]
@@ -257,100 +261,32 @@ fn normalize(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// 保守拆词：至少识别出“前缀+词根”或“词根+后缀”才返回结果。
-pub fn decompose(word: &str) -> Vec<WordRoot> {
-    let lower = word.to_ascii_lowercase();
-    if lower.len() < 4 || !lower.chars().all(|c| c.is_ascii_alphabetic()) {
-        return Vec::new();
-    }
-
-    // 1. 最长匹配前缀，剩余部分至少 3 个字母。
-    let prefix = PREFIXES
-        .iter()
-        .filter(|p| {
-            let pn = normalize(p.part);
-            lower.starts_with(pn.as_str()) && lower.len() - pn.len() >= 3
-        })
-        .max_by_key(|p| p.part.len());
-
-    let after_prefix = match prefix {
-        Some(p) => &lower[normalize(p.part).len()..],
-        None => lower.as_str(),
-    };
-
-    // 2. 最长匹配后缀，剩余部分至少 3 个字母。
-    let suffix = SUFFIXES
-        .iter()
-        .filter(|s| {
-            let sn = normalize(s.part);
-            after_prefix.ends_with(sn.as_str()) && after_prefix.len() - sn.len() >= 3
-        })
-        .max_by_key(|s| s.part.len());
-
-    let suf_len = suffix.map(|s| normalize(s.part).len()).unwrap_or(0);
-    let core = &after_prefix[..after_prefix.len() - suf_len];
-
-    // 3. 在核心部分寻找已知词根（允许 core 前后带少量字母）。
-    let found_root = ROOTS
-        .iter()
-        .filter(|r| {
-            let rn = normalize(r.part);
-            core.contains(rn.as_str()) && rn.len() >= 3
-        })
-        .max_by_key(|r| r.part.len());
-
-    // 4. 置信度门槛：没有词根时，至少需要前缀+后缀同时存在。
-    if found_root.is_none() && (prefix.is_none() || suffix.is_none()) {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    if let Some(p) = prefix {
-        out.push(WordRoot::new(p.part, p.gloss, RootKind::Prefix));
-    }
-    if let Some(r) = found_root {
-        out.push(WordRoot::new(r.part, r.gloss, RootKind::Root));
-    }
-    if let Some(s) = suffix {
-        out.push(WordRoot::new(s.part, s.gloss, RootKind::Suffix));
-    }
-    // 去重（例如 photo- 前缀与 photo 词根同时命中）
-    out.dedup_by(|a, b| normalize(&a.part) == normalize(&b.part));
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decomposes_inspect() {
-        let roots = decompose("inspect");
-        assert!(roots.iter().any(|r| r.part == "in-"));
-        assert!(roots.iter().any(|r| r.part == "spect"));
-    }
-
-    #[test]
-    fn decomposes_visible() {
-        let roots = decompose("visible");
-        assert!(roots.iter().any(|r| r.kind == RootKind::Root && r.part == "vis"));
-        assert!(roots.iter().any(|r| r.part == "ible"));
-    }
-
-    #[test]
-    fn ignores_short_words() {
-        assert!(decompose("cat").is_empty());
-    }
-
-    #[test]
-    fn ignores_unknown_words() {
-        // 没有可识别词根，也没有前缀+后缀组合。
-        assert!(decompose("zebra").is_empty());
-    }
-
-    #[test]
     fn lookup_accepts_hyphenless_input() {
         let hit = lookup("spect").expect("spect should exist");
         assert_eq!(hit.gloss, "看");
+    }
+
+    #[test]
+    fn lookup_normalises_hyphens() {
+        let hit = lookup("-ology").expect("ology should exist");
+        assert_eq!(hit.kind, RootKind::Suffix);
+        assert_eq!(hit.part, "ology");
+    }
+
+    #[test]
+    fn containing_finds_related_affixes() {
+        let hits = containing("olog");
+        assert!(hits.iter().any(|affix| affix.part == "ology"));
+    }
+
+    #[test]
+    fn empty_query_is_ignored() {
+        assert!(lookup("").is_none());
+        assert!(containing("").is_empty());
     }
 }

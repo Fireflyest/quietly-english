@@ -734,6 +734,14 @@ impl Store for SqliteStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn deck_lemmas(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT lower(w.lemma) FROM book_words bw JOIN words w ON w.id = bw.word_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn daily(&self, day: NaiveDate) -> Result<DailyStats> {
         let key = time::format_day(day);
         let (reviews, new_learned, again, hard, good, easy): (i64, i64, i64, i64, i64, i64) =
@@ -961,7 +969,112 @@ impl Store for SqliteStore {
                 report.skipped += missing;
                 Ok(report)
             }
+            FileKind::Etymology => {
+                let (words, morphemes) = self.import_etymology(path)?;
+                Ok(ImportReport {
+                    inserted: 0,
+                    updated: words,
+                    // Reported as the number of morphemes attached; `books` is used
+                    // here to surface it in the CLI summary.
+                    skipped: 0,
+                    books: vec![("morphemes".to_string(), morphemes)],
+                })
+            }
         }
+    }
+
+    fn import_stardict_with(
+        &mut self,
+        path: &Path,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(u32, u32)> {
+        use crate::stardict::Stardict;
+
+        let mut dict = Stardict::open(path)?;
+        let tx = self.conn.transaction()?;
+        let mut inserted = 0u32;
+        let mut updated = 0u32;
+
+        dict.for_each_word(progress, |word| {
+            let (id, is_new) = upsert_word_tx(
+                &tx,
+                &word.lemma,
+                word.phonetic.as_deref(),
+                &word.translation,
+                None,
+                "[]",
+                "[]",
+                "[]",
+                "ecdict-stardict",
+            )?;
+            let _ = id;
+            if is_new {
+                inserted += 1;
+            } else {
+                updated += 1;
+            }
+            Ok(())
+        })?;
+
+        tx.commit()?;
+        Ok((inserted, updated))
+    }
+
+    fn import_etymology_with(
+        &mut self,
+        path: &Path,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(u32, u32)> {
+        use crate::etymology;
+
+        // Only words we already have can be enriched; load them once instead of
+        // hitting the database for every one of the million entries in the dump.
+        let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = self.conn.prepare("SELECT lemma FROM words")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for lemma in rows {
+                existing.insert(lemma?.to_ascii_lowercase());
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+        let mut words = 0u32;
+        let mut morphemes = 0u32;
+
+        if etymology::looks_like_jsonl(path) {
+            // Pass one gathers the affixes' own glosses, pass two walks every word.
+            let index = etymology::index_morphemes(path)?;
+            etymology::for_each_analysis(path, &index, progress, |lemma, roots| {
+                if !existing.contains(&lemma.to_ascii_lowercase()) {
+                    return Ok(());
+                }
+                let payload = serde_json::to_string(&roots)?;
+                tx.execute(
+                    "UPDATE words SET roots = ?1 WHERE lemma = ?2",
+                    params![payload, lemma],
+                )?;
+                words += 1;
+                morphemes += roots.len() as u32;
+                Ok(())
+            })?;
+        } else {
+            for (lemma, roots) in etymology::parse_roots_tsv(path)? {
+                if !existing.contains(&lemma.to_ascii_lowercase()) {
+                    continue;
+                }
+                let payload = serde_json::to_string(&roots)?;
+                tx.execute(
+                    "UPDATE words SET roots = ?1 WHERE lemma = ?2",
+                    params![payload, lemma],
+                )?;
+                words += 1;
+                morphemes += roots.len() as u32;
+            }
+        }
+
+        tx.commit()?;
+        Ok((words, morphemes))
     }
 
     fn add_examples(&mut self, examples: &[(String, Example)]) -> Result<u32> {

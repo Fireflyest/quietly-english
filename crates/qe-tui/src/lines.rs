@@ -270,17 +270,27 @@ fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
                 out.extend(rail_text(text, width, rail, theme::value()));
             }
             ToolLine::Kv { key, value } => {
+                // Values can be full sentences (Wiktionary glosses), so they wrap
+                // under the key column instead of running off the card.
                 let key_width = 14.min(inner.saturating_sub(4));
                 let key_text = truncate(key, key_width);
-                out.push(rail_line(
-                    rail,
-                    0,
-                    vec![
-                        Span::styled(pad_right(&key_text, key_width), theme::muted()),
-                        Span::styled("  ", Style::default()),
-                        Span::styled(value.clone(), theme::text()),
-                    ],
-                ));
+                let wrapped = wrap(value, inner.saturating_sub(key_width + 2).max(8));
+                for (index, piece) in wrapped.iter().enumerate() {
+                    let lead = if index == 0 {
+                        pad_right(&key_text, key_width)
+                    } else {
+                        " ".repeat(key_width)
+                    };
+                    out.push(rail_line(
+                        rail,
+                        0,
+                        vec![
+                            Span::styled(lead, theme::muted()),
+                            Span::styled("  ", Style::default()),
+                            Span::styled(piece.clone(), theme::text()),
+                        ],
+                    ));
+                }
             }
             ToolLine::Bar { label, value, max } => {
                 const BAR_WIDTH: usize = 10;

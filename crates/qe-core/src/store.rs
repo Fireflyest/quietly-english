@@ -61,6 +61,8 @@ pub trait Store {
     fn word(&self, lemma: &str) -> Result<Option<Word>>;
     /// 按单词或词根片段搜索，`needle` 不区分大小写。
     fn search(&self, needle: &str, limit: usize) -> Result<Vec<Word>>;
+    /// 所有词书里出现过的词（小写），用于给例句挑选候选。
+    fn deck_lemmas(&self) -> Result<Vec<String>>;
 
     // ---- 统计 ----
     fn daily(&self, day: NaiveDate) -> Result<DailyStats>;
@@ -77,4 +79,29 @@ pub trait Store {
     fn add_examples(&mut self, examples: &[(String, Example)]) -> Result<u32>;
     /// 按文件后缀与表头自动选择导入器（ECDICT / JSON / CSV / TXT）。
     fn import_file(&mut self, path: &Path) -> Result<ImportReport>;
+    /// 导入有出处的词源数据（kaikki/Wiktionary JSONL 或 TSV），只更新已有词条。
+    /// 返回 `(已更新词数, 词素数)`。
+    fn import_etymology(&mut self, path: &Path) -> Result<(u32, u32)> {
+        self.import_etymology_with(path, &mut |_| {})
+    }
+
+    /// 同上，但每扫过 10 万行回调一次已扫描行数。
+    fn import_etymology_with(
+        &mut self,
+        path: &Path,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(u32, u32)>;
+
+    /// 导入 StarDict 词典（ECDICT 的 `ecdict-stardict` 包），写入 `words` 表。
+    /// 返回 `(新增, 更新)`。
+    fn import_stardict(&mut self, path: &Path) -> Result<(u32, u32)> {
+        self.import_stardict_with(path, &mut |_| {})
+    }
+
+    /// 同上，每 10 万条回调一次已处理条数。
+    fn import_stardict_with(
+        &mut self,
+        path: &Path,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(u32, u32)>;
 }
