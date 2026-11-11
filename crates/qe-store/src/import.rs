@@ -14,7 +14,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use qe_core::model::{Example, ImportPlan, RootKind, Word, WordRoot};
+use qe_core::model::{Collocation, Example, ImportPlan, RootKind, Word, WordRoot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -510,6 +510,53 @@ pub fn parse_examples_csv(path: &Path) -> Result<Vec<(String, Example)>> {
         out.push((lemma.to_string(), Example::new(en, zh)));
     }
     Ok(out)
+}
+
+/// 常用词组 / 固定搭配表：`lemma<TAB>phrase<TAB>gloss`。
+///
+/// 首行可以带表头（含 `lemma` / `phrase` 字样），也可以直接是数据。
+/// 逗号分隔同样可以，因为分隔符是探测出来的。
+pub fn parse_phrases(path: &Path) -> Result<Vec<(String, Collocation)>> {
+    let mut reader = csv_reader(path)?;
+    let headers = reader.headers()?.clone();
+    let first = headers.iter().next().unwrap_or("").to_ascii_lowercase();
+    let has_header = first.contains("lemma") || first.contains("word") || first.contains("phrase");
+    let map = if has_header {
+        header_map(&headers)
+    } else {
+        // 无表头时按位置解释，让 `demo.tsv` 这种手工文件也能直接导入。
+        HashMap::from([
+            ("lemma".to_string(), 0usize),
+            ("phrase".to_string(), 1),
+            ("gloss".to_string(), 2),
+        ])
+    };
+
+    let mut out = Vec::new();
+    let mut records = reader.records();
+    if !has_header {
+        // `headers()` already consumed the first record; replay it as data.
+        if let Some((lemma, phrase, gloss)) = phrase_row(&headers, &map) {
+            out.push((lemma, Collocation::new(phrase, gloss)));
+        }
+    }
+    for record in records.by_ref() {
+        let record = record?;
+        if let Some((lemma, phrase, gloss)) = phrase_row(&record, &map) {
+            out.push((lemma, Collocation::new(phrase, gloss)));
+        }
+    }
+    Ok(out)
+}
+
+fn phrase_row(record: &csv::StringRecord, map: &HashMap<String, usize>) -> Option<(String, String, String)> {
+    let lemma = pick(record, map, &["lemma", "word"]);
+    let phrase = pick(record, map, &["phrase", "collocation", "搭配", "词组"]);
+    if lemma.is_empty() || phrase.is_empty() {
+        return None;
+    }
+    let gloss = pick(record, map, &["gloss", "meaning", "translation", "释义"]);
+    Some((lemma.to_string(), phrase.to_string(), gloss.to_string()))
 }
 
 /// 纯词表：一行一个单词，忽略空行与 `#` 注释。

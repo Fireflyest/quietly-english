@@ -88,6 +88,9 @@ pub struct ToolView {
     pub result: Option<String>,
     /// Indented detail lines.
     pub lines: Vec<ToolLine>,
+    /// Optional right-hand column, rendered beside `lines` when the terminal is
+    /// wide enough and stacked underneath it otherwise.
+    pub aside: Vec<ToolLine>,
     pub accent: Accent,
 }
 
@@ -98,6 +101,7 @@ impl ToolView {
             badge: None,
             result: None,
             lines: Vec::new(),
+            aside: Vec::new(),
             accent: Accent::Neutral,
         }
     }
@@ -119,6 +123,12 @@ impl ToolView {
 
     pub fn line(mut self, line: ToolLine) -> Self {
         self.lines.push(line);
+        self
+    }
+
+    /// Add a line to the right-hand column.
+    pub fn aside(mut self, line: ToolLine) -> Self {
+        self.aside.push(line);
         self
     }
 
@@ -178,60 +188,132 @@ impl ToolView {
             return view;
         }
 
-        let translation = if word.translation.trim().is_empty() {
-            "(no definition yet)".to_string()
+        let parsed = word.senses();
+        if parsed.senses.is_empty() {
+            view = view.text("(no definition yet)".to_string());
         } else {
-            word.translation.clone()
-        };
-        for line in translation.split('\n') {
-            view = view.text(line.to_string());
+            // Common senses are numbered so the card reads like a dictionary entry;
+            // domain-tagged ones (`[医]`, `[古]`) are grouped below, which is how the
+            // "rare meaning" case gets separated from everyday usage.
+            let (common, secondary): (Vec<&crate::text::Sense>, Vec<&crate::text::Sense>) =
+                parsed.senses.iter().partition(|sense| !sense.is_secondary());
+
+            for (index, sense) in common.iter().enumerate() {
+                view = view.line(ToolLine::Sense {
+                    index: index + 1,
+                    label: sense.pos.clone(),
+                    text: sense.text.clone(),
+                });
+            }
+
+            if !secondary.is_empty() {
+                view = view.muted("rare / technical".to_string());
+                for sense in &secondary {
+                    view = view.line(ToolLine::Sense {
+                        index: 0,
+                        label: format!("[{}]", sense.label),
+                        text: sense.text.clone(),
+                    });
+                }
+            }
+
+            if let Some(forms) = parsed.forms {
+                view = view.muted(forms);
+            }
+        }
+
+        // Wiktionary's English glosses fill in what ECDICT lacks: `sake` has no
+        // "Japanese rice wine" in the Chinese source, so it shows up here.
+        if !word.glosses.is_empty() {
+            view = view.spacer().muted("more meanings".to_string());
+            for gloss in &word.glosses {
+                view = view.line(ToolLine::Gloss {
+                    text: gloss.text.clone(),
+                    tags: gloss.tags.clone(),
+                });
+            }
+        }
+
+        if let Some(freq) = crate::text::freq(&word.translation) {
+            let mut label = crate::text::stars(freq);
+            if freq.oxford {
+                label.push_str("  oxford");
+            }
+            view = view.muted(label);
         }
         if let Some(definition) = &word.definition {
             view = view.muted(definition.clone());
         }
 
-        let roots = word.roots();
-        if roots.is_empty() {
-            view = view
-                .spacer()
-                .muted("no etymology on file · /root <affix> looks up affixes");
-        } else {
-            // Morphemes go on one compact line; each gloss gets its own line because
-            // Wiktionary definitions run long and would otherwise blow out the width.
-            let parts: Vec<String> = roots
-                .iter()
-                .map(|root| format!("{} ({})", root.part, root.kind.label()))
-                .collect();
-            view = view.spacer().text(parts.join("  +  "));
-
-            for root in roots.iter().filter(|r| !r.gloss.is_empty()) {
-                view = view.line(ToolLine::Kv {
-                    key: root.part.clone(),
-                    value: root.gloss.clone(),
+        if !word.collocations.is_empty() {
+            view = view.spacer().muted("phrases".to_string());
+            for collocation in &word.collocations {
+                view = view.line(ToolLine::Phrase {
+                    phrase: collocation.phrase.clone(),
+                    gloss: collocation.gloss.clone(),
                 });
             }
+        }
 
-            // Attribution, so a learner can check where the split came from.
+        let roots = word.roots();
+        if !roots.is_empty() {
+            // Rendered like a function definition, because that is what a word's
+            // morphology actually is: a name applied to typed parts.
+            //
+            //     hopeless(hope : root, -less : suffix) {
+            //         hope  -> to hope
+            //         -less -> lacking (something)
+            //     }
+            let parts: Vec<(String, String)> = roots
+                .iter()
+                .map(|root| (root.part.clone(), root.kind.label().to_string()))
+                .collect();
+
+            let body: Vec<(String, String)> = roots
+                .iter()
+                .map(|root| {
+                    // Keep every part so the body mirrors the signature; a missing
+                    // gloss becomes an em dash instead of a vanished line.
+                    let gloss = if root.gloss.trim().is_empty() {
+                        "—".to_string()
+                    } else {
+                        root.gloss.clone()
+                    };
+                    (root.part.clone(), gloss)
+                })
+                .collect();
+
             let sources: Vec<&str> = roots
                 .iter()
                 .filter_map(|r| r.source.as_deref())
                 .collect();
-            if let Some(first) = sources.first() {
-                let label = if sources.len() > 1 {
-                    format!("source: {first} (+{} more)", sources.len() - 1)
+            let source = sources.first().map(|first| {
+                if sources.len() > 1 {
+                    format!("{first} (+{} more)", sources.len() - 1)
                 } else {
-                    format!("source: {first}")
-                };
-                view = view.muted(label);
-            }
+                    (*first).to_string()
+                }
+            });
+
+            view = view.spacer().line(ToolLine::Code(CodeBlock {
+                name: word.lemma.clone(),
+                parts,
+                body,
+                source,
+            }));
         }
 
         if !word.examples.is_empty() {
-            view = view.spacer().muted("examples");
-            for example in word.examples.iter().take(3) {
-                view = view.line(ToolLine::Example {
+            // Examples live in the right-hand column so the meaning and the
+            // etymology keep the left, and the headword inside each sentence is
+            // highlighted against its surroundings.
+            view = view.aside(ToolLine::Muted("examples".to_string()));
+            for (index, example) in word.examples.iter().take(3).enumerate() {
+                view = view.aside(ToolLine::Example {
+                    index: index + 1,
                     en: example.en.clone(),
                     zh: example.zh.clone(),
+                    highlight: Some(word.lemma.clone()),
                 });
             }
         }
@@ -314,23 +396,46 @@ impl CardState {
         self
     }
 
+    /// Progressive hint shown before the answer is revealed.
+    ///
+    /// Ordered by how much it gives away: the morphological split first (it is
+    /// already on the card once revealed, so it mainly jogs memory), then an
+    /// example sentence for context, then only the part of speech.
     fn hint_lines(&self) -> Vec<ToolLine> {
         if !self.hint {
             return Vec::new();
         }
+
         let roots = self.word.roots();
-        if roots.is_empty() {
-            let first = self.word.lemma.chars().next().unwrap_or('?');
-            return vec![ToolLine::Muted(format!(
-                "hint: starts with '{first}', {} letters",
-                self.word.lemma.chars().count()
-            ))];
+        if !roots.is_empty() {
+            let parts: Vec<String> = roots
+                .iter()
+                .map(|root| format!("{} ({}, {})", root.part, root.kind.label(), root.gloss))
+                .collect();
+            return vec![ToolLine::Muted(format!("hint: {}", parts.join("  +  ")))];
         }
-        let parts: Vec<String> = roots
-            .iter()
-            .map(|root| format!("{} ({}, {})", root.part, root.kind.label(), root.gloss))
-            .collect();
-        vec![ToolLine::Muted(format!("hint: {}", parts.join("  +  ")))]
+
+        // No etymology on file: an example puts the word in context without
+        // spelling out its meaning. The translation is withheld on purpose — it
+        // would hand over the answer the hint is meant to nudge towards.
+        if let Some(example) = self.word.examples.first() {
+            let mut lines = vec![ToolLine::Muted("hint: example".to_string())];
+            lines.push(ToolLine::Example {
+                index: 1,
+                en: example.en.clone(),
+                zh: None,
+                highlight: Some(self.word.lemma.clone()),
+            });
+            return lines;
+        }
+
+        // Nothing else: at least say what kind of word it is.
+        let kinds = crate::text::parts_of_speech(&self.word.translation);
+        if !kinds.is_empty() {
+            return vec![ToolLine::Muted(format!("hint: {}", kinds.join(" / ")))];
+        }
+
+        vec![ToolLine::Muted("hint: nothing on file · space to peek".to_string())]
     }
 
     fn prompt(&self) -> String {
@@ -351,10 +456,51 @@ pub enum ToolLine {
     Accent(String),
     Kv { key: String, value: String },
     Bar { label: String, value: u32, max: u32 },
-    Example { en: String, zh: Option<String> },
+    Example {
+        /// 1-based position in the example list, shown as a gutter number.
+        index: usize,
+        en: String,
+        zh: Option<String>,
+        /// Word to emphasise inside `en`. Matched case-insensitively, including the
+        /// common inflections (`-s`, `-es`, `-ed`, `-ing`, `-d`).
+        highlight: Option<String>,
+    },
+    /// One dictionary sense. `index == 0` means no number (a secondary sense).
+    Sense {
+        index: usize,
+        /// Part of speech (`n.`) or a bracketed domain tag (`[医]`).
+        label: String,
+        text: String,
+    },
+    /// A fixed expression: `for the sake of → 为了`.
+    Phrase { phrase: String, gloss: String },
+    /// One English gloss from Wiktionary, with optional register tags.
+    Gloss { text: String, tags: Vec<String> },
     /// Four rating options, the selected one highlighted.
     Rating { selected: Option<Rating> },
+    /// Morphology rendered as a code block.
+    Code(CodeBlock),
     Spacer,
+}
+
+/// A word's morphology, laid out like a function definition:
+///
+/// ```text
+/// hopeless(hope : root, -less : suffix) {
+///     hope  -> to hope
+///     -less -> lacking (something)
+/// }  // Wiktionary {{af}}
+/// ```
+#[derive(Debug, Clone)]
+pub struct CodeBlock {
+    /// Headword, shown as the function name.
+    pub name: String,
+    /// `(part, kind)` pairs in the signature.
+    pub parts: Vec<(String, String)>,
+    /// `(part, gloss)` pairs in the body.
+    pub body: Vec<(String, String)>,
+    /// Optional attribution, shown as a trailing comment.
+    pub source: Option<String>,
 }
 
 /// Tabular output (books, search hits, affix lists).
@@ -476,9 +622,12 @@ pub fn summary_tool(
 pub fn example_lines(examples: &[Example]) -> Vec<ToolLine> {
     examples
         .iter()
-        .map(|e| ToolLine::Example {
+        .enumerate()
+        .map(|(index, e)| ToolLine::Example {
+            index: index + 1,
             en: e.en.clone(),
             zh: e.zh.clone(),
+            highlight: None,
         })
         .collect()
 }
@@ -572,5 +721,153 @@ mod tests {
         assert_eq!(state.accent, Accent::Warn);
         let view = ToolView::word_card(&state);
         assert_eq!(view.accent, Accent::Warn, "rail colour must reach the block");
+    }
+
+    /// Only the `hint:` lines, so the card's own prompt does not get in the way.
+    fn hint_texts(view: &ToolView) -> Vec<String> {
+        view.lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Muted(text) if text.starts_with("hint:") => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hint_prefers_the_morphological_split() {
+        let mut word = crate::model::Word::new("hopeless", "a. 无希望的");
+        word.roots = vec![crate::model::WordRoot::new(
+            "-less",
+            "lacking",
+            crate::model::RootKind::Suffix,
+        )];
+        word.examples = vec![crate::model::Example::new("You are hopeless.", None)];
+
+        let view = ToolView::word_card(&CardState::new(word, "1/3").hint(true));
+        let text = hint_texts(&view).join("\n");
+        assert!(text.contains("-less (suffix, lacking)"), "{text}");
+        assert!(!text.contains("You are hopeless."), "roots win over examples");
+    }
+
+    #[test]
+    fn hint_falls_back_to_an_example_without_roots() {
+        let mut word = crate::model::Word::new("serendipity", "n. 意外发现");
+        word.examples = vec![crate::model::Example::new(
+            "It was pure serendipity.",
+            Some("纯属意外。".into()),
+        )];
+
+        let view = ToolView::word_card(&CardState::new(word, "1/3").hint(true));
+        assert!(hint_texts(&view).iter().any(|t| t.contains("hint: example")));
+        let example = view
+            .lines
+            .iter()
+            .find_map(|line| match line {
+                ToolLine::Example { en, zh, highlight, .. } => Some((en, zh, highlight)),
+                _ => None,
+            })
+            .expect("hint should carry an example");
+        assert!(example.0.contains("serendipity"));
+        assert_eq!(example.2.as_deref(), Some("serendipity"));
+        // The translation would give the answer away, so the hint omits it.
+        assert!(example.1.is_none(), "hint example must not show the Chinese");
+    }
+
+    #[test]
+    fn hint_falls_back_to_the_part_of_speech() {
+        let word = crate::model::Word::new("abandon", "-K3\nvt. 放弃\nn. 放任");
+        let view = ToolView::word_card(&CardState::new(word, "1/3").hint(true));
+        let text = hint_texts(&view).join("\n");
+        assert_eq!(text.trim(), "hint: vt / n");
+        assert!(!text.contains("letters"), "letter count is no longer shown");
+    }
+
+    #[test]
+    fn hint_says_so_when_nothing_is_known() {
+        let word = crate::model::Word::new("zzz", "");
+        let view = ToolView::word_card(&CardState::new(word, "1/3").hint(true));
+        let text = hint_texts(&view).join("\n");
+        assert!(text.contains("nothing on file"), "{text}");
+    }
+
+    #[test]
+    fn hint_is_hidden_until_requested() {
+        let word = crate::model::Word::new("abandon", "vt. 放弃");
+        let view = ToolView::word_card(&CardState::new(word, "1/3"));
+        assert!(hint_texts(&view).is_empty());
+    }
+
+    fn senses(view: &ToolView) -> Vec<(usize, String, String)> {
+        view.lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Sense { index, label, text } => {
+                    Some((*index, label.clone(), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn common_senses_are_numbered_and_rare_ones_follow() {
+        let word = crate::model::Word::new(
+            "bank",
+            "-K1\nn. 银行, 堤, 岸\n[医] 库\n[时态] banked, banking, banks",
+        );
+        let view = ToolView::word_card(&CardState::new(word, "lookup").revealed());
+
+        let rows = senses(&view);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1, "common sense is numbered from 1");
+        assert_eq!(rows[0].1, "n.");
+        assert_eq!(rows[1].0, 0, "secondary sense is unnumbered");
+        assert_eq!(rows[1].1, "[医]");
+
+        let texts: Vec<String> = view
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Muted(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t == "rare / technical"));
+        assert!(texts.iter().any(|t| t.contains("[时态] banked")));
+    }
+
+    #[test]
+    fn collocations_render_below_the_senses() {
+        let mut word = crate::model::Word::new("sake", "n. 目的, 缘故");
+        word.collocations = vec![
+            crate::model::Collocation::new("for the sake of", "为了"),
+            crate::model::Collocation::new("for its own sake", "为了本身"),
+        ];
+        let view = ToolView::word_card(&CardState::new(word, "lookup").revealed());
+
+        let phrases: Vec<(String, String)> = view
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Phrase { phrase, gloss } => Some((phrase.clone(), gloss.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phrases.len(), 2);
+        assert_eq!(phrases[0].0, "for the sake of");
+        assert_eq!(phrases[0].1, "为了");
+    }
+
+    #[test]
+    fn word_without_roots_does_not_scold_the_reader() {
+        // An empty etymology block simply does not render; the old placeholder made
+        // 63% of cards carry a line of noise.
+        let word = crate::model::Word::new("sake", "n. 目的");
+        let view = ToolView::word_card(&CardState::new(word, "lookup").revealed());
+        assert!(!view.lines.iter().any(|line| matches!(
+            line,
+            ToolLine::Muted(text) if text.contains("no etymology")
+        )));
     }
 }

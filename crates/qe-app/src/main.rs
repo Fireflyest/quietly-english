@@ -77,13 +77,20 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("dict") => {
+            // `--merge` layers this dictionary on top of what is already stored,
+            // which is how you combine ECDICT + 21世纪 + 朗道 without losing data.
+            let merge = rest.iter().any(|arg| arg == "--merge" || arg == "-m");
             let path = rest
-                .first()
-                .context("用法：quietly dict <.ifo | .idx | .dict>")?;
-            println!("reading StarDict from {path} …");
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .context("用法：quietly dict <dict.ifo> [--merge]")?;
+            println!(
+                "reading StarDict from {path} …{}",
+                if merge { " (merging into existing senses)" } else { "" }
+            );
             let started = std::time::Instant::now();
             let (inserted, updated) =
-                store.import_stardict_with(std::path::Path::new(path), &mut |count| {
+                store.import_stardict_with(std::path::Path::new(path), merge, &mut |count| {
                     eprintln!("  {count} entries …");
                 })?;
             println!(
@@ -128,6 +135,36 @@ fn run() -> Result<()> {
             let added = store.add_examples(&examples)?;
             println!("attached {added} examples to existing words");
             println!("database: {}", store.path().display());
+            Ok(())
+        }
+        Some("phrases") | Some("collocations") => {
+            let path = rest
+                .first()
+                .context("用法：quietly phrases <lemma,phrase,gloss.tsv>")?;
+            println!("reading phrases from {path} …");
+            let (words, added) = store.import_phrases(std::path::Path::new(path))?;
+            println!("{added} phrases added across {words} words");
+            println!("database: {}", store.path().display());
+            Ok(())
+        }
+        Some("phrase") => {
+            // 单条补录：`quietly phrase sake for the sake of = 为了`
+            let spec = rest.join(" ").trim().to_string();
+            let (head, gloss) = spec
+                .split_once('=')
+                .context("用法：quietly phrase <词> <搭配> = <释义>")?;
+            let mut parts = head.split_whitespace();
+            let lemma = parts.next().context("缺少词条，例如：quietly phrase sake for the sake of = 为了")?;
+            let phrase = parts.collect::<Vec<_>>().join(" ");
+            if phrase.is_empty() {
+                bail!("缺少搭配，例如：quietly phrase sake for the sake of = 为了");
+            }
+            let added = store.add_collocation(lemma, &phrase, gloss.trim())?;
+            if added {
+                println!("added · {lemma} · {phrase} -> {}", gloss.trim());
+            } else {
+                println!("already on file · {lemma} · {phrase}");
+            }
             Ok(())
         }
         Some("etymology") | Some("roots") => {
@@ -187,8 +224,10 @@ quietly · terminal english tutor
 USAGE:
     quietly                       打开对话式终端界面
     quietly import <file>         导入词库（ECDICT csv / 通用 csv / json / txt）
-    quietly dict <file>           导入 StarDict 词典（ECDICT 的 ecdict-stardict 包）
+    quietly dict <file> [--merge] 导入 StarDict 词典；--merge 追加义项而非覆盖
     quietly etymology <file>      导入有出处的词根（kaikki jsonl / roots.tsv）
+    quietly phrases <file>        批量导入常用词组（lemma,phrase,gloss）
+    quietly phrase <词> <搭配> = <释义>   单条补录词组
     quietly books                 列出词书与进度
     quietly stats                 今日统计
     quietly where                 打印数据库路径
@@ -201,7 +240,6 @@ OPTIONS:
 TUI 命令：
     /study [n]   开始学习      /books       词书列表
     /book <slug> 切换词书      /search <q>  搜索
-    /root <affix> 查词根       /summary     每日总结
-    /import <p>  导入文件      /help        帮助"
+    /root <affix> 查词根       /summary     每日总结    /phrase <词> <搭配> = <释义>   补录固定搭配    /import <p>  导入文件      /help        帮助"
     );
 }

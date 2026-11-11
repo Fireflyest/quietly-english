@@ -72,6 +72,7 @@ cargo run --release -- books # 查看词书
 ```bash
 quietly import CET6_T.json                      # qwerty-learner 词书，免转换
 quietly dict stardict-ecdict-2.4.2.ifo          # ECDICT StarDict 词典（327 万词条）
+quietly dict stardict-langdao-ec-gb.ifo --merge # 再叠一本，只追加新义项不覆盖
 quietly etymology kaikki.org-dictionary-English.jsonl   # Wiktionary 词源（有出处）
 quietly examples cmn_sentences.tsv eng_sentences.tsv links.csv  # Tatoeba 中英例句
 ```
@@ -79,12 +80,12 @@ quietly examples cmn_sentences.tsv eng_sentences.tsv links.csv  # Tatoeba 中英
 | 数据 | 作用 | 来源 |
 | --- | --- | --- |
 | 词书 JSON | 考试大纲词汇，按文件名自动归入 `cet4`/`cet6`/`ky`/`toefl`/`ielts`/`gre` | [qwerty-learner](https://github.com/RealKai42/qwerty-learner)（MIT） |
-| StarDict | 查词覆盖，含音标与中英释义 | [ECDICT](https://github.com/skywind3000/ECDICT)（MIT） |
+| StarDict | 查词覆盖，含音标与中英释义；加 `--merge` 可叠多本 | [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）· [huzheng](http://download.huzheng.org/zh_CN/) |
 | 词源 JSONL | 词根分解 + 出处，卡片显示 `source:` | [kaikki.org](https://kaikki.org/dictionary/English/)（CC BY-SA） |
 | 例句 TSV | 中英对照例句，每词最多 3 条 | [Tatoeba](https://tatoeba.org/en/downloads)（CC-BY 2.0 FR） |
 
-**词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，没有数据的词显示
-`no etymology on file`。详细下载地址、体积和字段说明见 [docs/data-sources.md](docs/data-sources.md)。
+**词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，没有数据的词就不显示词根区块。
+详细下载地址、体积和字段说明见 [docs/data-sources.md](docs/data-sources.md)。
 
 ### 其他格式
 
@@ -93,6 +94,7 @@ quietly import words.json     # {"name":"我的词书","words":[{...}]}
 quietly import words.csv      # word,translation,phonetic,roots,example,example_zh
 quietly import examples.csv   # word,sentence,translation —— 只合并例句
 quietly import list.txt       # 一行一词，释义从已导入的词典里补
+quietly phrases words.tsv     # lemma,phrase,gloss —— 补常用词组/固定搭配
 quietly etymology roots.tsv   # lemma/part/gloss/kind/source 五列，自备词根表
 ```
 
@@ -110,6 +112,7 @@ quietly etymology roots.tsv   # lemma/part/gloss/kind/source 五列，自备词�
 | `/import <path>` | 在应用内导入词库 |
 | `/limit [n]` | 查看 / 设置每日新词上限（持久化） |
 | `/add <word>` | 把生词加入当前词书（词典里没有就用搜索补全） |
+| `/phrase <w> <phrase> = <释义>` | 给一个词补一条固定搭配，如 `/phrase sake for the sake of = 为了` |
 | `/bury` | 把当前卡推迟到明天 |
 | `/undo` | 撤销上一次评分，回到那张卡 |
 | `/quiet` | 低调模式，隐藏顶栏词书名 |

@@ -312,9 +312,11 @@ fn render_input(frame: &mut Frame, area: Rect, view: &View) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, view: &View) {
+    // `F2` releases the mouse so the terminal can select text; it belongs in the
+    // hint because nothing else on screen hints that copy is even possible.
     let hint = match view.mode {
-        ViewMode::Study => "1-4 grade · enter/s next · tab hint · esc end",
-        ViewMode::Input => "tab complete · ↑↓ history · ctrl+c quit",
+        ViewMode::Study => "1-4 grade · enter next · tab hint · F2 select · esc end",
+        ViewMode::Input => "tab complete · ↑↓ history · F2 select · ctrl+c quit",
     };
     let status = if view.unread > 0 {
         format!("↓ {} new · end to jump", view.unread)
@@ -543,5 +545,49 @@ mod tests {
         let prompt = line.find('›').unwrap();
         let caret = line.find("type a word").unwrap();
         assert!(caret > prompt, "caret must sit between prompt and hint: {line:?}");
+    }
+
+    #[test]
+    fn etymology_renders_on_a_tinted_panel() {
+        let word = sample_word();
+        let messages = vec![Message::tool(ToolView::word_card(
+            &CardState::new(word, "lookup").revealed(),
+        ))];
+        let view = View {
+            messages: &messages,
+            input: "",
+            input_cursor: 0,
+            mode: ViewMode::Input,
+            title: "",
+            context: None,
+            meta: None,
+            status: "",
+            placeholder: "",
+            ghost: None,
+            suggestions: &[],
+            scroll_back: 0,
+            cursor_on: true,
+            unread: 0,
+        };
+        let buffer = buffer_of(&view, 80, 24);
+        let panel = theme::PANEL_BG;
+
+        // The etymology block must produce at least one full row of tint, and the
+        // tint must stop before the end of the transcript (no bleeding into the
+        // meaning paragraph above).
+        let mut tinted_rows = 0;
+        for y in 0..buffer.area.height {
+            let mut tinted = 0;
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].bg == panel {
+                    tinted += 1;
+                }
+            }
+            if tinted > 20 {
+                tinted_rows += 1;
+                assert!(tinted <= buffer.area.width as usize, "row {y} overflows");
+            }
+        }
+        assert!(tinted_rows >= 2, "expected a tinted block, got {tinted_rows} rows");
     }
 }

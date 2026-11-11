@@ -79,6 +79,41 @@ StarDict 是二进制格式：`.idx` 存"词条 + 偏移 + 长度"，`.dict` 是
 
 > ECDICT **没有词根、没有例句**，这两层分开导入。
 
+### 叠第二本、第三本词典
+
+ECDICT 是「简明」词典，义项少而精。想补全释义（尤其是生僻义）可以再叠一本，
+关键是加 `--merge`，否则后导入的会**整体覆盖**已有释义：
+
+```bash
+quietly dict stardict-langdao-ec-gb.ifo --merge
+```
+
+合并以**释义行**为单位：已有条目里没有的行追加到末尾，重复的行（忽略空格与
+全角标点差异）跳过。所以 AB 两本词典里都有的词，行数只增不减，顺序也不会变。
+
+可叠的 StarDict 词典（<http://download.huzheng.org/zh_CN/>，均为 StarDict 格式，
+解压后直接 `.ifo`）：
+
+| 文件 | 体积 | 内容 |
+| --- | --- | --- |
+| `stardict-langdao-ec-gb-2.4.2.tar.bz2` | 8.3 MB | 朗道英汉，义项较全 |
+| `stardict-21shijianji-ec-2.4.2.tar.bz2` | 8.0 MB | 21 世纪英汉，百科式释义 |
+| `stardict-oald-cn-2.4.2.tar.bz2` | 7.4 MB | 牛津高阶，含搭配与例句片段 |
+| `stardict-ProECCE-2.4.2.tar.bz2` | 8.2 MB | 专业计算机词汇 |
+| `stardict-xdict-ec-gb-2.4.2.tar.bz2` | 3.4 MB | 人教社 xdict，义项精简 |
+
+> ⚠️ 这些词典多数是纸质词典的电子化转换，**版权状态不明**。仅作个人离线查词用，
+> 不要随应用分发。商用请换用有明确授权的语料。
+
+### 中文翻译的其它来源，以及为什么没用
+
+| 来源 | 结论 |
+| --- | --- |
+| Wiktionary 中文翻译（kaikki `translations`） | ❌ 全库仅 4144 条带 `lang: Chinese`，且多为东干语/闽南语标签，普通话释义几乎没有 |
+| 汉典 / 有道 / 必应 网页 | ❌ 无开放接口，抓取违反服务条款 |
+| CC-CEDICT | ❌ 方向相反，是「汉 → 英」 |
+| 朗道 / 21 世纪 / 牛津高阶 StarDict | ✅ 可用，见上表，走 `--merge` |
+
 ## 3. 词源：kaikki.org（Wiktionary，CC BY-SA）
 
 这是唯一带学术出处的词根来源：Wiktionary 编辑者依据词源词典逐条填写构词模板，
@@ -114,7 +149,7 @@ quietly etymology kaikki.org-dictionary-English.jsonl
 等一律**跳过**——它们描述的是历史来源，不是这个词自身的构词，转成词素拆分就是编造。
 
 每个词素都记录 `source`，卡片上以 `source: Wiktionary {{af}}` 展示。
-没有可用模板的词不写入，卡片显示 `no etymology on file`。
+没有可用模板的词不写入词根，卡片上也就没有词根区块（**不显示占位文案、不猜**）。
 
 ### 自备 TSV
 

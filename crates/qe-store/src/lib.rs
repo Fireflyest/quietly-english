@@ -3,6 +3,7 @@
 pub mod db;
 pub mod etymology;
 pub mod import;
+pub mod merge;
 pub mod seed;
 pub mod stardict;
 pub mod tatoeba;

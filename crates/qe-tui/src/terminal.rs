@@ -17,6 +17,8 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 pub struct TerminalSession {
     pub terminal: Tui,
     restored: bool,
+    /// Whether the app is currently receiving mouse events.
+    mouse: bool,
 }
 
 impl TerminalSession {
@@ -33,6 +35,7 @@ impl TerminalSession {
         Ok(Self {
             terminal,
             restored: false,
+            mouse: true,
         })
     }
 
@@ -41,6 +44,29 @@ impl TerminalSession {
     pub fn clear(&mut self) -> Result<()> {
         self.terminal.clear()?;
         Ok(())
+    }
+
+    /// Turn mouse reporting on or off.
+    ///
+    /// While it is on the app receives scroll, click and drag events, but the
+    /// terminal can no longer select text. Releasing it hands the mouse back so the
+    /// user can copy from the transcript.
+    pub fn set_mouse(&mut self, on: bool) -> Result<()> {
+        if self.mouse == on {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        if on {
+            execute!(stdout, EnableMouseCapture)?;
+        } else {
+            execute!(stdout, DisableMouseCapture)?;
+        }
+        self.mouse = on;
+        Ok(())
+    }
+
+    pub fn mouse_enabled(&self) -> bool {
+        self.mouse
     }
 
     pub fn restore(&mut self) {

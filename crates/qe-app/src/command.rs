@@ -17,6 +17,7 @@ pub enum Command {
     Quiet,
     Limit(Option<u32>),
     Add(String),
+    Phrase(String),
     Bury,
     Undo,
     Skip,
@@ -85,6 +86,11 @@ pub const SPECS: &[Spec] = &[
         help: "add a word to the current deck",
     },
     Spec {
+        name: "/phrase",
+        args: " <word> <phrase> = <gloss>",
+        help: "add a fixed expression to a word",
+    },
+    Spec {
         name: "/bury",
         args: "",
         help: "postpone the current card to tomorrow",
@@ -138,6 +144,7 @@ impl Command {
             "quiet" | "discreet" => Command::Quiet,
             "limit" | "daily" => Command::Limit(arg.parse::<u32>().ok()),
             "add" => Command::Add(arg),
+            "phrase" | "collocation" => Command::Phrase(arg),
             "bury" | "later" => Command::Bury,
             "undo" | "back" => Command::Undo,
             "skip" | "next" => Command::Skip,

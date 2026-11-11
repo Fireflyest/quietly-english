@@ -93,6 +93,23 @@ impl Example {
     }
 }
 
+/// 常用词组 / 固定搭配，例如 `for the sake of → 为了`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Collocation {
+    pub phrase: String,
+    #[serde(default)]
+    pub gloss: String,
+}
+
+impl Collocation {
+    pub fn new(phrase: impl Into<String>, gloss: impl Into<String>) -> Self {
+        Self {
+            phrase: phrase.into(),
+            gloss: gloss.into(),
+        }
+    }
+}
+
 /// 一个单词的完整条目。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Word {
@@ -110,6 +127,12 @@ pub struct Word {
     pub examples: Vec<Example>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 常用词组 / 固定搭配。
+    #[serde(default)]
+    pub collocations: Vec<Collocation>,
+    /// 英文释义，来自 Wiktionary，用来补 ECDICT 缺失的生僻义。
+    #[serde(default)]
+    pub glosses: Vec<crate::text::Gloss>,
 }
 
 impl Word {
@@ -128,6 +151,15 @@ impl Word {
     /// empty list means "no etymology on file".
     pub fn roots(&self) -> &[WordRoot] {
         &self.roots
+    }
+
+    /// Structured senses, split out of `translation` when no richer source supplied
+    /// them.
+    ///
+    /// Keeping this derived means the 3.2M rows imported before senses existed still
+    /// get the multi-sense card without a re-import.
+    pub fn senses(&self) -> crate::text::ParsedSenses {
+        crate::text::parse_senses(&self.translation)
     }
 }
 

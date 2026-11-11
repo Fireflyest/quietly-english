@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
-    Book, BookProgress, DailyStats, Example, ImportPlan, ImportReport, Phase, Rating, SessionLog,
-    SrsCard, StudyCard, Word,
+    Book, BookProgress, Collocation, DailyStats, Example, ImportPlan, ImportReport, Phase, Rating,
+    SessionLog, SrsCard, StudyCard, Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -88,7 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_reviews_day ON reviews(day);
 CREATE INDEX IF NOT EXISTS idx_reviews_word ON reviews(word_id);
 "#;
 
-const WORD_COLS: &str = "w.id, w.lemma, w.phonetic, w.translation, w.definition, w.roots, w.examples, w.tags";
+const WORD_COLS: &str = "w.id, w.lemma, w.phonetic, w.translation, w.definition, w.roots, w.examples, w.tags, w.collocations, w.glosses";
 
 pub struct SqliteStore {
     conn: Connection,
@@ -139,6 +139,21 @@ impl SqliteStore {
         if version < 1 {
             self.conn.execute_batch(SCHEMA_V1)?;
             self.conn.execute_batch("PRAGMA user_version = 1")?;
+        }
+        if version < 2 {
+            // `ALTER TABLE ... ADD COLUMN` with a constant default is a metadata-only
+            // change in SQLite, so this stays instant on a 3.2M row table.
+            self.conn.execute_batch(
+                "ALTER TABLE words ADD COLUMN collocations TEXT NOT NULL DEFAULT '[]';",
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 2")?;
+        }
+        if version < 3 {
+            // English glosses from Wiktionary, used to fill senses ECDICT lacks.
+            self.conn.execute_batch(
+                "ALTER TABLE words ADD COLUMN glosses TEXT NOT NULL DEFAULT '[]';",
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 3")?;
         }
         Ok(())
     }
@@ -321,6 +336,8 @@ fn decode_word(row: &Row<'_>) -> rusqlite::Result<Word> {
     let roots_raw: String = row.get(5)?;
     let examples_raw: String = row.get(6)?;
     let tags_raw: String = row.get(7)?;
+    let collocations_raw: String = row.get(8)?;
+    let glosses_raw: String = row.get(9)?;
     Ok(Word {
         id: row.get(0)?,
         lemma: row.get(1)?,
@@ -330,6 +347,8 @@ fn decode_word(row: &Row<'_>) -> rusqlite::Result<Word> {
         roots: serde_json::from_str(&roots_raw).unwrap_or_default(),
         examples: serde_json::from_str(&examples_raw).unwrap_or_default(),
         tags: serde_json::from_str(&tags_raw).unwrap_or_default(),
+        collocations: serde_json::from_str(&collocations_raw).unwrap_or_default(),
+        glosses: serde_json::from_str(&glosses_raw).unwrap_or_default(),
     })
 }
 
@@ -442,7 +461,8 @@ impl Store for SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![book_id, now.timestamp(), limit as i64], |row| {
             let word = decode_word(row)?;
-            let card = decode_card(row, 8)?;
+            // Card columns follow the word columns; keep this in step with WORD_COLS.
+            let card = decode_card(row, 10)?;
             Ok(StudyCard::review(word, card))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -986,6 +1006,7 @@ impl Store for SqliteStore {
     fn import_stardict_with(
         &mut self,
         path: &Path,
+        merge: bool,
         progress: &mut dyn FnMut(u64),
     ) -> Result<(u32, u32)> {
         use crate::stardict::Stardict;
@@ -996,11 +1017,30 @@ impl Store for SqliteStore {
         let mut updated = 0u32;
 
         dict.for_each_word(progress, |word| {
+            // `merge` layers a second dictionary on top of the first: senses the
+            // existing entry does not have are appended instead of replacing it.
+            // Without it, importing 朗道 after ECDICT would wipe ECDICT's text.
+            let translation = if merge {
+                match tx
+                    .query_row(
+                        "SELECT translation FROM words WHERE lemma = ?1",
+                        [word.lemma.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    Some(existing) => crate::merge::merge_translations(&existing, &word.translation),
+                    None => word.translation.clone(),
+                }
+            } else {
+                word.translation.clone()
+            };
+
             let (id, is_new) = upsert_word_tx(
                 &tx,
                 &word.lemma,
                 word.phonetic.as_deref(),
-                &word.translation,
+                &translation,
                 None,
                 "[]",
                 "[]",
@@ -1018,6 +1058,77 @@ impl Store for SqliteStore {
 
         tx.commit()?;
         Ok((inserted, updated))
+    }
+
+    fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)> {
+        use crate::import;
+
+        let rows = import::parse_phrases(path)?;
+        let tx = self.conn.transaction()?;
+        let mut words = 0u32;
+        let mut added = 0u32;
+
+        for (lemma, collocation) in rows {
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT collocations FROM words WHERE lemma = ?1",
+                    [lemma.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // A phrases file must never invent vocabulary; it only enriches words we
+            // already have.
+            let Some(raw) = raw else { continue };
+
+            let mut list: Vec<Collocation> = serde_json::from_str(&raw).unwrap_or_default();
+            if list
+                .iter()
+                .any(|existing| existing.phrase.eq_ignore_ascii_case(&collocation.phrase))
+            {
+                continue;
+            }
+            list.push(collocation);
+            tx.execute(
+                "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+                params![serde_json::to_string(&list)?, lemma.as_str()],
+            )?;
+            words += 1;
+            added += 1;
+        }
+
+        tx.commit()?;
+        Ok((words, added))
+    }
+
+    fn add_collocation(&mut self, lemma: &str, phrase: &str, gloss: &str) -> Result<bool> {
+        let lemma = lemma.trim();
+        let phrase = phrase.trim();
+        if lemma.is_empty() || phrase.is_empty() {
+            return Ok(false);
+        }
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT collocations FROM words WHERE lemma = ?1",
+                [lemma],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(false) };
+
+        let mut list: Vec<Collocation> = serde_json::from_str(&raw).unwrap_or_default();
+        if list
+            .iter()
+            .any(|existing| existing.phrase.eq_ignore_ascii_case(phrase))
+        {
+            return Ok(false);
+        }
+        list.push(Collocation::new(phrase, gloss.trim()));
+        self.conn.execute(
+            "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+            params![serde_json::to_string(&list)?, lemma],
+        )?;
+        Ok(true)
     }
 
     fn import_etymology_with(
@@ -1041,21 +1152,30 @@ impl Store for SqliteStore {
         let tx = self.conn.transaction()?;
         let mut words = 0u32;
         let mut morphemes = 0u32;
+        let mut glosses = 0u32;
 
         if etymology::looks_like_jsonl(path) {
             // Pass one gathers the affixes' own glosses, pass two walks every word.
             let index = etymology::index_morphemes(path)?;
-            etymology::for_each_analysis(path, &index, progress, |lemma, roots| {
+            etymology::for_each_analysis(path, &index, progress, |lemma, analysis| {
                 if !existing.contains(&lemma.to_ascii_lowercase()) {
                     return Ok(());
                 }
-                let payload = serde_json::to_string(&roots)?;
-                tx.execute(
-                    "UPDATE words SET roots = ?1 WHERE lemma = ?2",
-                    params![payload, lemma],
-                )?;
+                if !analysis.roots.is_empty() {
+                    tx.execute(
+                        "UPDATE words SET roots = ?1 WHERE lemma = ?2",
+                        params![serde_json::to_string(&analysis.roots)?, lemma],
+                    )?;
+                    morphemes += analysis.roots.len() as u32;
+                }
+                if !analysis.glosses.is_empty() {
+                    tx.execute(
+                        "UPDATE words SET glosses = ?1 WHERE lemma = ?2",
+                        params![serde_json::to_string(&analysis.glosses)?, lemma],
+                    )?;
+                    glosses += analysis.glosses.len() as u32;
+                }
                 words += 1;
-                morphemes += roots.len() as u32;
                 Ok(())
             })?;
         } else {
@@ -1074,6 +1194,7 @@ impl Store for SqliteStore {
         }
 
         tx.commit()?;
+        let _ = glosses;
         Ok((words, morphemes))
     }
 
@@ -1247,5 +1368,68 @@ mod tests {
         assert!(store.add_to_book(book.id, &fresh).unwrap());
         assert_eq!(store.progress(book.id).unwrap().total, before + 1);
         assert!(store.word("serendipity").unwrap().is_some());
+    }
+
+    #[test]
+    fn import_phrases_attaches_to_existing_words_only() {
+        let (mut store, _dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+
+        let dir = std::env::temp_dir().join("qe_phrases_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("phrases.tsv");
+        std::fs::write(
+            &path,
+            "lemma\tphrase\tgloss\ninspect\tinspect for\t检查是否存在\nmissing\tnot a word\t忽略\n",
+        )
+        .unwrap();
+
+        let (words, added) = store.import_phrases(&path).unwrap();
+        assert_eq!((words, added), (1, 1), "unknown words are skipped");
+
+        let word = store.word("inspect").unwrap().unwrap();
+        assert_eq!(word.collocations.len(), 1);
+        assert_eq!(word.collocations[0].phrase, "inspect for");
+        assert_eq!(word.collocations[0].gloss, "检查是否存在");
+
+        // Importing the same file again must not duplicate the phrase.
+        let (_, added) = store.import_phrases(&path).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(store.word("inspect").unwrap().unwrap().collocations.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn add_collocation_appends_once() {
+        let (mut store, _dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+
+        assert!(store.add_collocation("inspect", "inspect for", "检查").unwrap());
+        assert!(
+            !store.add_collocation("inspect", "inspect for", "重复").unwrap(),
+            "duplicates are rejected"
+        );
+        assert!(
+            !store.add_collocation("nope", "nope out", "").unwrap(),
+            "unknown words are rejected"
+        );
+
+        let word = store.word("inspect").unwrap().unwrap();
+        assert_eq!(word.collocations.len(), 1);
+        assert_eq!(word.collocations[0].gloss, "检查");
+    }
+
+    #[test]
+    fn migration_adds_the_collocations_column() {
+        // A v1 database must open and gain the column rather than error out.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let store = SqliteStore::open_at(&path).unwrap();
+            drop(store);
+        }
+        let store = SqliteStore::open_at(&path).unwrap();
+        let word = store.word("anything").unwrap();
+        assert!(word.is_none());
     }
 }

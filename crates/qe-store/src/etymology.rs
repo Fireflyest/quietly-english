@@ -64,10 +64,52 @@ struct KaikkiTemplate {
 struct KaikkiSense {
     #[serde(default)]
     glosses: Option<Vec<String>>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    /// Present on "Alternative spelling of …" / "plural of …" senses.
+    #[serde(default)]
+    alt_of: Option<Vec<KaikkiFormOf>>,
+    #[serde(default)]
+    form_of: Option<Vec<KaikkiFormOf>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KaikkiFormOf {
+    word: String,
+}
+
+/// One English gloss taken from Wiktionary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Gloss {
+    pub text: String,
+    /// Register / usage tags: `archaic`, `obsolete`, `slang`, …
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+/// Everything one lemma yielded in the scan.
+#[derive(Debug, Clone, Default)]
+pub struct Analysis {
+    pub roots: Vec<WordRoot>,
+    pub glosses: Vec<Gloss>,
+}
+
+impl Analysis {
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty() && self.glosses.is_empty()
+    }
 }
 
 /// 词素→释义索引，一次导入内复用。
-type MorphemeIndex = HashMap<String, (String, RootKind)>;
+/// One affix entry's glosses, in dictionary order.
+#[derive(Debug, Clone)]
+pub struct AffixGlosses {
+    kind: RootKind,
+    glosses: Vec<String>,
+}
+
+/// 词素 → 释义索引，一次导入内复用。
+pub type MorphemeIndex = HashMap<String, AffixGlosses>;
 
 fn is_affix(word: &str) -> bool {
     (word.starts_with('-') || word.ends_with('-')) && word.trim_matches('-').len() >= 2
@@ -78,8 +120,13 @@ fn affix_key(word: &str) -> String {
     word.trim().to_ascii_lowercase()
 }
 
-/// 查找词素释义。只接受**同类型**的条目：`rise`（词根）不能借用 `-rise`（后缀）
-/// 的释义，`kind`（词根）也不能借用 `kind-`（前缀）的释义。
+/// Look a morpheme's gloss up in the affix index.
+///
+/// A morpheme can be spelled three ways in templates (`spect`, `spect-`, `-spect`)
+/// and the dictionary entry may use a different one than the template, so every
+/// spelling is tried. Entries whose recorded kind matches the requested kind win;
+/// otherwise any entry is accepted, because a bound root like `spect` legitimately
+/// only has an affix entry.
 fn gloss_for(index: &MorphemeIndex, part: &str, kind: RootKind) -> Option<String> {
     let base = part.trim_matches('-').to_ascii_lowercase();
     if base.is_empty() {
@@ -88,14 +135,44 @@ fn gloss_for(index: &MorphemeIndex, part: &str, kind: RootKind) -> Option<String
     let candidates = match kind {
         RootKind::Prefix => [format!("{base}-"), format!("-{base}"), base.clone()],
         RootKind::Suffix => [format!("-{base}"), format!("{base}-"), base.clone()],
-        RootKind::Root => [base.clone(), base.clone(), base.clone()],
+        RootKind::Root => [base.clone(), format!("-{base}"), format!("{base}-")],
     };
-    candidates.iter().find_map(|key| {
-        index
-            .get(key)
-            .filter(|(_, entry_kind)| *entry_kind == kind)
-            .map(|(gloss, _)| gloss.clone())
-    })
+
+    let hits: Vec<&AffixGlosses> = candidates
+        .iter()
+        .filter_map(|key| index.get(key))
+        .collect();
+
+    let chosen = hits
+        .iter()
+        .find(|entry| entry.kind == kind)
+        .or_else(|| hits.first())?;
+
+    // First gloss that is an actual meaning rather than a "Used to form …"
+    // boilerplate sentence describing the suffix itself.
+    chosen
+        .glosses
+        .iter()
+        .find(|gloss| !is_boilerplate(gloss))
+        .or_else(|| chosen.glosses.first())
+        .cloned()
+}
+
+/// Wiktionary affix senses often open with a sentence describing the grammar
+/// rather than the meaning. Those make poor card glosses when a real one exists.
+fn is_boilerplate(gloss: &str) -> bool {
+    const OPENERS: [&str; 9] = [
+        "Used to form",
+        "Used in the sense of",
+        "Used to ",
+        "Used after",
+        "Used before",
+        "Forming ",
+        "Appended",
+        "Denoting ",
+        "Indicating ",
+    ];
+    OPENERS.iter().any(|opener| gloss.starts_with(opener))
 }
 
 fn affix_kind(word: &str) -> RootKind {
@@ -128,11 +205,10 @@ pub fn index_morphemes(path: &Path) -> Result<MorphemeIndex> {
         if !is_affix(word) {
             continue;
         }
-        // Affix entries list several senses. Take the shortest complete one so the
-        // card shows a readable definition instead of a paragraph, but keep it whole
-        // (no truncation): "Used to form adjectives from nouns, with the meaning of …"
-        // is still more informative than an ellipsis.
-        let gloss = entry
+
+        // Keep every sense in dictionary order; which one reads best is decided at
+        // lookup time, since that depends on what kind of morpheme asked for it.
+        let glosses: Vec<String> = entry
             .senses
             .as_ref()
             .map(|senses| {
@@ -142,16 +218,17 @@ pub fn index_morphemes(path: &Path) -> Result<MorphemeIndex> {
                     .flatten()
                     .map(|gloss| clean_gloss(gloss))
                     .filter(|gloss| gloss.chars().count() >= 3)
-                    .min_by_key(|gloss| gloss.chars().count())
+                    .collect()
             })
-            .flatten()
             .unwrap_or_default();
-        if gloss.is_empty() {
+        if glosses.is_empty() {
             continue;
         }
-        index
-            .entry(affix_key(word))
-            .or_insert_with(|| (gloss, affix_kind(word)));
+
+        index.entry(affix_key(word)).or_insert(AffixGlosses {
+            kind: affix_kind(word),
+            glosses,
+        });
     }
 
     Ok(index)
@@ -217,20 +294,26 @@ pub struct ScanStats {
     pub produced: u32,
 }
 
-/// 第二遍：流式扫描每一行，把构词模板转成 `WordRoot` 交给调用方。
+/// 第二遍：流式扫描每一行，收集构词与英文释义。
 ///
-/// 同一个词出现多条词源（不同词性、不同 `etymology_number`）时只保留第一条，
-/// 因为 Wiktionary 的排列以主要词源在前。`progress` 每 10 万行回调一次已扫描行数。
+/// 同一个词可能有多条词源（不同词性、不同 `etymology_number`）。构词只取第一条，
+/// 释义则合并所有词性，因为 `sake` 的「清酒」和「目的」分属不同词条。
+/// `progress` 每 10 万行回调一次已扫描行数。
 pub fn for_each_analysis(
     path: &Path,
     index: &MorphemeIndex,
     progress: &mut dyn FnMut(u64),
-    mut on_word: impl FnMut(&str, Vec<WordRoot>) -> Result<()>,
+    mut on_word: impl FnMut(&str, Analysis) -> Result<()>,
 ) -> Result<ScanStats> {
     let file = File::open(path).with_context(|| format!("无法打开 {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut stats = ScanStats::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    // Roots are kept from the first entry that describes a formation; glosses
+    // accumulate across entries.
+    let mut roots_taken: HashSet<String> = HashSet::new();
+    let mut pending: HashMap<String, Analysis> = HashMap::new();
+    // `sake` → `saké`: an alternative spelling, whose meanings live on the target.
+    let mut alt_targets: HashMap<String, String> = HashMap::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -238,9 +321,9 @@ pub fn for_each_analysis(
         if stats.scanned % 100_000 == 0 {
             progress(stats.scanned);
         }
+        // Cheap pre-filter: a line with neither templates nor glosses is useless.
         if line.trim().is_empty()
-            || !line.contains("\"etymology_templates\"")
-            || !mentions_build_template(&line)
+            || (!line.contains("\"etymology_templates\"") && !line.contains("\"glosses\""))
         {
             continue;
         }
@@ -252,25 +335,169 @@ pub fn for_each_analysis(
             continue;
         };
         // Affix entries describe the affix itself, and phrases are not single words.
-        if is_affix(word) || word.contains(' ') {
+        if is_affix(word) || word.contains(' ') || !word.chars().any(|c| c.is_ascii_alphabetic()) {
             continue;
         }
-        let Some(templates) = entry.etymology_templates.as_ref() else {
-            continue;
-        };
+        let key = word.to_ascii_lowercase();
 
-        let roots = roots_from_templates(templates, index);
-        if roots.is_empty() {
+        let mut analysis = Analysis::default();
+
+        if !roots_taken.contains(&key) {
+            if let Some(templates) = entry.etymology_templates.as_ref() {
+                if mentions_build_template(&line) {
+                    let roots = roots_from_templates(templates, index);
+                    if !roots.is_empty() {
+                        analysis.roots = roots;
+                        roots_taken.insert(key.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(senses) = entry.senses.as_ref() {
+            analysis.glosses = collect_glosses(senses);
+            // "Alternative spelling of saké." carries no meaning of its own, but it
+            // tells us which entry does: record the target and inherit its senses
+            // once the whole file has been read.
+            if let Some(target) = alt_target(senses) {
+                alt_targets.insert(key.clone(), target);
+            }
+        }
+
+        if analysis.is_empty() {
             continue;
         }
-        if !seen.insert(word.to_ascii_lowercase()) {
-            continue;
+
+        let slot = pending.entry(key).or_default();
+        if slot.roots.is_empty() {
+            slot.roots = analysis.roots;
         }
+        for gloss in analysis.glosses {
+            if slot.glosses.len() >= MAX_GLOSSES {
+                break;
+            }
+            if slot.glosses.iter().any(|g| g.text == gloss.text) {
+                continue;
+            }
+            slot.glosses.push(gloss);
+        }
+    }
+
+    // Emission happens at the end: a lemma's entries are not adjacent in the dump,
+    // and the caller wants one row per word.
+    inherit_alt_of(&mut pending, &alt_targets);
+    let mut words: Vec<(String, Analysis)> = pending.into_iter().collect();
+    words.sort_by(|a, b| a.0.cmp(&b.0));
+    for (lemma, analysis) in words {
         stats.produced += 1;
-        on_word(word, roots)?;
+        on_word(&lemma, analysis)?;
     }
 
     Ok(stats)
+}
+
+/// Keep at most this many English glosses per word.
+const MAX_GLOSSES: usize = 6;
+
+/// The word an "alternative spelling / form of" sense points at.
+fn alt_target(senses: &[KaikkiSense]) -> Option<String> {
+    for sense in senses {
+        for list in [sense.alt_of.as_ref(), sense.form_of.as_ref()].into_iter().flatten() {
+            if let Some(entry) = list.first() {
+                let target = entry.word.trim().to_ascii_lowercase();
+                if !target.is_empty() {
+                    return Some(target);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Move meanings from an alias target onto the alias itself.
+///
+/// `sake` is only an "alternative spelling of saké", so its card would show nothing
+/// useful. Copying the target's glosses over makes `sake` list "Japanese rice wine"
+/// — which is exactly the rare sense a learner is looking for.
+fn inherit_alt_of(pending: &mut HashMap<String, Analysis>, alt_targets: &HashMap<String, String>) {
+    // Copy first, then apply, so chains are resolved one level at a time without
+    // borrowing the map while iterating it.
+    let inherited: Vec<(String, Vec<Gloss>)> = alt_targets
+        .iter()
+        .filter_map(|(alias, target)| {
+            let source = pending.get(target)?;
+            if source.glosses.is_empty() {
+                return None;
+            }
+            Some((alias.clone(), source.glosses.clone()))
+        })
+        .collect();
+
+    for (alias, glosses) in inherited {
+        let Some(entry) = pending.get_mut(&alias) else {
+            continue;
+        };
+        // Drop the "Alternative spelling of …" placeholder; the real meanings follow.
+        entry
+            .glosses
+            .retain(|gloss| !is_alt_of_gloss(&gloss.text));
+        for gloss in glosses {
+            if entry.glosses.len() >= MAX_GLOSSES {
+                break;
+            }
+            if entry.glosses.iter().any(|g| g.text == gloss.text) {
+                continue;
+            }
+            entry.glosses.push(gloss);
+        }
+    }
+}
+
+fn is_alt_of_gloss(text: &str) -> bool {
+    text.starts_with("Alternative spelling of")
+        || text.starts_with("Alternative form of")
+        || text.starts_with("Alternative letter-case form of")
+}
+
+/// Turn Wiktionary senses into glosses, keeping register tags but dropping the
+/// "no-gloss" senses wiktionary uses for form-of entries.
+fn collect_glosses(senses: &[KaikkiSense]) -> Vec<Gloss> {
+    let mut out = Vec::new();
+    for sense in senses {
+        let Some(glosses) = sense.glosses.as_ref() else {
+            continue;
+        };
+        let Some(text) = glosses.first() else { continue };
+        let text = text.trim();
+        // Form-of senses read "present participle of run"; they are not meanings.
+        if text.is_empty() || text.starts_with("present participle of") {
+            continue;
+        }
+        let tags: Vec<String> = sense
+            .tags
+            .as_ref()
+            .map(|tags| {
+                tags.iter()
+                    .filter(|tag| {
+                        matches!(
+                            tag.as_str(),
+                            "archaic" | "obsolete" | "slang" | "informal" | "vulgar" | "dated"
+                                | "rare" | "poetic" | "humorous" | "figurative" | "literally"
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(Gloss {
+            text: text.to_string(),
+            tags,
+        });
+        if out.len() >= MAX_GLOSSES {
+            break;
+        }
+    }
+    out
 }
 
 /// Convert one entry's templates into an ordered morpheme list.
@@ -545,12 +772,20 @@ mod tests {
         }
     }
 
+    fn entry(kind: RootKind, glosses: &[&str]) -> AffixGlosses {
+        AffixGlosses {
+            kind,
+            glosses: glosses.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
     fn index() -> MorphemeIndex {
         let mut index = HashMap::new();
-        index.insert("un".to_string(), ("not".to_string(), RootKind::Prefix));
-        index.insert("happy".to_string(), ("content".to_string(), RootKind::Root));
-        index.insert("read".to_string(), ("read".to_string(), RootKind::Root));
-        index.insert("able".to_string(), ("capable of".to_string(), RootKind::Suffix));
+        // Keys keep the hyphen side, matching what the real index does.
+        index.insert("un-".to_string(), entry(RootKind::Prefix, &["not"]));
+        index.insert("happy".to_string(), entry(RootKind::Root, &["content"]));
+        index.insert("read".to_string(), entry(RootKind::Root, &["read"]));
+        index.insert("-able".to_string(), entry(RootKind::Suffix, &["capable of"]));
         index
     }
 
@@ -699,12 +934,10 @@ mod tests {
     }
 
     #[test]
-    fn gloss_lookup_respects_the_affix_side() {
+    fn gloss_lookup_prefers_the_matching_side() {
         let mut index = MorphemeIndex::new();
-        index.insert("-ness".to_string(), ("state of".to_string(), RootKind::Suffix));
-        index.insert("kind-".to_string(), ("group of".to_string(), RootKind::Prefix));
-        // `kind` as a root must not borrow the `kind-` prefix gloss.
-        assert!(gloss_for(&index, "kind", RootKind::Root).is_none());
+        index.insert("-ness".to_string(), entry(RootKind::Suffix, &["state of"]));
+        index.insert("kind-".to_string(), entry(RootKind::Prefix, &["group of"]));
         assert_eq!(
             gloss_for(&index, "ness", RootKind::Suffix).as_deref(),
             Some("state of")
@@ -712,6 +945,60 @@ mod tests {
         assert_eq!(
             gloss_for(&index, "kind", RootKind::Prefix).as_deref(),
             Some("group of")
+        );
+        // A bound root falls back to whatever spelling exists: `kind` has no plain
+        // entry, so it borrows the prefix one rather than showing nothing.
+        assert_eq!(
+            gloss_for(&index, "kind", RootKind::Root).as_deref(),
+            Some("group of")
+        );
+    }
+
+    #[test]
+    fn bound_root_finds_its_gloss_through_the_hyphenated_entry() {
+        // Regression: `inspect` renders `spect -> To look at …`. The template spells
+        // it `spect`, but the dictionary entry is `-spect`, so a plain lookup misses.
+        let mut index = MorphemeIndex::new();
+        index.insert(
+            "-spect".to_string(),
+            entry(RootKind::Suffix, &["To look at, perceive, or observe"]),
+        );
+        assert_eq!(
+            gloss_for(&index, "spect", RootKind::Root).as_deref(),
+            Some("To look at, perceive, or observe")
+        );
+    }
+
+    #[test]
+    fn boilerplate_glosses_lose_to_real_meanings() {
+        let mut index = MorphemeIndex::new();
+        index.insert(
+            "in-".to_string(),
+            entry(
+                RootKind::Prefix,
+                &[
+                    "Used to form verbs from nouns",
+                    "in, into, towards, within",
+                ],
+            ),
+        );
+        // The first sense only describes the grammar; the second is the meaning.
+        assert_eq!(
+            gloss_for(&index, "in", RootKind::Prefix).as_deref(),
+            Some("in, into, towards, within")
+        );
+    }
+
+    #[test]
+    fn boilerplate_is_used_when_nothing_else_exists() {
+        let mut index = MorphemeIndex::new();
+        index.insert(
+            "-ish".to_string(),
+            entry(RootKind::Suffix, &["Used to form adjectives from nouns"]),
+        );
+        assert_eq!(
+            gloss_for(&index, "ish", RootKind::Suffix).as_deref(),
+            Some("Used to form adjectives from nouns")
         );
     }
 
@@ -731,5 +1018,118 @@ mod tests {
         assert_eq!(rows[0].1[1].gloss, "look");
         assert_eq!(rows[0].1[0].source.as_deref(), Some("OED"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn sense(gloss: &str, tags: &[&str]) -> KaikkiSense {
+        KaikkiSense {
+            glosses: Some(vec![gloss.to_string()]),
+            tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+            alt_of: None,
+            form_of: None,
+        }
+    }
+
+    #[test]
+    fn glosses_keep_register_tags_and_drop_form_of_noise() {
+        let senses = vec![
+            sense("cause, interest or account", &[]),
+            sense("Japanese rice wine", &["countable"]),
+            sense("present participle of run", &[]),
+            sense("the aforementioned reason", &["archaic"]),
+        ];
+        let glosses = collect_glosses(&senses);
+        // `countable` is grammar, not register, so it is dropped.
+        assert_eq!(glosses.len(), 3);
+        assert_eq!(glosses[1].text, "Japanese rice wine");
+        assert!(glosses[1].tags.is_empty());
+        assert_eq!(glosses[2].tags, vec!["archaic"]);
+        assert!(
+            !glosses.iter().any(|g| g.text.contains("present participle")),
+            "form-of senses are not meanings"
+        );
+    }
+
+    #[test]
+    fn glosses_are_capped_and_deduplicated() {
+        let senses: Vec<KaikkiSense> = (0..12)
+            .map(|i| sense(&format!("meaning {i}"), &[]))
+            .collect();
+        let glosses = collect_glosses(&senses);
+        assert_eq!(glosses.len(), MAX_GLOSSES);
+
+        let repeated = vec![sense("one", &[]), sense("one", &[])];
+        assert_eq!(collect_glosses(&repeated).len(), 2, "caller dedupes");
+    }
+
+    fn alt_of(word: &str) -> KaikkiSense {
+        KaikkiSense {
+            glosses: Some(vec![format!("Alternative spelling of {word}.")]),
+            tags: Some(vec!["alt-of".to_string()]),
+            alt_of: Some(vec![KaikkiFormOf {
+                word: word.to_string(),
+            }]),
+            form_of: None,
+        }
+    }
+
+    #[test]
+    fn alternative_spellings_inherit_the_target_meanings() {
+        // `sake` is only "Alternative spelling of saké"; the meanings live on `saké`.
+        let mut pending: HashMap<String, Analysis> = HashMap::new();
+        pending.insert(
+            "sake".to_string(),
+            Analysis {
+                roots: Vec::new(),
+                glosses: collect_glosses(&[alt_of("saké")]),
+            },
+        );
+        pending.insert(
+            "saké".to_string(),
+            Analysis {
+                roots: Vec::new(),
+                glosses: collect_glosses(&[sense(
+                    "Rice wine; a drink made from filtered fermented rice",
+                    &[],
+                )]),
+            },
+        );
+
+        let mut targets = HashMap::new();
+        targets.insert("sake".to_string(), "saké".to_string());
+        inherit_alt_of(&mut pending, &targets);
+
+        let glosses = &pending["sake"].glosses;
+        assert_eq!(glosses.len(), 1, "placeholder is replaced");
+        assert!(glosses[0].text.contains("Rice wine"));
+    }
+
+    #[test]
+    fn alt_target_handles_form_of_too() {
+        let sense = KaikkiSense {
+            glosses: Some(vec!["plural of mouse".to_string()]),
+            tags: None,
+            alt_of: None,
+            form_of: Some(vec![KaikkiFormOf {
+                word: "Mouse".to_string(),
+            }]),
+        };
+        assert_eq!(alt_target(&[sense]).as_deref(), Some("mouse"));
+    }
+
+    #[test]
+    fn missing_target_leaves_the_alias_alone() {
+        let mut pending: HashMap<String, Analysis> = HashMap::new();
+        pending.insert(
+            "thing".to_string(),
+            Analysis {
+                roots: Vec::new(),
+                glosses: collect_glosses(&[alt_of("nonexistent")]),
+            },
+        );
+        let mut targets = HashMap::new();
+        targets.insert("thing".to_string(), "nonexistent".to_string());
+        inherit_alt_of(&mut pending, &targets);
+        // Nothing to inherit, so the original gloss stays rather than vanishing.
+        assert_eq!(pending["thing"].glosses.len(), 1);
     }
 }

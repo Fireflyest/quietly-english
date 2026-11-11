@@ -77,6 +77,11 @@ pub trait Store {
     // ---- 导入 ----
     fn import_plan(&mut self, plan: &ImportPlan) -> Result<ImportReport>;
     fn add_examples(&mut self, examples: &[(String, Example)]) -> Result<u32>;
+    /// 导入常用词组表（`lemma<TAB>phrase<TAB>gloss`），只更新已有词条。
+    /// 返回 `(覆盖词数, 新增搭配数)`。
+    fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)>;
+    /// 给一个词追加一条搭配；词不存在时返回 `false`。
+    fn add_collocation(&mut self, lemma: &str, phrase: &str, gloss: &str) -> Result<bool>;
     /// 按文件后缀与表头自动选择导入器（ECDICT / JSON / CSV / TXT）。
     fn import_file(&mut self, path: &Path) -> Result<ImportReport>;
     /// 导入有出处的词源数据（kaikki/Wiktionary JSONL 或 TSV），只更新已有词条。
@@ -95,13 +100,15 @@ pub trait Store {
     /// 导入 StarDict 词典（ECDICT 的 `ecdict-stardict` 包），写入 `words` 表。
     /// 返回 `(新增, 更新)`。
     fn import_stardict(&mut self, path: &Path) -> Result<(u32, u32)> {
-        self.import_stardict_with(path, &mut |_| {})
+        self.import_stardict_with(path, false, &mut |_| {})
     }
 
-    /// 同上，每 10 万条回调一次已处理条数。
+    /// 同上。`merge` 为真时把新义项追加到已有释义后，而不是覆盖；
+    /// 依次导入多本词典时用它才能逐本累加。
     fn import_stardict_with(
         &mut self,
         path: &Path,
+        merge: bool,
         progress: &mut dyn FnMut(u64),
     ) -> Result<(u32, u32)>;
 }

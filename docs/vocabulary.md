@@ -142,6 +142,84 @@ inspect,Engineers inspect the bridge every year.,工程师每年检查这座桥�
 `list.txt` 一行一个词，`#` 开头为注释。词条必须已存在于 `words` 表（例如先导入 ECDICT），
 否则会计入 `skipped`。词书名取文件名。
 
+## 常用词组 / 固定搭配
+
+ECDICT 本身没有搭配数据，`sake` 的「清酒」这类生僻义也不在它的条目里，所以搭配与补充义
+单独维护，导入时**只更新已有词条**，不会凭空造词。
+
+```bash
+quietly phrases phrases.tsv
+```
+
+```tsv
+lemma	phrase	gloss
+sake	for the sake of	为了；为了……的缘故
+sake	for its own sake	为了本身
+bank	bank on	指望，依赖
+```
+
+- 首行可以是表头（含 `lemma` / `phrase` 字样），也可以直接写数据
+- 逗号分隔同样可用，分隔符是探测出来的
+- 同一词的重复 `phrase` 会被忽略，可反复导入
+
+单条补录用 `/phrase`，语序是「词 空格 搭配 = 释义」：
+
+```
+/phrase sake for the sake of = 为了
+```
+
+卡片上的呈现：
+
+```
+│ sake  /seik/
+│ 1 n.   目的, 缘故, 理由
+│
+│ phrases
+│   for the sake of   ->  为了；为了……的缘故
+│   for its own sake  ->  为了本身
+```
+
+### 多义词与生僻义
+
+`translation` 字段里的分行被解析成结构化词义：
+
+| 原文 | 呈现 |
+| --- | --- |
+| `n. 银行, 堤, 岸` | `1 n.   银行, 堤, 岸`（常用义，编号） |
+| `[医] 库` | 归入 `rare / technical` 分组，带上领域标签 |
+| `[时态] banked, banking` | 单独一行的词形变化，不算词义 |
+| `-K1`、`(中高雅 663/406)` | 丢弃，星级改渲染成 `★☆☆☆☆` |
+
+带任何方括号标签（`[医]` `[古]` `[口]` `[网络]` …）的释义都归入次要分组，
+这样「生僻义」和日常用法不会混在一起。
+
+### 英文释义补充（Wiktionary）
+
+ECDICT 的中文释义并不完整：`sake` 只有「目的, 缘故, 理由」，没有「清酒」。
+`quietly etymology` 在导入词根时会**顺带**收集 Wiktionary 的英文释义，
+存在 `glosses` 字段，卡片上以 `more meanings` 展示：
+
+```
+│ sake  /seik/
+│ 1 n.   目的, 缘故, 理由
+│
+│ more meanings
+│   • Cause, interest or account.
+│   • Purpose or end; reason.
+│   • Rice wine; a drink made from filtered fermented rice.
+│
+│ phrases
+│   for the sake of   ->  为了；为了……的缘故
+```
+
+几个细节：
+
+- **只收有语体标记或真正不同的义项**，每词最多 6 条
+- **保留语体标签**（`archaic` / `obsolete` / `slang` / `rare` …），显示为 `[archaic]`
+- **跳过 `present participle of run` 这类变形说明**，它们不是词义
+- **别名继承**：`sake` 在 Wiktionary 里只是 “Alternative spelling of saké”，
+  真正的义项挂在 `saké` 上，导入时会自动把目标条目的释义复制过来
+
 ## 导入行为
 
 - 同一拼写（忽略大小写）视为同一个 `word`，重复导入只更新空缺字段（音标、释义、词根、例句、标签）

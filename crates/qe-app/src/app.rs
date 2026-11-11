@@ -65,6 +65,9 @@ pub struct App {
     /// Words behind each table message, for click-to-open and numeric picking.
     table_words: HashMap<usize, Vec<Word>>,
     undo: Vec<UndoEntry>,
+    /// Request from the key handler to flip mouse capture; applied by the loop,
+    /// which is the only place that can touch the terminal.
+    toggle_mouse: bool,
     /// Import queued by `/import`; it runs after the next frame so the user sees
     /// the "importing" line instead of a frozen window.
     pending_import: Option<String>,
@@ -103,6 +106,7 @@ impl App {
             confirm_exit: false,
             table_words: HashMap::new(),
             undo: Vec::new(),
+            toggle_mouse: false,
             pending_import: None,
         };
         app.load_history();
@@ -162,6 +166,17 @@ impl App {
             if let Some(path) = self.pending_import.take() {
                 self.run_pending_import(&path)?;
                 continue;
+            }
+
+            if self.toggle_mouse {
+                self.toggle_mouse = false;
+                let on = !terminal.mouse_enabled();
+                terminal.set_mouse(on)?;
+                if on {
+                    self.note("mouse capture on · scroll and click work, text selection is off");
+                } else {
+                    self.note("mouse capture off · select and copy with the mouse · F2 to restore");
+                }
             }
 
             if event::poll(Duration::from_millis(120))? {
@@ -251,6 +266,12 @@ impl App {
                 self.table_words.clear();
                 self.undo.clear();
                 self.greet()?;
+                return Ok(());
+            }
+            // Selection needs the terminal's own mouse handling, which we disable
+            // while capturing. F2 hands the mouse back and returns it again.
+            KeyCode::F(2) => {
+                self.toggle_mouse = true;
                 return Ok(());
             }
             KeyCode::PageUp => {
@@ -612,6 +633,7 @@ impl App {
             Command::Quiet => self.toggle_discreet(),
             Command::Limit(value) => self.set_limit(value),
             Command::Add(word) => self.add_word(&word),
+            Command::Phrase(spec) => self.add_phrase(&spec),
             Command::Bury => self.bury_current(),
             Command::Undo => self.undo_last(),
             Command::Skip => {
@@ -643,7 +665,14 @@ impl App {
                 spec.help
             ));
         }
-        body.push_str("\ntype an English word to look it up.\nin a session: 1-4 grade · enter next · tab hint · esc end");
+        body.push_str(
+            "\ntype an English word to look it up.\n\
+             in a session: 1-4 grade · enter next · tab hint · esc end\n\
+             \n\
+             F2 releases the mouse so you can select and copy text; press it again \
+             to get scroll and click back. Most terminals also accept shift+drag \
+             while capture is on.",
+        );
         self.push(Message::agent(body));
         Ok(())
     }
@@ -716,6 +745,51 @@ impl App {
             ));
         } else {
             self.note(format!("{} is already in {}", word.lemma, book.name));
+        }
+        Ok(())
+    }
+
+    /// `/phrase <word> <phrase> = <gloss>` records a fixed expression.
+    ///
+    /// The `=` is optional: without it the phrase is stored unglossed, which still
+    /// shows up on the card.
+    fn add_phrase(&mut self, spec: &str) -> Result<()> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            self.note("usage: /phrase sake for the sake of = 为了");
+            return Ok(());
+        }
+        let (head, gloss) = match spec.split_once('=') {
+            Some((head, gloss)) => (head.trim(), gloss.trim()),
+            None => (spec, ""),
+        };
+        let Some((lemma, phrase)) = head.split_once(char::is_whitespace) else {
+            self.note("usage: /phrase <word> <phrase> = <gloss>");
+            return Ok(());
+        };
+        let phrase = phrase.trim();
+        if phrase.is_empty() {
+            self.note("usage: /phrase <word> <phrase> = <gloss>");
+            return Ok(());
+        }
+
+        if self.store.word(lemma)?.is_none() {
+            self.fail(format!("\"{lemma}\" is not in the dictionary"));
+            return Ok(());
+        }
+        if self.store.add_collocation(lemma, phrase, gloss)? {
+            self.push(Message::tool(
+                ToolView::new("phrase")
+                    .accent(Accent::Success)
+                    .badge(lemma.to_string())
+                    .result(if gloss.is_empty() {
+                        phrase.to_string()
+                    } else {
+                        format!("{phrase}  ->  {gloss}")
+                    }),
+            ));
+        } else {
+            self.note(format!("\"{phrase}\" is already listed under {lemma}"));
         }
         Ok(())
     }
@@ -1660,6 +1734,46 @@ mod tests {
         app.daily_new_limit = 2;
         app.execute(Command::Study(None)).unwrap();
         assert_eq!(app.session.as_ref().unwrap().new_total, 2);
+    }
+
+    #[test]
+    fn phrase_command_records_a_collocation() {
+        let Harness { mut app, _dir } = harness();
+        // Syntax is `/phrase <lemma> <phrase> = <gloss>`; the lemma comes first, so
+        // `sake`-style entries read `/phrase sake for the sake of = 为了`.
+        app.execute(Command::Phrase("inspect for inspection = 供检查".into()))
+            .unwrap();
+
+        let word = app.store.word("inspect").unwrap().unwrap();
+        assert_eq!(word.collocations.len(), 1);
+        assert_eq!(word.collocations[0].phrase, "for inspection");
+        assert_eq!(word.collocations[0].gloss, "供检查");
+    }
+
+    #[test]
+    fn phrase_command_reports_duplicates_and_missing_words() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Phrase("inspect for inspection".into()))
+            .unwrap();
+        app.execute(Command::Phrase("inspect for inspection".into()))
+            .unwrap();
+
+        assert_eq!(
+            app.store.word("inspect").unwrap().unwrap().collocations.len(),
+            1,
+            "second add is a no-op"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(&m.body, Body::Text(t) if t.contains("already listed"))));
+
+        app.execute(Command::Phrase("nosuchword some phrase".into()))
+            .unwrap();
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(&m.body, Body::Tool(t) if t.name == "error")));
     }
 
     #[test]

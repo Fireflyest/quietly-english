@@ -6,6 +6,7 @@ pub mod affix;
 pub mod model;
 pub mod srs;
 pub mod store;
+pub mod text;
 pub mod time;
 pub mod view;
 
