@@ -148,14 +148,18 @@ fn gloss_for(index: &MorphemeIndex, part: &str, kind: RootKind) -> Option<String
         .find(|entry| entry.kind == kind)
         .or_else(|| hits.first())?;
 
-    // First gloss that is an actual meaning rather than a "Used to form …"
-    // boilerplate sentence describing the suffix itself.
-    chosen
-        .glosses
-        .iter()
-        .find(|gloss| !is_boilerplate(gloss))
-        .or_else(|| chosen.glosses.first())
-        .cloned()
+    // Prefer a real meaning over a "Used to form …" grammar sentence.
+    if let Some(gloss) = chosen.glosses.iter().find(|gloss| !is_boilerplate(gloss)) {
+        return Some(gloss.clone());
+    }
+    // For a suffix, "Used to form adjectives from nouns" *is* the meaning, so it
+    // stays. For a prefix or a bound root the same shape usually describes one
+    // obscure sense (`a-` "used to form nouns for astronomical bodies"), which is
+    // worse than showing the bare affix.
+    if matches!(kind, RootKind::Suffix) {
+        return chosen.glosses.first().cloned();
+    }
+    None
 }
 
 /// Wiktionary affix senses often open with a sentence describing the grammar
@@ -952,6 +956,25 @@ mod tests {
             gloss_for(&index, "kind", RootKind::Root).as_deref(),
             Some("group of")
         );
+    }
+
+    #[test]
+    fn a_boilerplate_only_affix_reports_no_gloss() {
+        // Regression: `arise` rendered `a- -> Used to form noun from a noun
+        // corresponding to astronomical body …`, which is a grammar note about a
+        // different sense of `a-`, not this word's meaning.
+        let mut index = MorphemeIndex::new();
+        index.insert(
+            "a-".to_string(),
+            entry(
+                RootKind::Prefix,
+                &[
+                    "Used to form noun from a noun corresponding to astronomical body",
+                    "Used to form adverbs",
+                ],
+            ),
+        );
+        assert_eq!(gloss_for(&index, "a", RootKind::Prefix), None);
     }
 
     #[test]

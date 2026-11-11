@@ -223,7 +223,11 @@ fn run() -> Result<()> {
                 println!("forms: {forms}");
             }
             for colloc in &word.collocations {
-                println!("phrase: {}  ->  {}", colloc.phrase, colloc.gloss);
+                if colloc.gloss.trim().is_empty() {
+                    println!("phrase: {}", colloc.phrase);
+                } else {
+                    println!("phrase: {}  ->  {}", colloc.phrase, colloc.gloss);
+                }
             }
             for gloss in &word.glosses {
                 println!("gloss: {}", gloss.text);
