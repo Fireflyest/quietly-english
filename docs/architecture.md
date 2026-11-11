@@ -76,9 +76,12 @@ sequenceDiagram
 
 ## 数据模型
 
+数据分两个 SQLite 文件，打开时用 `ATTACH DATABASE ... AS dict` 挂在一起，
+所以跨库 JOIN 和事务都照常可用。
+
+**`quietly.db`**（学习数据，几 MB，可进 git）
+
 ```sql
-words(id, lemma UNIQUE NOCASE, phonetic, translation, definition,
-      roots JSON, examples JSON, tags JSON, source)
 books(id, slug UNIQUE, name, description, builtin)
 book_words(book_id, word_id, rank)          -- 词书内容与顺序
 cards(word_id PK, book_id, phase, step, ease, interval_days,
@@ -86,11 +89,28 @@ cards(word_id PK, book_id, phase, step, ease, interval_days,
 reviews(id, word_id, at, day, rating, phase_after, interval_after, is_new)
 sessions(id, day, started_at, ended_at, seconds, new_count, review_count)
 settings(key, value)
+texts(id, title UNIQUE, source, license, body, translation, created_at)
+reading_progress(text_id PK, paragraph, mode, updated_at)
+reading_log(id, text_id, day, started_at, ended_at, seconds, paragraphs, ...)
+reading_marks(text_id, lemma, paragraph, created_at)
+quizzes(id, text_id, paragraph, prompt, answer, choices, source, created_at)
+quiz_attempts(id, quiz_id, day, at, correct)
 ```
 
-- `roots` / `examples` / `tags` 用 JSON 存，避免过早拆表；解析失败时静默降级为空。
+**`quietly-words.db`**（词典，500 MB+，随时重建）
+
+```sql
+words(id, lemma UNIQUE NOCASE, phonetic, translation, definition,
+      roots JSON, examples JSON, tags JSON, source,
+      collocations JSON, glosses JSON)
+```
+
+- `roots` / `examples` / `tags` / `collocations` / `glosses` 用 JSON 存，避免过早拆表；
+  解析失败时静默降级为空。
 - `cards` 以 `word_id` 为主键：一个词只有一份记忆状态，多个词书共享。
 - `reviews` 是流水，`daily` / `streak` / `due` 全部从它和 `cards` 派生，没有冗余计数器。
+- **跨库外键在 SQLite 里不生效**，所以 `book_words` / `cards` 只存 `word_id` 数值。
+  词典库重建时只要沿用同一份导入顺序，id 就保持不变；`quietly db` 用于核对两个文件的体积。
 
 ## 记忆曲线
 

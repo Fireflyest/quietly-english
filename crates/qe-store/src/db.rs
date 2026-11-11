@@ -14,8 +14,13 @@ use qe_core::model::{
 use qe_core::store::Store;
 use qe_core::time;
 
-const SCHEMA_V1: &str = r#"
-CREATE TABLE IF NOT EXISTS words (
+/// 词典表。它单独放在 `quietly-words.db` 里：327 万词条会让整个文件涨到 500 MB+，
+/// 而学习数据只有几 MB。分开之后学习数据可以进 git，词典随时能从下载包重建。
+///
+/// 跨库外键在 SQLite 里不生效，所以 `book_words` / `cards` 只存 `word_id`，
+/// 由 `quietly doctor` 负责校验引用是否还有对应的词条。
+const SCHEMA_WORDS: &str = r#"
+CREATE TABLE IF NOT EXISTS dict.words (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     lemma       TEXT NOT NULL UNIQUE COLLATE NOCASE,
     phonetic    TEXT,
@@ -26,7 +31,10 @@ CREATE TABLE IF NOT EXISTS words (
     tags        TEXT NOT NULL DEFAULT '[]',
     source      TEXT NOT NULL DEFAULT ''
 );
+"#;
 
+/// 学习数据。不含 `words`，也不带指向它的外键。
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS books (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     slug        TEXT NOT NULL UNIQUE,
@@ -37,13 +45,13 @@ CREATE TABLE IF NOT EXISTS books (
 
 CREATE TABLE IF NOT EXISTS book_words (
     book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-    word_id INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,
+    word_id INTEGER NOT NULL,
     rank    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (book_id, word_id)
 );
 
 CREATE TABLE IF NOT EXISTS cards (
-    word_id        INTEGER PRIMARY KEY REFERENCES words(id) ON DELETE CASCADE,
+    word_id        INTEGER PRIMARY KEY,
     book_id        INTEGER,
     phase          TEXT NOT NULL DEFAULT 'new',
     step           INTEGER NOT NULL DEFAULT 0,
@@ -160,9 +168,20 @@ CREATE INDEX IF NOT EXISTS idx_quizzes_text ON quizzes(text_id);
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
+    /// 词典库文件（`quietly-words.db`），与 `path` 同目录。
+    words_path: PathBuf,
 }
 
 impl SqliteStore {
+    /// 词典库文件名。学习库叫 `quietly.db`，它叫 `quietly-words.db`。
+    fn words_file_for(core: &Path) -> PathBuf {
+        let stem = core
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "quietly".to_string());
+        core.with_file_name(format!("{stem}-words.db"))
+    }
+
     /// 默认位置：`%APPDATA%/quietly-english`（Windows）或 `~/.local/share/quietly-english`。
     /// 可用环境变量 `QUIETLY_HOME` 覆盖。
     pub fn open_default() -> Result<Self> {
@@ -192,7 +211,21 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        let mut store = Self { conn, path };
+        // 词典单独一个文件。ATTACH 让 `dict.words` 能和学习表共用同一个连接和
+        // 事务，跨库 JOIN 也照常可用。
+        let words_path = Self::words_file_for(&path);
+        conn.execute(
+            "ATTACH DATABASE ?1 AS dict",
+            [words_path.to_string_lossy().as_ref()],
+        )
+        .with_context(|| format!("无法打开词典库 {}", words_path.display()))?;
+        conn.execute_batch(SCHEMA_WORDS)?;
+
+        let mut store = Self {
+            conn,
+            path,
+            words_path,
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -201,33 +234,149 @@ impl SqliteStore {
         &self.path
     }
 
+    /// 词典库文件的路径。`,quietly doctor` 用它算体积。
+    pub fn words_path(&self) -> &Path {
+        &self.words_path
+    }
+
     fn migrate(&mut self) -> Result<()> {
         let version: i64 = self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             self.conn.execute_batch(SCHEMA_V1)?;
             self.conn.execute_batch("PRAGMA user_version = 1")?;
         }
-        if version < 2 {
-            // `ALTER TABLE ... ADD COLUMN` with a constant default is a metadata-only
-            // change in SQLite, so this stays instant on a 3.2M row table.
-            self.conn.execute_batch(
-                "ALTER TABLE words ADD COLUMN collocations TEXT NOT NULL DEFAULT '[]';",
-            )?;
-            self.conn.execute_batch("PRAGMA user_version = 2")?;
-        }
-        if version < 3 {
-            // English glosses from Wiktionary, used to fill senses ECDICT lacks.
-            self.conn.execute_batch(
-                "ALTER TABLE words ADD COLUMN glosses TEXT NOT NULL DEFAULT '[]';",
-            )?;
-            self.conn.execute_batch("PRAGMA user_version = 3")?;
-        }
         if version < 4 {
             // 阅读模块。文本与译文都存原文，段落切分在读取时做，所以只需要一张表。
             self.conn.execute_batch(SCHEMA_V4)?;
             self.conn.execute_batch("PRAGMA user_version = 4")?;
         }
+        // 词典库的列不跟主库版本号走：老库和新库都要补齐这两列，补之前先看
+        // 实际列名，所以重复执行也不会出错。
+        self.ensure_words_columns()?;
+        if version < 5 {
+            // 把 `words` 从学习库里搬出去，换成独立的词典库文件。
+            //
+            // 老库里 `book_words` / `cards` 带指向 `words` 的外键，跨库外键在 SQLite
+            // 里不生效，所以这两张表要重建一次。它们只有几万行，很快。
+            self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+            let moved = self.move_words_out()?;
+            self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
+            self.conn.execute_batch("PRAGMA user_version = 5")?;
+            if moved {
+                // DROP TABLE 只把页标记为空闲，文件不会自己变小。VACUUM 把 500MB
+                // 的词典页从学习库里真正收回去，之后主库只剩几 MB。
+                self.conn.execute_batch("VACUUM")?;
+            }
+        }
         Ok(())
+    }
+
+    /// 词典库的列结构补齐。
+    ///
+    /// `ALTER TABLE ... ADD COLUMN` 带常量默认值时是纯元数据操作，327 万行也是瞬间。
+    /// 先查实际列名，所以反复调用安全。
+    fn ensure_words_columns(&mut self) -> Result<()> {
+        let mut existing: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("PRAGMA dict.table_info(words)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                existing.push(row?);
+            }
+        }
+        for (name, decl) in [
+            ("collocations", "TEXT NOT NULL DEFAULT '[]'"),
+            ("glosses", "TEXT NOT NULL DEFAULT '[]'"),
+        ] {
+            if !existing.iter().any(|col| col == name) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE dict.words ADD COLUMN {name} {decl};"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 老布局（`words` 在学习库里）迁移到新布局。
+    /// 老布局（`words` 在学习库里）迁移到新布局。返回是否真的搬过。
+    fn move_words_out(&mut self) -> Result<bool> {
+        let has_old: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'words'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)?;
+        if !has_old {
+            return Ok(false);
+        }
+
+        let tx = self.conn.transaction()?;
+        // 逐列搬，老库可能还没有 collocations / glosses。
+        let cols: Vec<String> = tx
+            .prepare("PRAGMA main.table_info(words)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let wanted = [
+            "id",
+            "lemma",
+            "phonetic",
+            "translation",
+            "definition",
+            "roots",
+            "examples",
+            "tags",
+            "source",
+            "collocations",
+            "glosses",
+        ];
+        let present: Vec<&str> = wanted
+            .iter()
+            .copied()
+            .filter(|name| cols.iter().any(|col| col == name))
+            .collect();
+        let list = present.join(", ");
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO dict.words({list}) SELECT {list} FROM main.words;"
+        ))?;
+
+        // 重建两张带外键的子表，去掉指向 words 的约束。
+        tx.execute_batch(
+            "ALTER TABLE book_words RENAME TO book_words_old;
+             CREATE TABLE book_words (
+                book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                word_id INTEGER NOT NULL,
+                rank    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (book_id, word_id)
+             );
+             INSERT INTO book_words(book_id, word_id, rank)
+                SELECT book_id, word_id, rank FROM book_words_old;
+             DROP TABLE book_words_old;
+             CREATE INDEX IF NOT EXISTS idx_book_words_book ON book_words(book_id);
+
+             ALTER TABLE cards RENAME TO cards_old;
+             CREATE TABLE cards (
+                word_id        INTEGER PRIMARY KEY,
+                book_id        INTEGER,
+                phase          TEXT NOT NULL DEFAULT 'new',
+                step           INTEGER NOT NULL DEFAULT 0,
+                ease           REAL NOT NULL DEFAULT 2.5,
+                interval_days  INTEGER NOT NULL DEFAULT 0,
+                reps           INTEGER NOT NULL DEFAULT 0,
+                lapses         INTEGER NOT NULL DEFAULT 0,
+                due_at         TEXT,
+                due_ts         INTEGER,
+                last_review_at TEXT
+             );
+             INSERT INTO cards SELECT * FROM cards_old;
+             DROP TABLE cards_old;
+             CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due_ts);
+
+             DROP TABLE main.words;",
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// 流式导入 ECDICT（约 77 万词）。
@@ -384,10 +533,10 @@ fn upsert_word_tx(
     source: &str,
 ) -> Result<(i64, bool)> {
     let existed: Option<i64> = tx
-        .query_row("SELECT id FROM words WHERE lemma = ?1", [lemma], |row| row.get(0))
+        .query_row("SELECT id FROM dict.words WHERE lemma = ?1", [lemma], |row| row.get(0))
         .optional()?;
     let id: i64 = tx.query_row(
-        "INSERT INTO words(lemma, phonetic, translation, definition, roots, examples, tags, source)
+        "INSERT INTO dict.words(lemma, phonetic, translation, definition, roots, examples, tags, source)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(lemma) DO UPDATE SET
             phonetic    = COALESCE(NULLIF(excluded.phonetic, ''), words.phonetic),
@@ -412,7 +561,7 @@ fn add_collocations_tx(
 ) -> Result<()> {
     let raw: Option<String> = tx
         .query_row(
-            "SELECT collocations FROM words WHERE lemma = ?1",
+            "SELECT collocations FROM dict.words WHERE lemma = ?1",
             [lemma],
             |row| row.get(0),
         )
@@ -434,7 +583,7 @@ fn add_collocations_tx(
         return Ok(());
     }
     tx.execute(
-        "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+        "UPDATE dict.words SET collocations = ?1 WHERE lemma = ?2",
         params![serde_json::to_string(&list)?, lemma],
     )?;
     Ok(())
@@ -451,7 +600,7 @@ fn lookup_phrase_tx(tx: &Transaction<'_>, phrase: &str) -> Result<Option<String>
     }
     let raw: Option<String> = tx
         .query_row(
-            "SELECT translation FROM words WHERE lemma = ?1",
+            "SELECT translation FROM dict.words WHERE lemma = ?1",
             [key.as_str()],
             |row| row.get(0),
         )
@@ -609,7 +758,7 @@ impl Store for SqliteStore {
             "SELECT {WORD_COLS},
                     c.phase, c.step, c.ease, c.interval_days, c.reps, c.lapses, c.due_at, c.last_review_at
              FROM cards c
-             JOIN words w ON w.id = c.word_id
+             JOIN dict.words w ON w.id = c.word_id
              JOIN book_words bw ON bw.word_id = w.id AND bw.book_id = ?1
              WHERE c.due_ts IS NOT NULL AND c.due_ts <= ?2
              ORDER BY c.due_ts ASC
@@ -632,7 +781,7 @@ impl Store for SqliteStore {
         let sql = format!(
             "SELECT {WORD_COLS}
              FROM book_words bw
-             JOIN words w ON w.id = bw.word_id
+             JOIN dict.words w ON w.id = bw.word_id
              LEFT JOIN cards c ON c.word_id = w.id
              WHERE bw.book_id = ?1 AND c.word_id IS NULL
              ORDER BY bw.rank ASC, w.id ASC
@@ -799,7 +948,7 @@ impl Store for SqliteStore {
     }
 
     fn word(&self, lemma: &str) -> Result<Option<Word>> {
-        let sql = format!("SELECT {WORD_COLS} FROM words w WHERE w.lemma = ?1");
+        let sql = format!("SELECT {WORD_COLS} FROM dict.words w WHERE w.lemma = ?1");
         let mut stmt = self.conn.prepare(&sql)?;
         let word = stmt.query_row([lemma.trim()], decode_word).optional()?;
         Ok(word)
@@ -1157,7 +1306,7 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let sql = format!(
-            "SELECT {WORD_COLS} FROM words w
+            "SELECT {WORD_COLS} FROM dict.words w
              WHERE w.lemma LIKE ?1 OR w.translation LIKE ?1 OR w.roots LIKE ?1
              ORDER BY CASE WHEN lower(w.lemma) = lower(?2) THEN 0 WHEN w.lemma LIKE ?3 THEN 1 ELSE 2 END,
                       length(w.lemma) ASC, w.lemma ASC
@@ -1178,7 +1327,7 @@ impl Store for SqliteStore {
 
     fn deck_lemmas(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT lower(w.lemma) FROM book_words bw JOIN words w ON w.id = bw.word_id",
+            "SELECT DISTINCT lower(w.lemma) FROM book_words bw JOIN dict.words w ON w.id = bw.word_id",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1449,7 +1598,7 @@ impl Store for SqliteStore {
             if merge {
                 if let Some(existing) = tx
                     .query_row(
-                        "SELECT translation FROM words WHERE lemma = ?1",
+                        "SELECT translation FROM dict.words WHERE lemma = ?1",
                         [word.lemma.as_str()],
                         |row| row.get::<_, String>(0),
                     )
@@ -1503,7 +1652,7 @@ impl Store for SqliteStore {
         let pending: Vec<(String, String)> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT lemma, collocations FROM words WHERE collocations != '[]'")?;
+                .prepare("SELECT lemma, collocations FROM dict.words WHERE collocations != '[]'")?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -1539,7 +1688,7 @@ impl Store for SqliteStore {
             }
             if changed {
                 tx.execute(
-                    "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+                    "UPDATE dict.words SET collocations = ?1 WHERE lemma = ?2",
                     params![serde_json::to_string(&list)?, lemma],
                 )?;
             }
@@ -1559,7 +1708,7 @@ impl Store for SqliteStore {
         for (lemma, collocation) in rows {
             let raw: Option<String> = tx
                 .query_row(
-                    "SELECT collocations FROM words WHERE lemma = ?1",
+                    "SELECT collocations FROM dict.words WHERE lemma = ?1",
                     [lemma.as_str()],
                     |row| row.get(0),
                 )
@@ -1577,7 +1726,7 @@ impl Store for SqliteStore {
             }
             list.push(collocation);
             tx.execute(
-                "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+                "UPDATE dict.words SET collocations = ?1 WHERE lemma = ?2",
                 params![serde_json::to_string(&list)?, lemma.as_str()],
             )?;
             words += 1;
@@ -1597,7 +1746,7 @@ impl Store for SqliteStore {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT collocations FROM words WHERE lemma = ?1",
+                "SELECT collocations FROM dict.words WHERE lemma = ?1",
                 [lemma],
                 |row| row.get(0),
             )
@@ -1613,7 +1762,7 @@ impl Store for SqliteStore {
         }
         list.push(Collocation::new(phrase, gloss.trim()));
         self.conn.execute(
-            "UPDATE words SET collocations = ?1 WHERE lemma = ?2",
+            "UPDATE dict.words SET collocations = ?1 WHERE lemma = ?2",
             params![serde_json::to_string(&list)?, lemma],
         )?;
         Ok(true)
@@ -1630,7 +1779,7 @@ impl Store for SqliteStore {
         // hitting the database for every one of the million entries in the dump.
         let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
-            let mut stmt = self.conn.prepare("SELECT lemma FROM words")?;
+            let mut stmt = self.conn.prepare("SELECT lemma FROM dict.words")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             for lemma in rows {
                 existing.insert(lemma?.to_ascii_lowercase());
@@ -1651,14 +1800,14 @@ impl Store for SqliteStore {
                 }
                 if !analysis.roots.is_empty() {
                     tx.execute(
-                        "UPDATE words SET roots = ?1 WHERE lemma = ?2",
+                        "UPDATE dict.words SET roots = ?1 WHERE lemma = ?2",
                         params![serde_json::to_string(&analysis.roots)?, lemma],
                     )?;
                     morphemes += analysis.roots.len() as u32;
                 }
                 if !analysis.glosses.is_empty() {
                     tx.execute(
-                        "UPDATE words SET glosses = ?1 WHERE lemma = ?2",
+                        "UPDATE dict.words SET glosses = ?1 WHERE lemma = ?2",
                         params![serde_json::to_string(&analysis.glosses)?, lemma],
                     )?;
                     glosses += analysis.glosses.len() as u32;
@@ -1673,7 +1822,7 @@ impl Store for SqliteStore {
                 }
                 let payload = serde_json::to_string(&roots)?;
                 tx.execute(
-                    "UPDATE words SET roots = ?1 WHERE lemma = ?2",
+                    "UPDATE dict.words SET roots = ?1 WHERE lemma = ?2",
                     params![payload, lemma],
                 )?;
                 words += 1;
@@ -1692,7 +1841,7 @@ impl Store for SqliteStore {
         for (lemma, example) in examples {
             let raw: Option<String> = tx
                 .query_row(
-                    "SELECT examples FROM words WHERE lemma = ?1",
+                    "SELECT examples FROM dict.words WHERE lemma = ?1",
                     [lemma.trim()],
                     |row| row.get(0),
                 )
@@ -1707,7 +1856,7 @@ impl Store for SqliteStore {
                 list.remove(0);
             }
             tx.execute(
-                "UPDATE words SET examples = ?1 WHERE lemma = ?2",
+                "UPDATE dict.words SET examples = ?1 WHERE lemma = ?2",
                 params![serde_json::to_string(&list)?, lemma.trim()],
             )?;
             added += 1;
@@ -1919,5 +2068,95 @@ mod tests {
         let store = SqliteStore::open_at(&path).unwrap();
         let word = store.word("anything").unwrap();
         assert!(word.is_none());
+    }
+
+    #[test]
+    fn words_live_in_their_own_file() {
+        let (mut store, dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+
+        // 学习库里没有 words 表，词典库里才有。
+        let core_has: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE type='table' AND name='words'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(core_has, 0, "the study db must not hold the dictionary");
+
+        let words_path = store.words_path().to_path_buf();
+        assert!(words_path.exists(), "the dictionary file is created on open");
+        assert_eq!(
+            words_path.file_name().unwrap().to_string_lossy(),
+            "test-words.db",
+            "named after the core file"
+        );
+        assert!(dir.path().join("test-words.db").exists());
+        assert_eq!(store.word("inspect").unwrap().unwrap().lemma, "inspect");
+    }
+
+    #[test]
+    fn an_old_single_file_database_is_split_on_open() {
+        // 造一个 v4 布局：words 还在学习库里，子表带指向它的外键。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE words (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lemma TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    phonetic TEXT, translation TEXT NOT NULL DEFAULT '',
+                    definition TEXT, roots TEXT NOT NULL DEFAULT '[]',
+                    examples TEXT NOT NULL DEFAULT '[]',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT '',
+                    collocations TEXT NOT NULL DEFAULT '[]',
+                    glosses TEXT NOT NULL DEFAULT '[]');
+                 CREATE TABLE books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                    builtin INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE book_words (
+                    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                    word_id INTEGER NOT NULL REFERENCES words(id) ON DELETE CASCADE,
+                    rank INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (book_id, word_id));
+                 CREATE TABLE cards (
+                    word_id INTEGER PRIMARY KEY REFERENCES words(id) ON DELETE CASCADE,
+                    book_id INTEGER, phase TEXT NOT NULL DEFAULT 'new',
+                    step INTEGER NOT NULL DEFAULT 0, ease REAL NOT NULL DEFAULT 2.5,
+                    interval_days INTEGER NOT NULL DEFAULT 0,
+                    reps INTEGER NOT NULL DEFAULT 0, lapses INTEGER NOT NULL DEFAULT 0,
+                    due_at TEXT, due_ts INTEGER, last_review_at TEXT);
+                 INSERT INTO words(lemma, translation) VALUES ('inspect', 'v. 检查');
+                 INSERT INTO books(slug, name) VALUES ('legacy', 'Legacy Deck');
+                 INSERT INTO book_words(book_id, word_id, rank) VALUES (1, 1, 0);
+                 INSERT INTO cards(word_id, book_id, phase) VALUES (1, 1, 'review');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open_at(&path).unwrap();
+        // 词条搬进单独的库，引用关系还在。
+        assert_eq!(store.word("inspect").unwrap().unwrap().translation, "v. 检查");
+        let book = store.book_by_slug("legacy").unwrap().unwrap();
+        assert_eq!(store.new_cards(book.id, 10).unwrap().len(), 0, "already studied");
+        let cards = store.due_cards(book.id, chrono::Utc::now(), 10).unwrap();
+        assert!(cards.is_empty(), "nothing due, but the card survived");
+        assert!(dir.path().join("legacy-words.db").exists());
+
+        let core_has: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE type='table' AND name='words'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(core_has, 0, "the legacy table is dropped after the move");
     }
 }

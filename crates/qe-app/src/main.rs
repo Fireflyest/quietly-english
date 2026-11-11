@@ -63,17 +63,29 @@ fn run() -> Result<()> {
         Some(path) => SqliteStore::open_at(path)?,
         None => SqliteStore::open_default()?,
     };
-    let seeded = qe_store::seed::seed_if_empty(&mut store)?;
 
     match command.as_deref() {
         None => {
-            if seeded {
-                eprintln!("quietly: 已写入内置词书 {}", store.path().display());
-            }
             cli::install_panic_hook();
             let mut terminal = cli::TerminalSession::new()?;
             let app = app::App::new(Box::new(store))?;
             app.run(&mut terminal)
+        }
+        Some("db") => {
+            // 数据分两个文件，先说清楚各自是什么、多大。
+            let core = store.path().to_path_buf();
+            let words = store.words_path().to_path_buf();
+            let size = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .map(|meta| format!("{:.1} MB", meta.len() as f64 / 1_048_576.0))
+                    .unwrap_or_else(|_| "missing".to_string())
+            };
+            println!("study   {}  {}", size(&core), core.display());
+            println!("words   {}  {}", size(&words), words.display());
+            println!();
+            println!("study db 里是词书、卡片、复习流水、阅读与设置，几 MB，适合进 git。");
+            println!("words db 是词典，几百 MB，随时能用 quietly dict / etymology 重建。");
+            Ok(())
         }
         Some("import") => {
             let path = rest
@@ -419,6 +431,7 @@ USAGE:
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
     quietly stats                 今日统计
+    quietly db                    两个数据库文件的位置与体积
     quietly where                 打印数据库路径
 
 OPTIONS:

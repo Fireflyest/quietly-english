@@ -42,7 +42,7 @@ quietly  CET-4 核心词                          due 8 · new 4/20 · streak 3
 
 ## 功能（单词模块）
 
-- **词书**：内置 CET-4 / CET-6 / TOEFL 试读词书，支持从 ECDICT、JSON、CSV、TXT 导入任意词书
+- **词书**：从 ECDICT、JSON、CSV、TXT 导入任意词书，不做内置示例（空的库从你自己的词书开始）
 - **词根分解**：只认 Wiktionary 词源模板、词典条目或自备词根表，每段都带 `source`；
   没有数据的词就不显示词根区块，**不推测、不生成**
 - **词组搭配**：从词典的 `相关词组:` 段抽取，或用 `quietly phrases` / `/phrase` 自己补
@@ -64,11 +64,19 @@ cargo run --release -- books # 查看词书
 > 特性会用 C 编译 SQLite，所以两者缺一不可。macOS / Linux 装好 `build-essential` / `xcode-select` 即可。
 > 详细步骤与下载地址见 [docs/windows-setup.md](docs/windows-setup.md)。
 
-首次启动会自动建库并写入内置试读词书，位置：
+数据分两个 SQLite 文件，放在这些位置：
 
-- Windows：`%APPDATA%\quietly-english\quietly.db`
-- macOS / Linux：`~/.local/share/quietly-english/quietly.db`
+- Windows：`%APPDATA%\quietly-english\`
+- macOS / Linux：`~/.local/share/quietly-english/`
 - 覆盖：设置环境变量 `QUIETLY_HOME` 或 `--db <path>`
+
+| 文件 | 内容 | 体积 |
+| --- | --- | --- |
+| `quietly.db` | 词书、卡片、复习流水、阅读、设置 | 几 MB（可进 git） |
+| `quietly-words.db` | 词典（327 万词条） | 500 MB+（可重建） |
+
+`quietly db` 查看两个文件的实际位置与大小。**换机器时只需要搬 `quietly.db`**，
+词典那半边用下载包重建即可。
 
 ### 导入正式词库
 
@@ -90,6 +98,20 @@ quietly examples cmn_sentences.tsv eng_sentences.tsv links.csv  # Tatoeba 中英
 **词根不靠算法猜**：只从 Wiktionary 词源模板或自备词根表读取，没有数据的词就不显示词根区块。
 **搭配也不靠统计猜**：只从词典里显式标出的 `相关词组:` 段或自备 TSV 读取。
 详细下载地址、体积和字段说明见 [docs/data-sources.md](docs/data-sources.md)。
+
+### 数据包
+
+输入数据统一放在仓库的 [`packs/`](packs/README.md) 下，按「小则提交、大则重下」分开：
+
+| 目录 | 内容 | 进 git |
+| --- | --- | --- |
+| `packs/decks/` | 词书 JSON / CSV / TXT | ✅ |
+| `packs/texts/` | 阅读文本（可双语） | ✅ |
+| `packs/quizzes/` | 阅读题目 TSV | ✅ |
+| `packs/dict/` · `packs/etymology/` · `packs/examples/` | 词典、词源、例句语料 | ❌ 重新下载 |
+
+所以 clone 下来就能读到 `packs/texts/` 里的文章、做 `packs/quizzes/` 里的题，
+但词库要自己下——词典动辄几百 MB，而且多数商业词典的电子版版权状态不明，不适合进仓库。
 
 ### 其他格式
 
@@ -180,7 +202,7 @@ graph LR
 | crate | 职责 |
 | --- | --- |
 | `qe-core` | 纯领域层：`Word`/`SrsCard` 等模型、`srs` 记忆曲线、`reading` 切段与分词、`affix` 词缀表、`view` 视图模型、`Store` trait |
-| `qe-store` | `Store` 的 SQLite 实现、`import` 词库解析、`stardict` 词典、`collocations` 搭配抽取、`merge` 多词典合并、`etymology` 词源、`tatoeba` 例句、`seed` 内置词书 |
+| `qe-store` | `Store` 的 SQLite 实现（学习库 + 词典库两个文件）、`import` 词库解析、`stardict` 词典、`collocations` 搭配抽取、`merge` 多词典合并、`etymology` 词源、`tatoeba` 例句 |
 | `qe-tui` | 只消费视图模型：`lines`（换行/排版）、`render`（帧布局）、`theme`、`terminal` |
 | `qe-app` | `Command` 解析、单行编辑器、`StudySession` 会话、`App` 状态机与事件循环 |
 

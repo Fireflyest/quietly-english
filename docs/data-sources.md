@@ -205,10 +205,37 @@ quietly examples cmn_sentences.tsv eng_sentences.tsv links/links.csv
 
 ## 数据位置
 
-| 平台 | 路径 |
-| --- | --- |
-| Windows | `%APPDATA%\quietly-english\quietly.db` |
-| macOS | `~/Library/Application Support/quietly-english/quietly.db` |
-| Linux | `~/.local/share/quietly-english/quietly.db` |
+两个数据库文件：学习数据（几 MB）和词典（500 MB+）。
 
-用 `quietly where` 查看实际路径，`--db <path>` 或 `QUIETLY_HOME` 覆盖。
+| 平台 | 目录 |
+| --- | --- |
+| Windows | `%APPDATA%\quietly-english\` |
+| macOS | `~/Library/Application Support/quietly-english/` |
+| Linux | `~/.local/share/quietly-english/` |
+
+| 文件 | 内容 | 是否值得提交到 git |
+| --- | --- | --- |
+| `quietly.db` | 词书、卡片、复习流水、阅读文本与进度、设置 | ✅ 几 MB |
+| `quietly-words.db` | 词典（ECDICT + 叠进来的朗道） | ❌ 数百 MB，可重建 |
+
+用 `quietly db` 看两个文件的实际位置与体积，`quietly where` 只看学习库路径。
+`--db <path>` 或 `QUIETLY_HOME` 可以覆盖目录（词典库跟着学习库同目录、同名加 `-words`）。
+
+### 从零恢复
+
+```bash
+git clone <repo> && cd quietly-english
+cargo build --release
+
+quietly import packs/decks/CET6_T.json              # 词书，仓库自带
+quietly dict   <ecdict.ifo>                         # 327 万词条，约 11 分钟
+quietly dict   <langdao-ec-gb.ifo> --merge          # 补 7.5% 生僻义与搭配
+quietly etymology <kaikki.jsonl>                    # 词根，几分钟
+quietly examples <cmn.tsv> <eng.tsv> <links.csv>    # 中英例句
+
+quietly books      # 确认词书
+quietly db         # 确认两个库的位置和体积
+```
+
+只要把已有的 `quietly.db` 复制到新机器，学习进度、阅读进度、题目就全在，
+不必重跑上面任何一步。

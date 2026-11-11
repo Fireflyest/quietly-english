@@ -35,3 +35,9 @@ rustc-ice-*.txt
 # OS noise
 .DS_Store
 
+
+# 数据包：小的提交，大的重新下载。
+# 见 packs/README.md。
+packs/dict/
+packs/etymology/
+packs/examples/

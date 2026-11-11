@@ -1768,9 +1768,31 @@ mod tests {
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open_at(dir.path().join("quietly.db")).unwrap();
-        qe_store::seed::seed_if_empty(&mut store).unwrap();
+        // 没有内置词书了，测试自己准备一个小词库。
+        store.import_plan(&fixture_plan()).unwrap();
         let app = App::new(Box::new(store)).unwrap();
         Harness { app, _dir: dir }
+    }
+
+    /// 三词的小词库，够覆盖新词、复习、评分与撤销。
+    fn fixture_plan() -> qe_core::model::ImportPlan {
+        use qe_core::model::{Example, ImportPlan, Word};
+
+        let mut plan = ImportPlan::new("test", "Test Deck", "fixture");
+        for (lemma, translation) in [
+            ("inspect", "v. 检查"),
+            ("consistent", "a. 一致的"),
+            ("reject", "v. 拒绝"),
+        ] {
+            let mut word = Word::new(lemma, translation);
+            word.phonetic = Some(format!("/{lemma}/"));
+            word.examples.push(Example::new(
+                format!("They {lemma} it."),
+                Some(format!("他们{translation}。")),
+            ));
+            plan.words.push(word);
+        }
+        plan
     }
 
     fn card_count(app: &App) -> usize {
@@ -1927,9 +1949,16 @@ mod tests {
     #[test]
     fn book_switch_changes_current_book() {
         let Harness { mut app, _dir } = harness();
-        app.switch_book("toefl").unwrap();
-        assert_eq!(app.book.as_ref().unwrap().slug, "toefl");
-        assert_eq!(app.store.current_book().unwrap().unwrap().slug, "toefl");
+        // 第二个词书用来验证切换；内置示例词书已经去掉了。
+        let mut second = qe_core::model::ImportPlan::new("other", "Other Deck", "fixture");
+        second
+            .words
+            .push(qe_core::model::Word::new("serendipity", "n. 意外发现"));
+        app.store.import_plan(&second).unwrap();
+
+        app.switch_book("other").unwrap();
+        assert_eq!(app.book.as_ref().unwrap().slug, "other");
+        assert_eq!(app.store.current_book().unwrap().unwrap().slug, "other");
     }
 
     #[test]
