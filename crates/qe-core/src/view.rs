@@ -198,6 +198,15 @@ impl ToolView {
             result.push_str("  ");
             result.push_str(phonetic);
         }
+        // Frequency belongs on the headword line: it describes the word as a
+        // whole, and sitting under the glosses it read as part of them.
+        if let Some(freq) = crate::text::freq(&word.translation) {
+            result.push_str("  ");
+            result.push_str(&crate::text::stars(freq));
+            if freq.oxford {
+                result.push_str(" oxford");
+            }
+        }
 
         let mut view = Self::new(state.name.clone())
             .badge(state.badge.clone())
@@ -268,13 +277,6 @@ impl ToolView {
             }
         }
 
-        if let Some(freq) = crate::text::freq(&word.translation) {
-            let mut label = crate::text::stars(freq);
-            if freq.oxford {
-                label.push_str("  oxford");
-            }
-            view = view.muted(label);
-        }
         if let Some(definition) = &word.definition {
             view = view.muted(definition.clone());
         }
@@ -776,6 +778,30 @@ mod tests {
         assert_eq!(state.accent, Accent::Warn);
         let view = ToolView::word_card(&state);
         assert_eq!(view.accent, Accent::Warn, "rail colour must reach the block");
+    }
+
+    #[test]
+    fn frequency_rides_on_the_headword_line() {
+        // Stars describe the word, not one of its glosses, so they sit next to the
+        // phonetic instead of under `more meanings` where they read as a gloss.
+        let word = crate::model::Word::new("sake", "-K5\nn. 目的, 缘故");
+        let mut state = CardState::new(word, "lookup").revealed();
+        state.word.glosses = vec![crate::text::Gloss::new("Rice wine.")];
+
+        let view = ToolView::word_card(&state);
+        let headline = view.result.clone().expect("headline");
+        assert!(headline.contains("sake"), "{headline}");
+        assert!(headline.contains("★★★★★"), "stars on the headword: {headline}");
+        assert!(headline.contains("oxford"), "{headline}");
+
+        // And they must not linger in the body.
+        assert!(
+            !view.lines.iter().any(|line| matches!(
+                line,
+                ToolLine::Muted(text) if text.contains('★')
+            )),
+            "stars must not repeat below"
+        );
     }
 
     /// Only the `hint:` lines, so the card's own prompt does not get in the way.
