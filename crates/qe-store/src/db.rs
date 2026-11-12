@@ -602,6 +602,7 @@ impl SqliteStore {
                 "[]",
                 "[]",
                 "[]",
+                TranslationPolicy::Replace,
                 "ecdict",
             )?;
             if inserted {
@@ -656,10 +657,12 @@ impl SqliteStore {
     /// 才算悬空。`fix` 为真时顺手清掉这些行——但词典为空时不动，否则一次误操作
     /// 就能把全部进度删光。
     pub fn doctor(&self, fix: bool) -> Result<DoctorReport> {
-        let mut report = DoctorReport::default();
-        report.words = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM dict.words", [], |row| row.get(0))?;
+        let mut report = DoctorReport {
+            words: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM dict.words", [], |row| row.get(0))?,
+            ..DoctorReport::default()
+        };
 
         let mut stmt = self.conn.prepare(
             "SELECT b.slug, COUNT(bw.lemma)
@@ -756,6 +759,19 @@ fn max_rank_tx(tx: &Transaction<'_>, book_id: i64) -> Result<i64> {
     Ok(rank)
 }
 
+/// 释义合并策略。
+///
+/// 词典导入（ECDICT / StarDict）带来的释义最全，后来的词典要么覆盖、要么显式
+/// `--merge`；词书导入（JSON / CSV / TXT、`/add`）只说明「这个词属于哪本书」，
+/// 它的一行释义如果盖掉词典释义，就会连柯林斯星级、词形变化和其余义项一起丢掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationPolicy {
+    /// 新释义直接覆盖（词典导入）。
+    Replace,
+    /// 只在原本没有释义时补上（词书导入）。
+    Fill,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_word_tx(
     tx: &Transaction<'_>,
@@ -766,23 +782,34 @@ fn upsert_word_tx(
     roots: &str,
     examples: &str,
     tags: &str,
+    policy: TranslationPolicy,
     source: &str,
 ) -> Result<(i64, bool)> {
     let existed: Option<i64> = tx
         .query_row("SELECT id FROM dict.words WHERE lemma = ?1", [lemma], |row| row.get(0))
         .optional()?;
+    let translation_rule = match policy {
+        TranslationPolicy::Replace => {
+            "CASE WHEN excluded.translation = '' THEN words.translation ELSE excluded.translation END"
+        }
+        TranslationPolicy::Fill => {
+            "CASE WHEN words.translation = '' THEN excluded.translation ELSE words.translation END"
+        }
+    };
     let id: i64 = tx.query_row(
-        "INSERT INTO dict.words(lemma, phonetic, translation, definition, roots, examples, tags, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(lemma) DO UPDATE SET
-            phonetic    = COALESCE(NULLIF(excluded.phonetic, ''), words.phonetic),
-            translation = CASE WHEN excluded.translation = '' THEN words.translation ELSE excluded.translation END,
-            definition  = COALESCE(NULLIF(excluded.definition, ''), words.definition),
-            roots       = CASE WHEN excluded.roots = '[]' THEN words.roots ELSE excluded.roots END,
-            examples    = CASE WHEN excluded.examples = '[]' THEN words.examples ELSE excluded.examples END,
-            tags        = CASE WHEN excluded.tags = '[]' THEN words.tags ELSE excluded.tags END,
-            source      = COALESCE(NULLIF(excluded.source, ''), words.source)
-         RETURNING id",
+        &format!(
+            "INSERT INTO dict.words(lemma, phonetic, translation, definition, roots, examples, tags, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(lemma) DO UPDATE SET
+                phonetic    = COALESCE(NULLIF(excluded.phonetic, ''), words.phonetic),
+                translation = {translation_rule},
+                definition  = COALESCE(NULLIF(excluded.definition, ''), words.definition),
+                roots       = CASE WHEN excluded.roots = '[]' THEN words.roots ELSE excluded.roots END,
+                examples    = CASE WHEN excluded.examples = '[]' THEN words.examples ELSE excluded.examples END,
+                tags        = CASE WHEN excluded.tags = '[]' THEN words.tags ELSE excluded.tags END,
+                source      = COALESCE(NULLIF(excluded.source, ''), words.source)
+             RETURNING id"
+        ),
         params![lemma, phonetic, translation, definition, roots, examples, tags, source],
         |row| row.get(0),
     )?;
@@ -1524,6 +1551,8 @@ impl Store for SqliteStore {
         let tags = serde_json::to_string(&word.tags)?;
         let lemma = word.lemma.trim();
         // 词条必须在词典库里有一份，否则学习时 JOIN 不到它。
+        // 词书带来的释义只用来填空：它通常只有一行，盖掉词典释义会连
+        // 柯林斯星级和其余义项一起丢掉（渲染层的星级就写在释义里）。
         upsert_word_tx(
             &tx,
             lemma,
@@ -1533,6 +1562,7 @@ impl Store for SqliteStore {
             &roots,
             &examples,
             &tags,
+            TranslationPolicy::Fill,
             "manual",
         )?;
         let rank = max_rank_tx(&tx, book_id)?;
@@ -1755,6 +1785,7 @@ impl Store for SqliteStore {
                 &roots,
                 &examples,
                 &tags,
+                TranslationPolicy::Fill,
                 "import",
             )?;
             if inserted {
@@ -1885,6 +1916,7 @@ impl Store for SqliteStore {
                 "[]",
                 "[]",
                 "[]",
+                TranslationPolicy::Replace,
                 "ecdict-stardict",
             )?;
             if is_new {
@@ -2268,6 +2300,83 @@ mod tests {
         assert!(store.add_to_book(book.id, &fresh).unwrap());
         assert_eq!(store.progress(book.id).unwrap().total, before + 1);
         assert!(store.word("serendipity").unwrap().is_some());
+    }
+
+    /// 词书里的释义通常只有一行；盖掉词典释义会连柯林斯星级一起弄丢，
+    /// 而星级就写在 `translation` 的第一行（`-K5`）。
+    #[test]
+    fn importing_a_deck_does_not_overwrite_a_richer_translation() {
+        let (mut store, _dir) = temp_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO dict.words(lemma, translation, source)
+                 VALUES ('inspect', '-K5\nvt. 检查；视察\n[时态] inspected', 'ecdict')",
+                [],
+            )
+            .unwrap();
+
+        let mut plan = ImportPlan::new("deck", "Deck", "fixture");
+        plan.words.push(Word::new("inspect", "检查"));
+        store.import_plan(&plan).unwrap();
+
+        let word = store.word("inspect").unwrap().unwrap();
+        assert!(
+            word.translation.contains("-K5"),
+            "deck import must keep the dictionary's metadata line: {}",
+            word.translation
+        );
+        assert!(qe_core::text::freq(&word.translation).is_some(), "stars survive");
+    }
+
+    /// 反过来，词典导入仍然要覆盖：它是释义的权威来源。
+    #[test]
+    fn importing_a_dictionary_still_replaces_the_translation() {
+        let (mut store, _dir) = temp_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO dict.words(lemma, translation, source) VALUES ('inspect', '检查', 'import')",
+                [],
+            )
+            .unwrap();
+        let tx = store.conn.transaction().unwrap();
+        upsert_word_tx(
+            &tx,
+            "inspect",
+            None,
+            "-K5\nvt. 检查；视察",
+            None,
+            "[]",
+            "[]",
+            "[]",
+            TranslationPolicy::Replace,
+            "ecdict",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let word = store.word("inspect").unwrap().unwrap();
+        assert!(word.translation.contains("-K5"), "{}", word.translation);
+    }
+
+    /// 词典里原本没有释义（空串）时，词书那一行仍然要补进去。
+    #[test]
+    fn a_deck_fills_in_an_empty_translation() {
+        let (mut store, _dir) = temp_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO dict.words(lemma, translation) VALUES ('inspect', '')",
+                [],
+            )
+            .unwrap();
+
+        let mut plan = ImportPlan::new("deck", "Deck", "fixture");
+        plan.words.push(Word::new("inspect", "检查"));
+        store.import_plan(&plan).unwrap();
+
+        assert_eq!(store.word("inspect").unwrap().unwrap().translation, "检查");
     }
 
     #[test]
