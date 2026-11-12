@@ -160,14 +160,14 @@ pub const SPECS: &[Spec] = &[
     Spec {
         name: "/read",
         alias: "r",
-        args: " [title|path]",
-        help: "read a text, or resume the last one",
+        args: " [book|title|path]",
+        help: "read a book (by slug), a text, or import a file",
     },
     Spec {
         name: "/texts",
         alias: "",
         args: "",
-        help: "list imported texts",
+        help: "list books and loose texts with progress",
     },
     Spec {
         name: "/library",

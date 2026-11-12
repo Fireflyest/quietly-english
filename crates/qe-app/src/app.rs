@@ -754,7 +754,10 @@ impl App {
             command::ArgKind::Path => path_candidates(partial),
             command::ArgKind::Text => text_candidates(self),
             command::ArgKind::TextOrPath => {
-                let mut out = text_candidates(self);
+                // 书排在前面：导入一本书会带来几十章，逐章列出来既刷屏又难选；
+                // 读者真正想输入的是书名/slug，`/read <slug>` 自己会接着读下一篇。
+                let mut out = self.reading_book_candidates();
+                out.extend(loose_text_candidates(self));
                 out.extend(path_candidates(partial));
                 out
             }
@@ -778,6 +781,35 @@ impl App {
             .map(|book| Candidate {
                 value: book.slug,
                 help: book.name,
+            })
+            .collect();
+        out.sort_by(|a, b| a.value.cmp(&b.value));
+        out
+    }
+
+    /// `/read` 的候选：书（slug + 进度），读者输入 slug 就能接着读下一篇。
+    fn reading_book_candidates(&self) -> Vec<Candidate> {
+        let mut out: Vec<Candidate> = self
+            .store
+            .text_books()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|book| {
+                let progress = self.store.text_book_progress(&book.slug).ok()?;
+                let state = if progress.is_done() {
+                    format!("done · {}/{}", progress.finished, progress.total)
+                } else {
+                    format!(
+                        "{}/{} · next {}",
+                        progress.finished,
+                        progress.total,
+                        progress.next_title.unwrap_or_default()
+                    )
+                };
+                Some(Candidate {
+                    value: book.slug,
+                    help: format!("{} · {state}", book.name),
+                })
             })
             .collect();
         out.sort_by(|a, b| a.value.cmp(&b.value));
@@ -2000,6 +2032,20 @@ fn text_candidates(app: &App) -> Vec<Candidate> {
         .collect()
 }
 
+/// 不属于任何书的散篇。书里的章节不在这里重复列出——它们已经被书代表了。
+fn loose_text_candidates(app: &App) -> Vec<Candidate> {
+    app.store
+        .texts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|text| text.book.is_none())
+        .map(|text| Candidate {
+            value: text.title,
+            help: "text".into(),
+        })
+        .collect()
+}
+
 /// 命中但没显示出来的条数。
 fn hidden_suggestions(input: &str) -> usize {
     command::matches(input)
@@ -2653,6 +2699,94 @@ mod tests {
         );
     }
 
+    /// 写一个最小的 EPUB：container → OPF（spine 2 章 + 1 个扉页）。
+    fn write_epub(path: &std::path::Path) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        let mut put = |name: &str, body: &str| {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        };
+
+        put(
+            "mimetype",
+            "application/epub+zip",
+        );
+        put(
+            "META-INF/container.xml",
+            r#"<?xml version="1.0"?><container><rootfiles>
+               <rootfile full-path="epub/content.opf" media-type="application/oebps-package+xml"/>
+               </rootfiles></container>"#,
+        );
+        put(
+            "epub/content.opf",
+            r#"<?xml version="1.0"?><package><metadata>
+               <dc:title>Farm</dc:title><dc:creator>Someone</dc:creator>
+               </metadata><manifest>
+               <item id="tp" href="text/titlepage.xhtml" media-type="application/xhtml+xml"/>
+               <item id="c1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+               <item id="c2" href="text/ch2.xhtml" media-type="application/xhtml+xml"/>
+               </manifest><spine>
+               <itemref idref="tp"/><itemref idref="c1"/><itemref idref="c2"/>
+               </spine></package>"#,
+        );
+        put(
+            "epub/text/titlepage.xhtml",
+            r#"<html><body epub:type="frontmatter"><p>Farm</p><p>by Someone</p></body></html>"#,
+        );
+        put(
+            "epub/text/ch1.xhtml",
+            r#"<html><body epub:type="bodymatter"><h2>I</h2>
+               <p>All animals are equal, and that is a long enough sentence to keep.</p>
+               <p>But some animals are more equal than others, which is worth remembering.</p>
+               </body></html>"#,
+        );
+        put(
+            "epub/text/ch2.xhtml",
+            r#"<html><body epub:type="bodymatter"><h2>II</h2>
+               <p>Four legs good, two legs bad, and the sheep repeated it for hours.</p>
+               </body></html>"#,
+        );
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn an_epub_imports_one_text_per_chapter_into_one_book() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("farm.epub");
+        write_epub(&path);
+
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+
+        let books = app.store.text_books().unwrap();
+        assert_eq!(books.len(), 1, "one book from one epub: {books:?}");
+        assert_eq!(books[0].name, "Farm");
+        assert_eq!(books[0].slug, "farm");
+
+        let chapters = app.store.texts_in_book("farm").unwrap();
+        assert_eq!(chapters.len(), 2, "the frontmatter page is skipped");
+        assert_eq!(chapters[0].source.as_deref(), Some("Someone"));
+        assert!(chapters[0].body.contains("All animals are equal"));
+
+        // 导入后立刻打开第一章，`/read farm` 也能接上。
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Farm — 1")
+        );
+        app.finish_reading().unwrap();
+        app.execute(Command::Read("farm".into())).unwrap();
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Farm — 1"),
+            "the book slug opens the first unfinished chapter"
+        );
+    }
+
     #[test]
     fn reading_a_book_opens_its_next_unfinished_chapter() {
         let Harness { mut app, _dir } = harness();
@@ -2706,6 +2840,29 @@ mod tests {
             "a loose text stays open instead of jumping elsewhere"
         );
         assert_eq!(app.reading.as_ref().unwrap().paragraph, 1);
+    }
+
+    #[test]
+    fn read_completion_offers_the_book_not_its_chapters() {
+        // 一本书几十章：补全要给出可输入的书名，而不是把每一章列一遍。
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+
+        let candidates = app.arg_candidates("/read", "ani");
+        let values: Vec<String> = candidates.iter().map(|c| c.value.clone()).collect();
+        // 目录条目也会进来（`/read` 接受路径），所以看的是按前缀过滤后的命中。
+        let hits = command::arg_hits(&values, "ani");
+        assert_eq!(hits, vec!["animal-farm"], "the book slug, once");
+        assert!(
+            candidates[0].help.contains("Animal Farm"),
+            "the panel names the book and its progress: {}",
+            candidates[0].help
+        );
+        assert!(
+            !values.iter().any(|value| value.starts_with("Chapter")),
+            "chapters are reached through the book"
+        );
     }
 
     #[test]

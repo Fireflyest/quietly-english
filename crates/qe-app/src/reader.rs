@@ -98,6 +98,32 @@ fn split_bilingual(body: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// 从一个路径导入的阅读材料。
+pub struct ImportedReading {
+    /// 归到哪本书（EPUB 用 `dc:title`，TXT 用 `# book:`）。
+    pub book: Option<String>,
+    /// 拆出来的篇目；TXT 只有一篇，EPUB 一章一篇。
+    pub texts: Vec<Text>,
+}
+
+/// 读一个文件：EPUB 按章拆开，其它按纯文本读成一篇。
+///
+/// 两种格式最终都产出同一种 `Text`，所以导入、归书、进度都不区分来源格式。
+pub fn load_reading(path: &std::path::Path) -> Result<ImportedReading> {
+    if crate::epub::is_epub(path) {
+        let epub = crate::epub::load(path)?;
+        return Ok(ImportedReading {
+            book: Some(epub.title),
+            texts: epub.texts,
+        });
+    }
+    let text = load_text(path)?;
+    Ok(ImportedReading {
+        book: text.book.clone(),
+        texts: vec![text],
+    })
+}
+
 impl App {
     /// 当前段里可作为候选的词（还没标记、库里有词条的那些）。
     pub fn reading_candidates(&self) -> Vec<Candidate> {
@@ -179,18 +205,44 @@ impl App {
         Ok(())
     }
 
-    /// 列出已导入的文本。
+    /// 列出已导入的文本：书按本汇总，散篇逐条列出。
+    ///
+    /// 一本书动辄几十章，逐章列出来会把别的书挤出屏幕；想看某一章可以用
+    /// `/library` 看进度、`/read <slug>` 打开下一篇。
     pub fn list_texts(&mut self) -> Result<()> {
         let texts = self.store.texts()?;
         if texts.is_empty() {
             self.note("no texts yet · /read <file> to import one");
             return Ok(());
         }
+        let books = self.store.text_books()?;
         let last = self.store.setting("last_text")?.unwrap_or_default();
         let mut view = ToolView::new("texts")
             .accent(qe_core::view::Accent::Note)
-            .result(format!("{} imported", texts.len()));
-        for text in texts {
+            .result(format!(
+                "{} books · {} texts",
+                books.len(),
+                texts.len()
+            ));
+        for book in &books {
+            let progress = self.store.text_book_progress(&book.slug)?;
+            let current = progress
+                .next_title
+                .as_deref()
+                .map(|next| next.eq_ignore_ascii_case(&last))
+                .unwrap_or(false);
+            view = view.kv(
+                format!("{}{}", book.slug, if current { " ·" } else { "" }),
+                format!(
+                    "{} · {}/{} · next {}",
+                    book.name,
+                    progress.finished,
+                    progress.total,
+                    progress.next_title.as_deref().unwrap_or("-")
+                ),
+            );
+        }
+        for text in texts.iter().filter(|text| text.book.is_none()) {
             let progress = self
                 .store
                 .reading_progress(text.id)?
@@ -205,7 +257,7 @@ impl App {
             };
             view = view.kv(format!("{}{}", text.title, current), progress);
         }
-        view = view.muted("· = last read · /read <title> resumes");
+        view = view.muted("· = book of the last read · /read <slug> continues it");
         self.push(Message::tool(view));
         Ok(())
     }
@@ -239,18 +291,19 @@ impl App {
             let marker = if progress.is_done() { "done" } else { "next" };
             let next = progress.next_title.clone().unwrap_or_default();
             let current = next.eq_ignore_ascii_case(&last);
+            // key 是可输入的那一半：`/read <slug>` 直接续读，不用去猜书名。
             view = view.kv(
-                format!("{}{}", book.name, if current { " ·" } else { "" }),
+                format!("{}{}", book.slug, if current { " ·" } else { "" }),
                 format!(
-                    "{}/{} · {marker} {next}",
-                    progress.finished, progress.total
+                    "{} · {}/{} · {marker} {next}",
+                    book.name, progress.finished, progress.total
                 ),
             );
         }
         if loose > 0 {
             view = view.muted(format!("{loose} texts without a book · /texts lists them"));
         }
-        view = view.muted("/read <book> continues its next text · /read <file> imports");
+        view = view.muted("/read <slug> continues it · /read <file> imports txt/epub");
         self.push(Message::tool(view));
         Ok(())
     }
@@ -337,30 +390,60 @@ impl App {
                 }
             }
         } else if std::path::Path::new(query).exists() {
-            let text = load_text(std::path::Path::new(query))?;
-            let id = self.store.save_text(&text)?;
+            // TXT 一篇、EPUB 一章一篇，导入后从第一篇开始读。
+            let imported = load_reading(std::path::Path::new(query))?;
+            let mut first: Option<Text> = None;
+            let mut paragraphs = 0usize;
+            let mut count = 0usize;
+            for mut text in imported.texts {
+                paragraphs += text.paragraph_count();
+                let id = self.store.save_text(&text)?;
+                text.id = id;
+                count += 1;
+                first.get_or_insert(text);
+            }
+            let Some(text) = first else {
+                self.note("that file has no paragraphs");
+                return Ok(());
+            };
             self.store.set_setting("last_text", &text.title)?;
-            let mut text = text;
-            text.id = id;
-            let book = text
+            let book = imported
                 .book
                 .as_ref()
                 .map(|book| format!(" · book: {book}"))
                 .unwrap_or_default();
-            self.note(format!(
-                "imported \"{}\" · {} paragraphs{book}",
-                text.title,
-                text.paragraph_count()
-            ));
+            if count > 1 {
+                self.note(format!(
+                    "imported {count} chapters · {paragraphs} paragraphs{book} · /library"
+                ));
+            } else {
+                self.note(format!(
+                    "imported \"{}\" · {paragraphs} paragraphs{book}",
+                    text.title
+                ));
+            }
             text
         } else if let Some(text) = self.store.text_by_title(query)? {
             text
         } else if let Some(text) = self.book_next_text(query)? {
             text
         } else {
-            self.note(format!(
-                "no text or book \"{query}\" · /read <file> imports a file · /library lists books"
-            ));
+            let books: Vec<String> = self
+                .store
+                .text_books()?
+                .into_iter()
+                .map(|book| book.slug)
+                .collect();
+            self.note(if books.is_empty() {
+                format!(
+                    "no text or book \"{query}\" · /read <file> imports a file (txt or epub)"
+                )
+            } else {
+                format!(
+                    "no text or book \"{query}\" · books: {} · /read <file> imports",
+                    books.join(", ")
+                )
+            });
             return Ok(());
         };
 

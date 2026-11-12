@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod command;
 mod editor;
+mod epub;
 mod reader;
 mod session;
 
@@ -313,37 +314,69 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("read") => {
-            // `quietly read <file> [--book <name>]` 导入文本；不给文件就列出已导入的。
+            // `quietly read <file> [--book <name>]` 导入文本或 EPUB；不给文件就列出已导入的。
             let file = rest.iter().find(|arg| !arg.starts_with('-'));
             match file {
                 Some(path) => {
-                    let mut text = reader::load_text(std::path::Path::new(path))?;
-                    // `--book` 优先于文件头：批量导入同一本书时不必改每个文件头。
-                    if let Some(book) = flag_value(&rest, "--book") {
-                        text.book = Some(book);
+                    let book_override = flag_value(&rest, "--book");
+                    let mut imported =
+                        reader::load_reading(std::path::Path::new(path))?;
+                    if let Some(book) = book_override {
+                        // `--book` 优先于文件头：批量导入同一本书时不必改每个文件头。
+                        imported.book = Some(book.clone());
+                        for text in &mut imported.texts {
+                            text.book = Some(book.clone());
+                        }
                     }
-                    let paragraphs = text.paragraph_count();
-                    let has_translation = !text.translation.trim().is_empty();
-                    let id = store.save_text(&text)?;
-                    store.set_setting("last_text", &text.title)?;
-                    println!(
-                        "imported \"{}\" · {paragraphs} paragraphs{}",
-                        text.title,
-                        if has_translation { " · bilingual" } else { "" }
-                    );
-                    if let Some(book) = &text.book {
+
+                    let mut first_title = String::new();
+                    let mut paragraphs = 0usize;
+                    let mut bilingual = false;
+                    let mut source = None;
+                    let mut license = None;
+                    for text in &imported.texts {
+                        store.save_text(text)?;
+                        if first_title.is_empty() {
+                            first_title = text.title.clone();
+                            paragraphs = text.paragraph_count();
+                            bilingual = !text.translation.trim().is_empty();
+                            source = text.source.clone();
+                            license = text.license.clone();
+                        }
+                    }
+
+                    let count = imported.texts.len();
+                    if count == 1 {
                         println!(
-                            "book: {book} ({})",
-                            qe_core::reading::book_slug(book)
+                            "imported \"{}\" · {paragraphs} paragraphs{}",
+                            first_title,
+                            if bilingual { " · bilingual" } else { "" }
+                        );
+                    } else {
+                        // EPUB：列出书名而不是第一章的标题，避免误导。
+                        let book_name = imported
+                            .book
+                            .clone()
+                            .unwrap_or_else(|| first_title.clone());
+                        println!(
+                            "imported {count} chapters from \"{book_name}\" · {paragraphs} paragraphs in the first chapter"
                         );
                     }
-                    if let Some(source) = &text.source {
+                    if let Some(book) = &imported.book {
+                        println!("book: {book} ({})", qe_core::reading::book_slug(book));
+                    }
+                    if let Some(source) = &source {
                         println!("source: {source}");
                     }
-                    if let Some(license) = &text.license {
+                    if let Some(license) = &license {
                         println!("license: {license}");
                     }
-                    println!("id: {id} · open it with /read {}", text.title);
+                    let open = imported
+                        .book
+                        .as_ref()
+                        .map(|book| qe_core::reading::book_slug(book))
+                        .unwrap_or_else(|| first_title.clone());
+                    println!("open it with /read {open}");
                     Ok(())
                 }
                 None => {
@@ -370,7 +403,11 @@ fn run() -> Result<()> {
                         if !books.is_empty() {
                             println!();
                         }
-                        println!("{} texts without a book:", loose.len());
+                        println!(
+                            "{} text{} without a book:",
+                            loose.len(),
+                            if loose.len() == 1 { "" } else { "s" }
+                        );
                         for text in loose {
                             let progress = store
                                 .reading_progress(text.id)?

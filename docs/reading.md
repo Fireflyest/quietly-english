@@ -6,8 +6,9 @@
 ## 快速开始
 
 ```bash
-quietly read article.txt              # 导入一篇（可双语）
-quietly read ch1.txt --book "Animal Farm"   # 归入一本书
+quietly read book.epub                # 直接导入 EPUB，一章一篇，自动归成一本
+quietly read article.txt              # 导入纯文本（可双语）
+quietly read ch1.txt --book "Animal Farm"   # 归入指定的书
 quietly read                          # 列出阅读书与散篇进度
 quietly library                       # 只看书与进度
 quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
@@ -16,7 +17,8 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 进入 TUI：
 
 ```
-/read article.txt        导入并开始阅读
+/read book.epub          导入 EPUB 并开始读第一章
+/read article.txt        导入纯文本并开始阅读
 /read                    续读上次那篇
 /read Why I Write        按标题打开
 /read animal-farm        接着读这本书里下一篇没读完的
@@ -30,6 +32,7 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 
 | 来源 | 归到哪本书 |
 |---|---|
+| EPUB 文件 | 用 `dc:title` 当书名，spine 里每一章自动成为一篇 |
 | 文件头 `# book: Animal Farm` | `animal-farm` |
 | `quietly read x.txt --book "Animal Farm"` | 同上，批量导入时不用改文件头 |
 | 只有文件头 `# source: Project Gutenberg` | 用来源作书名（`project-gutenberg`） |
@@ -43,17 +46,17 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 读完最后一篇              → "book finished · 3/3"
 ```
 
-`/library` 的显示：
+`/library` 的显示（左边是可直接输入的书名 slug）：
 
 ```
-⏺ library  2 books · 9 texts · 1 on their own
-⎿ Animal Farm                  1/2 · next Chapter Two
-  Why I Write ·                2/2 · done Why I Write
-  1 texts without a book · /texts lists them
-  /read <book> continues its next text · /read <file> imports
+⏺ library  2 books · 31 texts
+⎿ barlasch-of-the-guard   Barlasch of the Guard · 0/30 · next Barlasch of the Guard — 1
+  george-orwell-why-i-write-1946   George Orwell, "Why I Write", 1946 · 1/1 · done
+  /read <slug> continues it · /read <file> imports txt/epub
 ```
 
-`·` 标在「上次读的那篇所在的书」上。命令行对应 `quietly library`。
+`/read` 的补全只列**书**，不会把三十章标题摊满屏幕；输入 `/read bar` 按 tab 就是
+`barlasch-of-the-guard`，回车从下一篇没读完的开始。`/texts` 同样按书汇总，散篇才逐条列出。
 
 一篇文章只能属于一本书，但它可以读完后随时重读（`/read <title>` 不会清进度）。
 
@@ -187,6 +190,18 @@ badge 也显示段号，所以定位结果看得见。译文同样受 `tab` 控�
 
 ## 文本格式
 
+**EPUB**：直接导入，不需要转换。
+
+```powershell
+quietly read "Pride and Prejudice.epub"
+# imported 61 chapters from "Pride and Prejudice" · 35 paragraphs in the first chapter
+# book: Pride and Prejudice (pride-and-prejudice)
+# open it with /read pride-and-prejudice
+```
+
+只认 spine 顺序与 `epub:type="bodymatter"` 的正文，扉页/版权页/colophon 跳过；
+斜体、脚注编号这类内联标记会被剥掉，段落边界保留。图片不导入。
+
 **单语**：空行分段。
 
 ```
@@ -253,8 +268,8 @@ TSV 五列，`#` 开头是注释：
 | 来源 | 授权 | 有中文对照 | 适合当什么 |
 | --- | --- | --- | --- |
 | 自己写的笔记 / 已购电子书 | 你自己的 | 视情况 | 任意 |
-| [Project Gutenberg](https://www.gutenberg.org/) | 公有领域 | ❌ 纯英文 | 长篇原著；**一章一个文件**，`# book:` 用书名 |
-| [Standard Ebooks](https://standardebooks.org/) | 公有领域（重排版） | ❌ | 同上，排版干净、分章清楚 |
+| [Project Gutenberg](https://www.gutenberg.org/) | 公有领域 | ❌ 纯英文 | 长篇原著；下载 `.txt` 即可，一章一个文件时写 `# book:` |
+| [Standard Ebooks](https://standardebooks.org/) | 公有领域（重排版） | ❌ | **下载 Compatible epub**，`quietly read book.epub` 直接按章导入 |
 | [Wikisource 多语言版](https://zh.wikisource.org/) | CC BY-SA / 公有领域 | ✅ 部分作品有旧译 | 中英对照长篇：原文取 Gutenberg，旧译取这里 |
 | [Tatoeba 句对](https://tatoeba.org/en/downloads) | CC-BY 2.0 FR | ✅ 句子级 | 短句精读素材，不是成篇 |
 | [TED 演讲字幕](https://www.ted.com/participate/translate) | CC BY-NC-ND | ✅ 逐句对照 | 演讲/口语，一个演讲一篇 |
@@ -265,10 +280,14 @@ TSV 五列，`#` 开头是注释：
 
 **推荐路径**：
 
-1. 用 Gutenberg / Standard Ebooks 拿原文，**一章一个 `.txt`**，统一写 `# book: 书名`；
-2. 需要译文时找公有领域旧译（民国时期译本多已进入公有领域，但各家出版社的
-   **新译**有版权，注意区分），按 `---` 分段粘进同一个文件；
-3. `quietly read ch01.txt --book "书名"` 批量导入，`/library` 看进度，`/read <slug>` 按书推进。
+1. **Standard Ebooks**：每本书页面 Downloads → **Compatible epub**（azw3/kepub 是给 Kindle/Kobo 的，
+   advanced epub 结构更花哨但对抽文本没好处）→ `quietly read book.epub`。spine 里的每一章
+   自动成为一篇，`dc:title` 当书名，`dc:creator` 当来源，扉页/版权页/colophon 按
+   `epub:type` 跳过。
+2. **Gutenberg**：只提供 `.txt` / `.html`，一章一个文件导入并写 `# book: 书名`。
+3. 需要译文时找公有领域旧译（民国时期译本多已进入公有领域，但各家出版社的
+   **新译**有版权，注意区分），按 `---` 分段粘进同一个文件。
+4. `quietly library` 看进度，`/read <slug>` 按书推进。
 
 `packs/texts/` 里已经放了一篇带 `# source:` 的示例（`orwell.txt`），可以照它的头部格式写。
 
