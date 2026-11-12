@@ -358,6 +358,22 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Some("drop") | Some("delete-text") => {
+            // `quietly drop <text>`：删掉一篇及其进度、标记、题目。
+            let title = rest
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .context("用法：quietly drop <text>")?;
+            let text = store
+                .text_by_title(title)?
+                .with_context(|| format!("没有这篇文本：{title}"))?;
+            store.delete_text(text.id)?;
+            if store.setting("last_text")?.as_deref() == Some(text.title.as_str()) {
+                store.set_setting("last_text", "")?;
+            }
+            println!("deleted \"{}\" · {} paragraphs", text.title, text.paragraph_count());
+            Ok(())
+        }
         Some("quiz") => {
             // `quietly quiz <text-title> <file.tsv>` 往某篇里导入题目。
             let mut args = rest.iter().filter(|arg| !arg.starts_with('-'));
@@ -477,6 +493,7 @@ USAGE:
     quietly phrase <词> <搭配> = <释义>   单条补录词组
     quietly word <lemma>          查看词条（含义项、搭配、词根、例句）
     quietly read [file]           导入一篇文本，或不带参数列出已导入的
+    quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
     quietly doctor [--fix]        核对词书/卡片引用的词条是否还在词典里
@@ -498,7 +515,7 @@ TUI 命令：
 
 阅读：
     /read [file|title]  开始阅读   /texts  已导入的文本
-    /mode [full|intensive]        切换全篇 / 精读
+    /drop <title>       删除文本   /mode [full|intensive]  切换模式
     /mark <word> · /mark all      标记 / 取消标记生词
     /take <n>                     收第 n 个词进词书
     /next · /prev · /goto <n>     翻页

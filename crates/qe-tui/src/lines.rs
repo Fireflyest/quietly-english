@@ -1296,7 +1296,7 @@ mod tests {
             },
         ];
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &candidates)),
+            &Message::tool(ToolView::reading_card(&session, &candidates, true)),
             80,
         ));
         let joined = text.join("\n");
@@ -1308,16 +1308,46 @@ mod tests {
     }
 
     #[test]
+    fn hiding_the_translation_leaves_a_hint_instead() {
+        let session = reading_session(qe_core::reading::ReadMode::Intensive);
+        let text = flat(&message_lines(
+            &Message::tool(ToolView::reading_card(&session, &[], false)),
+            80,
+        ));
+        let joined = text.join("\n");
+        assert!(!joined.contains("从很小的时候"), "translation is hidden");
+        assert!(joined.contains("translation hidden"), "{joined}");
+    }
+
+    #[test]
     fn full_mode_renders_every_paragraph_without_a_word_list() {
         let session = reading_session(qe_core::reading::ReadMode::Full);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[])),
+            &Message::tool(ToolView::reading_card(&session, &[], false)),
             80,
         ));
         let joined = text.join("\n");
         assert!(joined.contains("From a very early age"), "{joined}");
         assert!(joined.contains("lonely child's habit"), "second paragraph");
-        assert!(!joined.contains("translation"), "full mode is原文 only");
+        assert!(
+            !joined.contains("translation"),
+            "full mode hides the translation until tab"
+        );
         assert!(!joined.contains("words ·"), "no pick list in full mode");
+        assert!(
+            joined.contains("▸ 1/2"),
+            "the current paragraph is marked: {joined}"
+        );
+    }
+
+    #[test]
+    fn full_mode_shows_translations_under_each_paragraph() {
+        let session = reading_session(qe_core::reading::ReadMode::Full);
+        let text = flat(&message_lines(
+            &Message::tool(ToolView::reading_card(&session, &[], true)),
+            80,
+        ));
+        let joined = text.join("\n");
+        assert!(joined.contains("从很小的时候"), "translation per paragraph: {joined}");
     }
 }

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use qe_core::model::{Quiz, ReadingLog, Word};
 use qe_core::reading::{ReadMode, ReadingSession, Text};
-use qe_core::view::{Candidate, Message, ToolView};
+use qe_core::view::{Accent, Candidate, Message, ToolView};
 
 use crate::app::App;
 
@@ -121,7 +121,7 @@ impl App {
             return Ok(());
         };
         let candidates = self.reading_candidates();
-        let view = ToolView::reading_card(session, &candidates);
+        let view = ToolView::reading_card(session, &candidates, self.show_translation);
         let message = Message::tool(view);
         match session.message {
             Some(index) if index < self.messages.len() => self.messages[index] = message,
@@ -184,7 +184,10 @@ impl App {
         self.render_reading()
     }
 
-    /// 把选中的候选词全部标为已标记（批量）。
+    /// 把当前段的**全部**候选词标为已标记（批量）。
+    ///
+    /// 这里不能复用 `reading_candidates()`：那个列表被 `MAX_CANDIDATES` 截断到
+    /// 9 条（对应数字键），`/mark all` 用到它就会漏掉长段落后面的词。
     pub fn mark_all_candidates(&mut self) -> Result<()> {
         let Some(session) = self.reading.as_ref() else {
             self.note("not reading · /read to start");
@@ -192,20 +195,35 @@ impl App {
         };
         let text_id = session.text.id;
         let paragraph = session.paragraph;
-        let candidates = self.reading_candidates();
+        let lemmas: Vec<String> = session
+            .current_tokens()
+            .into_iter()
+            .filter(|token| token.is_word())
+            .map(|token| token.lower)
+            .collect();
         let mut count = 0u32;
-        for candidate in candidates {
-            if candidate.marked {
+        for lemma in lemmas {
+            let already = self
+                .reading
+                .as_ref()
+                .map(|session| session.is_marked(&lemma))
+                .unwrap_or(false);
+            if already {
                 continue;
             }
-            self.store.add_reading_mark(text_id, &candidate.lemma, paragraph)?;
+            self.store.add_reading_mark(text_id, &lemma, paragraph)?;
+            let word = self.store.word(&lemma).ok().flatten();
             if let Some(session) = self.reading.as_mut() {
-                let word = self.store.word(&candidate.lemma).ok().flatten();
-                session.mark(&candidate.lemma, word);
+                session.mark(&lemma, word);
             }
             count += 1;
         }
-        self.note(format!("marked {count} words"));
+        let marked = self
+            .reading
+            .as_ref()
+            .map(|session| session.marked.len())
+            .unwrap_or(0);
+        self.note(format!("marked {count} words · {marked} in this text"));
         self.render_reading()
     }
 
@@ -214,7 +232,11 @@ impl App {
         let query = query.trim();
         let text = if query.is_empty() {
             // 不给参数：续读上次那篇。
-            let Some(previous) = self.store.setting("last_text")? else {
+            let previous = self
+                .store
+                .setting("last_text")?
+                .filter(|title| !title.trim().is_empty());
+            let Some(previous) = previous else {
                 self.note("no text to resume · /read <file> to import one");
                 return Ok(());
             };
@@ -488,6 +510,51 @@ impl App {
         Ok(())
     }
 
+    /// 删除一篇已导入的文本，连同进度、标记与题目。
+    ///
+    /// 删除前要求标题精确匹配（不区分大小写）：`/drop` 是不可撤销的，
+    /// 用「包含」匹配很容易误删同名开头的另一篇。
+    pub fn drop_text(&mut self, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            self.note("usage: /drop <title> · /texts lists them");
+            return Ok(());
+        }
+        let Some(text) = self
+            .store
+            .texts()?
+            .into_iter()
+            .find(|text| text.title.eq_ignore_ascii_case(title))
+        else {
+            self.note(format!("no text \"{title}\" · /texts lists them"));
+            return Ok(());
+        };
+
+        // 正在读这一篇时先收尾，否则会话还指着已经不存在的行。
+        let reading_this = self
+            .reading
+            .as_ref()
+            .map(|session| session.text.id == text.id)
+            .unwrap_or(false);
+        if reading_this {
+            self.finish_reading()?;
+        }
+        if self.store.setting("last_text")?.as_deref() == Some(text.title.as_str()) {
+            // 记住的「上次读的」跟着消失的话，`/read` 无参会一直报错。
+            let _ = self.store.set_setting("last_text", "");
+        }
+
+        self.store.delete_text(text.id)?;
+        self.push(Message::tool(
+            ToolView::new("drop")
+                .accent(Accent::Warn)
+                .result(text.title.clone())
+                .muted("text, progress, marks and quizzes deleted"),
+        ));
+        self.refresh_status();
+        Ok(())
+    }
+
     /// 开始这篇的测验。
     pub fn start_quiz(&mut self) -> Result<()> {
         let Some(session) = self.reading.as_ref() else {
@@ -506,6 +573,9 @@ impl App {
         self.quizzes = quizzes;
         self.quiz_index = 0;
         self.quiz_answered = None;
+        self.quiz_revealed = false;
+        // 每轮从零分起算，否则第二轮会出现 `5/4 correct`。
+        self.quiz_correct = 0;
         self.render_quiz()?;
         Ok(())
     }
@@ -516,10 +586,11 @@ impl App {
             self.note("no active quiz · /quiz to start");
             return Ok(());
         };
-        if self.quiz_answered.is_some() {
+        if self.quiz_answered.is_some() || self.quiz_revealed {
             // 已答过：再按一次就翻到下一题。
             self.quiz_index += 1;
             self.quiz_answered = None;
+            self.quiz_revealed = false;
             if self.quiz_index >= self.quizzes.len() {
                 let correct = self.quiz_correct;
                 let total = self.quizzes.len();
@@ -530,15 +601,18 @@ impl App {
             return self.render_quiz();
         }
 
-        let correct = match choice {
-            Some(index) => quiz
-                .choices
-                .get(index.saturating_sub(1))
-                .map(|picked| picked.trim().eq_ignore_ascii_case(quiz.answer.trim()))
-                .unwrap_or(false),
-            // 填空题没有输入框，先只给答案；填空交互下一步再做。
-            None => false,
+        let Some(index) = choice.filter(|_| quiz.is_choice()) else {
+            // 填空题没有输入框：只揭示答案，不判对错。写成 `false` 会把
+            // `quiz_attempts` 污染成一片错误，统计里的正确率也就失去意义。
+            self.quiz_revealed = true;
+            return self.render_quiz();
         };
+
+        let correct = quiz
+            .choices
+            .get(index.saturating_sub(1))
+            .map(|picked| picked.trim().eq_ignore_ascii_case(quiz.answer.trim()))
+            .unwrap_or(false);
         self.store.record_attempt(quiz.id, correct)?;
         if correct {
             self.quiz_correct += 1;
@@ -556,6 +630,7 @@ impl App {
             self.quiz_index,
             self.quizzes.len(),
             self.quiz_answered,
+            self.quiz_revealed,
         );
         self.push(Message::tool(view));
         Ok(())

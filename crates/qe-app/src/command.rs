@@ -39,6 +39,8 @@ pub enum Command {
     Goto(String),
     /// `/take <n>`：把当前段第 n 个候选词收进词书。
     Take(String),
+    /// `/drop <title>`：删除一篇已导入的文本及其进度、标记、题目。
+    Drop(String),
     /// `/db`：两个数据库文件的位置与体积。
     Db,
     Bury,
@@ -164,6 +166,12 @@ pub const SPECS: &[Spec] = &[
         alias: "library",
         args: "",
         help: "list imported texts",
+    },
+    Spec {
+        name: "/drop",
+        alias: "delete|forget",
+        args: " <title>",
+        help: "delete a text with its progress, marks and quizzes",
     },
     Spec {
         name: "/mode",
@@ -297,6 +305,7 @@ impl Command {
             "quiz" | "test" => Command::Quiz(arg),
             "goto" | "g" => Command::Goto(arg),
             "take" | "keep" => Command::Take(arg),
+            "drop" | "delete" | "forget" => Command::Drop(arg),
             "db" | "files" | "where" => Command::Db,
             "bury" | "later" => Command::Bury,
             "undo" | "back" => Command::Undo,
@@ -402,6 +411,8 @@ pub enum ArgKind {
     Deck,
     /// 相对当前目录的文件或目录（`/import`）。
     Path,
+    /// 已导入文本的标题（`/drop`）。
+    Text,
     /// 文本标题或文件路径（`/read`、`/quiz`）。
     TextOrPath,
     /// 固定取值（`/mode`）。
@@ -418,6 +429,7 @@ pub const ARG_KINDS: &[(&str, ArgKind)] = &[
     ("/import", ArgKind::Path),
     ("/read", ArgKind::TextOrPath),
     ("/quiz", ArgKind::TextOrPath),
+    ("/drop", ArgKind::Text),
     ("/mode", ArgKind::Choice(&["full", "intensive"])),
     ("/study", ArgKind::Number),
     ("/limit", ArgKind::Number),

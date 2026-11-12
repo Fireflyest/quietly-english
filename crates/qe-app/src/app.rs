@@ -87,10 +87,12 @@ pub struct App {
     /// 待作答的测验题。
     pub(crate) quizzes: Vec<qe_core::model::Quiz>,
     pub(crate) quiz_index: usize,
-    /// `Some(答对与否)`：已作答，再按一次翻下一题。
+    /// `Some(答对与否)`：选择题已判定，再按一次翻下一题。
     pub(crate) quiz_answered: Option<bool>,
+    /// 填空题已揭示答案（不判对错，也不写库），再按一次翻下一题。
+    pub(crate) quiz_revealed: bool,
     pub(crate) quiz_correct: u32,
-    /// 精读时是否显示译文（`/translate` 切换）。
+    /// 阅读时是否显示译文（`/translate` 与 `tab` 切换，两种模式都生效）。
     pub(crate) show_translation: bool,
 }
 
@@ -133,8 +135,10 @@ impl App {
             quizzes: Vec::new(),
             quiz_index: 0,
             quiz_answered: None,
+            quiz_revealed: false,
             quiz_correct: 0,
-            show_translation: true,
+            // 译文默认隐藏：先读原文，需要对照时再按 tab。
+            show_translation: false,
         };
         app.load_history();
         app.greet()?;
@@ -345,6 +349,8 @@ impl App {
                 }
                 KeyCode::Esc => {
                     self.quizzes.clear();
+                    self.quiz_answered = None;
+                    self.quiz_revealed = false;
                     self.note("quiz closed");
                     return Ok(());
                 }
@@ -653,6 +659,7 @@ impl App {
         match command::arg_kind(command) {
             command::ArgKind::Deck => self.deck_candidates(),
             command::ArgKind::Path => path_candidates(partial),
+            command::ArgKind::Text => text_candidates(self),
             command::ArgKind::TextOrPath => {
                 let mut out = text_candidates(self);
                 out.extend(path_candidates(partial));
@@ -846,6 +853,7 @@ impl App {
                     Ok(())
                 }
             },
+            Command::Drop(title) => self.drop_text(&title),
             Command::Bury => self.bury_current(),
             Command::Undo => self.undo_last(),
             Command::Skip => {
@@ -2068,6 +2076,146 @@ mod tests {
         app.toggle_glosses();
         assert!(!expanded(&app, study_card));
         assert!(expanded(&app, lookup_card));
+    }
+
+    #[test]
+    fn translate_toggle_actually_changes_the_reading_card() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("bilingual.txt");
+        std::fs::write(
+            &path,
+            "From an early age I knew I should be a writer.\n\n---\n\n从很小的时候，我就知道我要当作家。\n",
+        )
+        .unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.execute(Command::Mode("intensive".into())).unwrap();
+
+        let card = |app: &App| {
+            app.messages
+                .iter()
+                .rev()
+                .find_map(|message| match &message.body {
+                    Body::Tool(view) if view.name == "read" => Some(view.clone()),
+                    _ => None,
+                })
+                .expect("reading card")
+        };
+        let has_translation = |view: &ToolView| {
+            view.lines.iter().any(|line| {
+                matches!(line, qe_core::view::ToolLine::Muted(text) if text.contains("从很小的时候"))
+            })
+        };
+
+        assert!(!has_translation(&card(&app)), "hidden by default");
+        app.execute(Command::Translate).unwrap();
+        assert!(has_translation(&card(&app)), "/translate must show it");
+        app.execute(Command::Translate).unwrap();
+        assert!(!has_translation(&card(&app)), "/translate hides it again");
+    }
+
+    #[test]
+    fn mark_all_covers_every_word_not_just_the_nine_picks() {
+        let Harness { mut app, _dir } = harness();
+        let words = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima",
+        ];
+        let path = _dir.path().join("long.txt");
+        std::fs::write(&path, format!("{}\n", words.join(" "))).unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+
+        // 候选列表被数字键限制在 9 条，但 `/mark all` 不能跟着截断。
+        assert_eq!(app.reading_candidates().len(), 9);
+        app.execute(Command::Mark("all".into())).unwrap();
+        let marked = app.reading.as_ref().unwrap().marked.len();
+        assert!(marked >= words.len(), "all {words:?} words marked, got {marked}");
+    }
+
+    fn reading_with_quiz(app: &mut App, dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("article.txt");
+        std::fs::write(&path, "First paragraph here.\n\nSecond paragraph here.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        let text = app.store.text_by_title("article").unwrap().unwrap();
+
+        let mut choice = qe_core::model::Quiz::new("Pick one", "yes")
+            .at_paragraph(0)
+            .with_source("fixture");
+        choice.choices = vec!["yes".into(), "no".into()];
+        choice.text_id = text.id;
+        app.store.add_quiz(&choice).unwrap();
+
+        let mut blank = qe_core::model::Quiz::new("Fill this", "written")
+            .at_paragraph(0)
+            .with_source("fixture");
+        blank.text_id = text.id;
+        app.store.add_quiz(&blank).unwrap();
+        text.title
+    }
+
+    #[test]
+    fn a_fill_in_question_is_revealed_without_recording_a_wrong_answer() {
+        let Harness { mut app, _dir } = harness();
+        reading_with_quiz(&mut app, &_dir);
+        app.start_quiz().unwrap();
+        // 先答选择题，再翻到填空题。
+        app.answer_quiz(Some(1)).unwrap();
+        app.answer_quiz(None).unwrap(); // 翻到下一题（填空题）
+        assert_eq!(app.quiz_answered, None);
+        assert!(!app.quiz_revealed, "not revealed until asked");
+
+        app.answer_quiz(None).unwrap(); // 揭示答案
+        assert_eq!(app.quiz_answered, None);
+        assert!(app.quiz_revealed, "fill-in reveals its answer");
+
+        // 只有选择题写了流水；填空题不该留下一条「错误」记录。
+        let stats = app.store.daily_reading(qe_core::time::today()).unwrap();
+        assert_eq!(stats.quizzes, 1, "exactly one attempt was recorded");
+        assert_eq!(stats.correct, 1);
+
+        app.answer_quiz(None).unwrap();
+        assert!(app.quizzes.is_empty(), "the round ends after the last question");
+    }
+
+    #[test]
+    fn a_second_quiz_round_starts_the_score_over() {
+        let Harness { mut app, _dir } = harness();
+        reading_with_quiz(&mut app, &_dir);
+
+        app.start_quiz().unwrap();
+        app.answer_quiz(Some(1)).unwrap();
+        app.answer_quiz(None).unwrap(); // 翻到下一题
+        app.answer_quiz(None).unwrap(); // 揭示答案
+        app.answer_quiz(None).unwrap(); // 结束
+        assert!(app.quizzes.is_empty());
+        assert_eq!(app.quiz_correct, 1);
+
+        app.start_quiz().unwrap();
+        assert_eq!(app.quiz_correct, 0, "a new round must not inherit the score");
+    }
+
+    #[test]
+    fn drop_deletes_a_text_with_its_progress_and_marks() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("doomed.txt");
+        std::fs::write(&path, "Only paragraph here.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        let id = app.store.texts().unwrap()[0].id;
+        app.store.add_reading_mark(id, "paragraph", 0).unwrap();
+
+        app.execute(Command::Drop("doomed".into())).unwrap();
+        assert!(app.store.texts().unwrap().is_empty());
+        assert!(app.reading.is_none(), "the reading session is closed");
+        assert!(
+            app.store.setting("last_text").unwrap().unwrap_or_default().is_empty(),
+            "stale last_text would break a bare /read"
+        );
+
+        // 不存在的标题只提示，不报错。
+        app.execute(Command::Drop("nope".into())).unwrap();
     }
 
     #[test]

@@ -40,20 +40,26 @@ quietly quiz "Why I Write" q.tsv  # 给某篇导入题目
   conversations with imaginary persons.
 ```
 
-**精读**（`intensive`）：
+**精读**（`intensive`，译文默认隐藏）：
 
 ```
 ⏺ read  intensive · 1/2
 ⎿ Why I Write
   From a very early age I knew I should be a writer.
 
-  translation
-    从很小的时候，我就知道我要当作家。
+  translation hidden · tab to show
 
-  words · 2 marked · m <word> to mark any
+  words · 2 marked · /mark <word> to mark any
     1 writer  n. 作家 ●
     2 lonely  a. 孤独的
     3 habit   n. 习惯 ●
+```
+
+按 `tab` 后同一张卡片变成：
+
+```
+  translation
+    从很小的时候，我就知道我要当作家。
 ```
 
 `●` 表示已标记。标记的词在原文里用强调色显示。
@@ -65,22 +71,29 @@ quietly quiz "Why I Write" q.tsv  # 给某篇导入题目
 | `space` / `enter` / `→` | 下一段 |
 | `←` | 上一段 |
 | `1`-`9` | 打开当前段第 n 个词的完整卡片 |
-| `tab` | 显示 / 隐藏译文 |
+| `tab` | 显示 / 隐藏译文（**默认隐藏**，先读原文） |
 | `esc` | 结束阅读（写进度与统计） |
 
 字母键不拦截，所以想输入单词查词、或者敲 `/命令` 都不会被吞掉。
+
+**全篇模式**也支持 `next` / `prev` / `goto`：当前段前面会出现一行暗色 `▸ 12/50`，
+badge 也显示段号，所以定位结果看得见。译文同样受 `tab` 控制，显示时跟在各自段落后面。
 
 ## 命令
 
 | 命令 | 说明 |
 | --- | --- |
+| `/read <title|file>` | 打开一篇；不给参数续读上次那篇 |
+| `/texts` | 列出已导入的文本与进度 |
+| `/drop <title>` | 删除一篇及其进度、标记、题目（不可撤销，需精确标题） |
+| `/mode` | 在全篇 / 精读之间切换 |
+| `/translate` | 显示 / 隐藏译文（`tab` 同效，默认隐藏，两种模式都生效） |
 | `/mark <word>` | 标记 / 取消标记一个词 |
 | `/mark` | 标记当前段第一个未标记的词 |
-| `/mark all` | 把当前段候选词全部标记 |
+| `/mark all` | 标记当前段**全部**词（不受数字键 9 个上限影响） |
 | `/take <n>` | 把第 n 个词收进当前词书 |
 | `/goto <n>` | 跳到第 n 段 |
 | `/next` · `/prev` | 翻页 |
-| `/translate` | 显示 / 隐藏译文 |
 | `/words` | 列出当前段所有不重复的词 |
 | `/quiz [file]` | 做题；给文件则先导入题目 |
 
@@ -131,10 +144,11 @@ TSV 五列，`#` 开头是注释：
 ```
 
 - 段落号从 1 开始
-- 选项用 `|` 分隔；**少于两个选项就是填空题**（当前只显示答案，不做输入判定）
+- 选项用 `|` 分隔；**少于两个选项就是填空题**：按 `enter` 揭示答案，不判对错，也不写 `quiz_attempts`
 - **出处列必填**：没有出处的题目会被跳过。凭空生成的题目无法核对对错，宁可不收。
 
-作答时按 `1`-`3` 选选项，`enter` 提交并翻下一题，`esc` 退出。
+作答时按 `1`-`9` 选选项，`enter` 提交并翻下一题，`esc` 退出。每轮从零分起算，
+重复做同一篇不会累加。
 
 ## 数据从哪来
 

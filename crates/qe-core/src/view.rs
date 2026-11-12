@@ -203,14 +203,16 @@ impl ToolView {
 
     /// 阅读卡片：原文（已标记的词高亮）+ 可选译文 + 可选的候选词列表。
     ///
-    /// 全篇模式一次给出全部段落；精读模式只给当前段，并带上译文与候选项。
+    /// 全篇模式一次给出全部段落，译文跟随各自段落；精读模式只给当前段。
+    /// `show_translation` 由 `/translate` 与 `tab` 控制，两种模式都认。
     pub fn reading_card(
         session: &crate::reading::ReadingSession,
         candidates: &[Candidate],
+        show_translation: bool,
     ) -> Self {
         let text = &session.text;
         let mut badge = format!("{} · {}", session.mode.label(), session.progress());
-        if session.mode == crate::reading::ReadMode::Intensive {
+        if session.total() > 1 {
             badge = format!(
                 "{} · {}/{}",
                 session.mode.label(),
@@ -233,9 +235,25 @@ impl ToolView {
                     if index > 0 {
                         view = view.spacer();
                     }
+                    // 全篇模式没有「当前段」的独立画面，用一行暗色标记指出
+                    // `next` / `goto` 把位置移到哪了，否则这两个键看不出效果。
+                    if index == session.paragraph && text.paragraph_count() > 1 {
+                        view = view.muted(format!(
+                            "▸ {}/{}",
+                            session.paragraph + 1,
+                            text.paragraph_count()
+                        ));
+                    }
                     view = view.line(ToolLine::Marked {
                         segments: crate::reading::highlight_segments(paragraph, is_marked),
                     });
+                    if show_translation {
+                        if let Some(translation) = text.translation_at(index) {
+                            for line in translation.lines() {
+                                view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                            }
+                        }
+                    }
                 }
             }
             crate::reading::ReadMode::Intensive => {
@@ -245,15 +263,19 @@ impl ToolView {
                     });
                 }
                 if let Some(translation) = session.current_translation() {
-                    view = view.spacer().muted("translation".to_string());
-                    for line in translation.lines() {
-                        // 缩进与原文对齐，读起来像同一段的两种语言。
-                        view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                    if show_translation {
+                        view = view.spacer().muted("translation".to_string());
+                        for line in translation.lines() {
+                            // 缩进与原文对齐，读起来像同一段的两种语言。
+                            view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                        }
+                    } else {
+                        view = view.spacer().muted("translation hidden · tab to show".to_string());
                     }
                 }
                 if !candidates.is_empty() {
                     view = view.spacer().muted(format!(
-                        "words · {} marked · m <word> to mark any",
+                        "words · {} marked · /mark <word> to mark any",
                         session.marked.len()
                     ));
                     for (index, candidate) in candidates.iter().enumerate() {
@@ -325,7 +347,16 @@ impl ToolView {
     }
 
     /// 一道测验题。选择题把选项列出来，填空题只给题干。
-    pub fn quiz_card(quiz: &Quiz, index: usize, total: usize, answered: Option<bool>) -> Self {
+    ///
+    /// `answered` 是已判定的结果；`revealed` 用于填空题——它没有输入框，按
+    /// enter 只揭示答案、不判对错，也不写 `quiz_attempts`。
+    pub fn quiz_card(
+        quiz: &Quiz,
+        index: usize,
+        total: usize,
+        answered: Option<bool>,
+        revealed: bool,
+    ) -> Self {
         let mut view = Self::new("quiz")
             .badge(format!("{}/{}", index + 1, total))
             .accent(match answered {
@@ -349,6 +380,10 @@ impl ToolView {
             } else {
                 format!("answer: {}", quiz.answer)
             });
+        } else if revealed {
+            view = view.muted(format!("answer: {} · not graded", quiz.answer));
+        } else if !quiz.is_choice() {
+            view = view.muted("fill in the blank · enter reveals the answer".to_string());
         }
         view
     }
