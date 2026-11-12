@@ -54,6 +54,10 @@ pub struct Text {
     pub source: Option<String>,
     /// 授权，例如 `public domain` / `CC BY-SA 4.0`。
     pub license: Option<String>,
+    /// 所属阅读书（同源的若干篇归成一本）。`None` 表示散篇。
+    pub book: Option<String>,
+    /// 在书里的顺序；导入时按先后递增，`/next` 按它推进。
+    pub rank: i64,
     /// 原文，段落之间用空行分隔。
     pub body: String,
     /// 逐段译文，段落数与 `body` 一致；没有译文时为空。
@@ -67,6 +71,8 @@ impl Text {
             title: title.into(),
             source: None,
             license: None,
+            book: None,
+            rank: 0,
             body: body.into(),
             translation: String::new(),
         }
@@ -93,6 +99,74 @@ impl Text {
 
     pub fn paragraph_count(&self) -> usize {
         self.paragraphs().len()
+    }
+}
+
+/// 一本阅读书：同源的若干篇文本。
+///
+/// 和词书（`books`）是并列概念，但只用于阅读：词书管「学哪些词」，阅读书管
+/// 「按什么顺序读哪些篇」。散篇不属于任何书。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextBook {
+    pub slug: String,
+    pub name: String,
+    /// 统一来源，例如 `Project Gutenberg`；不同书可能共享同一来源。
+    pub source: Option<String>,
+}
+
+/// 一本书的阅读进度。按「篇」计数，读完一篇（读到末段）才算一篇。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextBookProgress {
+    /// 书里的篇数。
+    pub total: u32,
+    /// 已读完的篇数。
+    pub finished: u32,
+    /// 至少读过一段的篇数。
+    pub started: u32,
+    /// 下一篇要读的标题；全部读完后是最后一篇。
+    pub next_title: Option<String>,
+    /// 书的 slug，方便在 UI 里回显。
+    pub slug: String,
+}
+
+impl TextBookProgress {
+    /// 已经读完。
+    pub fn is_done(&self) -> bool {
+        self.total > 0 && self.finished >= self.total
+    }
+
+    /// 进度百分比，按篇算。
+    pub fn percent(&self) -> u32 {
+        if self.total == 0 {
+            return 0;
+        }
+        self.finished * 100 / self.total
+    }
+}
+
+/// 把书名转成稳定的 slug：小写，非字母数字压成 `-`，去首尾横线。
+///
+/// 保留中日韩字符：书名本来就是中文时，`动物农场` 作 slug 比一串拼音或哈希更好认。
+/// 全是符号时退回 `book`，避免空 slug。
+pub fn book_slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "book".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -902,6 +976,32 @@ mod tests {
 
         assert!(session.clear_focus());
         assert!(session.focused_lemma().is_none());
+    }
+
+    #[test]
+    fn book_slugs_are_stable_and_readable() {
+        assert_eq!(book_slug("Animal Farm"), "animal-farm");
+        assert_eq!(book_slug("  The   Economist  "), "the-economist");
+        assert_eq!(book_slug("动物农场"), "动物农场");
+        assert_eq!(book_slug("!!!"), "book");
+        // 同一本书的不同写法落进同一个 slug，导入时才能归到一起。
+        assert_eq!(book_slug("Animal Farm"), book_slug("animal  farm"));
+    }
+
+    #[test]
+    fn book_progress_counts_texts() {
+        let mut progress = TextBookProgress {
+            total: 4,
+            finished: 1,
+            started: 2,
+            ..Default::default()
+        };
+        assert_eq!(progress.percent(), 25);
+        assert!(!progress.is_done());
+        progress.finished = 4;
+        assert!(progress.is_done());
+        assert_eq!(progress.percent(), 100);
+        assert_eq!(TextBookProgress::default().percent(), 0);
     }
 
     #[test]

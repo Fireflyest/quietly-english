@@ -22,6 +22,8 @@ pub enum Command {
     Read(String),
     /// `/texts`：列出已导入的文本。
     Texts,
+    /// `/library`：列出阅读书与每本书的进度。
+    Library,
     /// `/mode full|intensive`：切换阅读模式。
     Mode(String),
     /// `/mark <word>`：标记/取消标记当前段里的一个词。
@@ -163,9 +165,15 @@ pub const SPECS: &[Spec] = &[
     },
     Spec {
         name: "/texts",
-        alias: "library",
+        alias: "",
         args: "",
         help: "list imported texts",
+    },
+    Spec {
+        name: "/library",
+        alias: "shelf",
+        args: "",
+        help: "reading books with their progress",
     },
     Spec {
         name: "/drop",
@@ -295,7 +303,8 @@ impl Command {
             "add" => Command::Add(arg),
             "phrase" | "collocation" => Command::Phrase(arg),
             "read" | "r" => Command::Read(arg),
-            "texts" | "library" => Command::Texts,
+            "texts" => Command::Texts,
+            "library" | "shelf" => Command::Library,
             "mode" => Command::Mode(arg),
             "mark" | "m" => Command::Mark(arg),
             "words" => Command::Words,

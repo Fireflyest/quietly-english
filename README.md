@@ -145,6 +145,10 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 高亮，按数字看完整卡片，`/take` 收进词书，然后照常走记忆曲线。双语文本用 `---`
 分隔原文与译文；读后测验的题目必须带出处，导入时无出处的条目会被跳过。
 
+文本按**来源**归成阅读书：文件头写 `# book: Animal Farm`（或 `quietly read x.txt --book …`），
+同一本书的多篇自动排好顺序；`/library` 看每本进度，`/read animal-farm` 接着读下一篇，
+读到末段自动翻到下一章。没写书名的文本留作散篇。
+
 ## 命令
 
 | 命令 | 说明 |
@@ -158,8 +162,8 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | `/limit [n]` | 查看 / 设置每日新词上限（持久化） |
 | `/add <word>` | 把生词加入当前词书（词典里没有就用搜索补全） |
 | `/phrase <w> <phrase> = <释义>` | 给一个词补一条固定搭配，如 `/phrase sake for the sake of = 为了` |
-| `/read [file\|title]` | 开始阅读；不带参数续上次那篇 |
-| `/texts` | 列出已导入的文本与进度 |
+| `/read [file\|title\|book]` | 开始阅读；不带参数续上次那篇，给书名则接着读下一章 |
+| `/texts` · `/library` | 列出文本 / 阅读书与进度 |
 | `/mode [full\|intensive]` | 切换全篇 / 精读 |
 | `/mark [word]` | 标记生词（`/mark all` 标全部） |
 | `/take <n>` | 把当前段第 n 个词收进词书 |

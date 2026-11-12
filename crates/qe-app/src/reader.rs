@@ -29,6 +29,7 @@ pub fn load_text(path: &std::path::Path) -> Result<Text> {
         .unwrap_or_else(|| "untitled".to_string());
     let mut source = None;
     let mut license = None;
+    let mut book = None;
 
     let mut body = String::new();
     let mut in_header = true;
@@ -41,6 +42,10 @@ pub fn load_text(path: &std::path::Path) -> Result<Text> {
             }
             if let Some(rest) = trimmed.strip_prefix("# license:") {
                 license = Some(rest.trim().to_string());
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("# book:") {
+                book = Some(rest.trim().to_string());
                 continue;
             }
             if let Some(rest) = trimmed.strip_prefix("# title:") {
@@ -56,6 +61,12 @@ pub fn load_text(path: &std::path::Path) -> Result<Text> {
         body.push('\n');
     }
 
+    // 没有 `# book:` 时，用来源归书：同源的多篇读起来就是一本。
+    // 都没有就留作散篇，不硬凑一个「来源未知」的书。
+    if book.is_none() {
+        book = source.clone();
+    }
+
     // `---` 独占一行时视为原文与译文的分界。
     let (original, translation) = match split_bilingual(&body) {
         Some((a, b)) => (a.to_string(), b.to_string()),
@@ -67,6 +78,8 @@ pub fn load_text(path: &std::path::Path) -> Result<Text> {
         title,
         source,
         license,
+        book,
+        rank: 0,
         body: original,
         translation,
     })
@@ -197,6 +210,51 @@ impl App {
         Ok(())
     }
 
+    /// 列出阅读书：每本书的进度与下一篇。
+    pub fn list_library(&mut self) -> Result<()> {
+        let books = self.store.text_books()?;
+        let texts = self.store.texts()?;
+        if books.is_empty() && texts.is_empty() {
+            self.note("no texts yet · /read <file> imports one");
+            return Ok(());
+        }
+
+        let loose = texts.iter().filter(|text| text.book.is_none()).count();
+        let mut view = ToolView::new("library")
+            .accent(qe_core::view::Accent::Note)
+            .result(format!(
+                "{} books · {} texts{}",
+                books.len(),
+                texts.len(),
+                if loose > 0 {
+                    format!(" · {loose} on their own")
+                } else {
+                    String::new()
+                }
+            ));
+
+        let last = self.store.setting("last_text")?.unwrap_or_default();
+        for book in &books {
+            let progress = self.store.text_book_progress(&book.slug)?;
+            let marker = if progress.is_done() { "done" } else { "next" };
+            let next = progress.next_title.clone().unwrap_or_default();
+            let current = next.eq_ignore_ascii_case(&last);
+            view = view.kv(
+                format!("{}{}", book.name, if current { " ·" } else { "" }),
+                format!(
+                    "{}/{} · {marker} {next}",
+                    progress.finished, progress.total
+                ),
+            );
+        }
+        if loose > 0 {
+            view = view.muted(format!("{loose} texts without a book · /texts lists them"));
+        }
+        view = view.muted("/read <book> continues its next text · /read <file> imports");
+        self.push(Message::tool(view));
+        Ok(())
+    }
+
     /// 显示 / 隐藏译文。
     pub fn toggle_translation(&mut self) -> Result<()> {
         if self.reading.is_none() {
@@ -256,6 +314,9 @@ impl App {
     }
 
     /// 打开一篇文章并进入阅读。
+    ///
+    /// 参数可以是文件路径、篇名，或一本阅读书的 slug/书名——最后一种会接着读
+    /// 书里下一篇没读完的文章，这就是「按书推进」。
     pub fn start_reading(&mut self, query: &str) -> Result<()> {
         let query = query.trim();
         let text = if query.is_empty() {
@@ -281,16 +342,26 @@ impl App {
             self.store.set_setting("last_text", &text.title)?;
             let mut text = text;
             text.id = id;
-            self.note(format!("imported \"{}\" · {} paragraphs", text.title, text.paragraph_count()));
+            let book = text
+                .book
+                .as_ref()
+                .map(|book| format!(" · book: {book}"))
+                .unwrap_or_default();
+            self.note(format!(
+                "imported \"{}\" · {} paragraphs{book}",
+                text.title,
+                text.paragraph_count()
+            ));
+            text
+        } else if let Some(text) = self.store.text_by_title(query)? {
+            text
+        } else if let Some(text) = self.book_next_text(query)? {
             text
         } else {
-            match self.store.text_by_title(query)? {
-                Some(text) => text,
-                None => {
-                    self.note(format!("no text \"{query}\" · /read <file> imports a file"));
-                    return Ok(());
-                }
-            }
+            self.note(format!(
+                "no text or book \"{query}\" · /read <file> imports a file · /library lists books"
+            ));
+            return Ok(());
         };
 
         if text.paragraph_count() == 0 {
@@ -303,6 +374,11 @@ impl App {
             self.finish_session()?;
             self.note("study session closed before reading");
         }
+        // 已经在一篇里，又被要求打开另一篇（换书、书内续读）：先把当前这篇收尾，
+        // 否则阅读时长和段落数会算到下一篇头上。
+        if self.reading.is_some() {
+            self.finish_reading()?;
+        }
 
         let (paragraph, mode) = self
             .store
@@ -314,8 +390,68 @@ impl App {
             // 只恢复字符串标记；卡片正文按需再查。
             session.mark(&lemma, None);
         }
+        self.store.set_setting("last_text", &session.text.title)?;
         self.reading = Some(session);
         self.render_reading()
+    }
+
+    /// 一本书里下一篇要读的文章：按 slug 或书名匹配，然后取进度里的 `next_title`。
+    ///
+    /// 全部读完时返回最后一篇（复习用），并在提示里说清楚。
+    fn book_next_text(&mut self, query: &str) -> Result<Option<Text>> {
+        let slug = qe_core::reading::book_slug(query);
+        let books = self.store.text_books()?;
+        let Some(book) = books.into_iter().find(|book| {
+            book.slug.eq_ignore_ascii_case(&slug)
+                || book.name.eq_ignore_ascii_case(query)
+                || qe_core::reading::book_slug(&book.name).eq_ignore_ascii_case(&slug)
+        }) else {
+            return Ok(None);
+        };
+        let progress = self.store.text_book_progress(&book.slug)?;
+        let Some(title) = progress.next_title.clone() else {
+            self.note(format!("book \"{}\" has no texts", book.name));
+            return Ok(None);
+        };
+        let text = self.store.text_by_title(&title)?;
+        let position = if progress.is_done() {
+            format!("{} finished · re-reading the last one", book.name)
+        } else {
+            format!(
+                "{} · {} {}/{}",
+                book.name,
+                if progress.started == 0 { "start" } else { "next" },
+                (progress.finished + 1).min(progress.total),
+                progress.total
+            )
+        };
+        self.note(position);
+        Ok(text)
+    }
+
+    /// 读完一篇后接着读书里的下一篇；散篇或没有下一篇时返回 `false`。
+    fn advance_within_book(&mut self) -> Result<bool> {
+        let Some(session) = self.reading.as_ref() else {
+            return Ok(false);
+        };
+        let Some(book) = session.text.book.clone() else {
+            return Ok(false);
+        };
+        let current = session.text.title.clone();
+        let slug = qe_core::reading::book_slug(&book);
+        let progress = self.store.text_book_progress(&slug)?;
+        let Some(next) = progress.next_title else {
+            return Ok(false);
+        };
+        if next.eq_ignore_ascii_case(&current) {
+            self.note(format!(
+                "book \"{book}\" finished · {}/{} · /read {slug} re-reads it",
+                progress.finished, progress.total
+            ));
+            return Ok(false);
+        }
+        self.start_reading(&next)?;
+        Ok(true)
     }
 
     /// 切换模式。全篇 ↔ 精读。
@@ -352,19 +488,38 @@ impl App {
         self.render_reading()
     }
 
-    /// 下一页。
+    /// 下一页。读到最后一段时，书里还有下一篇就自动接着读。
     pub fn reading_next(&mut self) -> Result<()> {
-        let Some(session) = self.reading.as_mut() else {
+        let advanced = {
+            let Some(session) = self.reading.as_mut() else {
+                return Ok(());
+            };
+            if session.next() {
+                Some((session.text.id, session.paragraph, session.mode))
+            } else {
+                None
+            }
+        };
+        if let Some((id, paragraph, mode)) = advanced {
+            self.store.save_reading_progress(id, paragraph, mode)?;
+            return self.render_reading();
+        }
+
+        // 到头了：书里还有下一篇就接上，这是「按书推进」的核心。
+        let Some((last, has_book)) = self
+            .reading
+            .as_ref()
+            .map(|session| (session.total(), session.text.book.is_some()))
+        else {
             return Ok(());
         };
-        if !session.next() {
-            let last = session.total();
+        if !has_book {
             self.note(format!("last paragraph ({last}/{last}) · /read to pick another text"));
             return Ok(());
         }
-        let (id, paragraph, mode) = (session.text.id, session.paragraph, session.mode);
-        self.store.save_reading_progress(id, paragraph, mode)?;
-        self.render_reading()
+        self.note(format!("text finished ({last}/{last})"));
+        self.advance_within_book()?;
+        Ok(())
     }
 
     /// 上一页。

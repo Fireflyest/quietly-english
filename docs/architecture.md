@@ -89,7 +89,8 @@ cards(lemma PK, book_id, phase, step, ease, interval_days,
 reviews(id, lemma, at, day, rating, phase_after, interval_after, is_new)
 sessions(id, day, started_at, ended_at, seconds, new_count, review_count)
 settings(key, value)
-texts(id, title UNIQUE, source, license, body, translation, created_at)
+texts(id, title UNIQUE, source, license, book_slug, rank, body, translation, created_at)
+text_books(id, slug UNIQUE, name, source, created_at)   -- 阅读书：同源的多篇归一
 reading_progress(text_id PK, paragraph, mode, updated_at)
 reading_log(id, text_id, day, started_at, ended_at, seconds, paragraphs, ...)
 reading_marks(text_id, lemma, paragraph, created_at)

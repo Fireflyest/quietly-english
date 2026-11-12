@@ -908,6 +908,7 @@ impl App {
             Command::Phrase(spec) => self.add_phrase(&spec),
             Command::Read(query) => self.start_reading(&query),
             Command::Texts => self.list_texts(),
+            Command::Library => self.list_library(),
             Command::Mode(arg) => self.set_reading_mode(&arg),
             Command::Mark(word) => self.mark_word(&word),
             Command::Words => self.list_reading_words(),
@@ -2615,6 +2616,92 @@ mod tests {
             )),
             "nothing to show when the paragraph does not use the phrase"
         );
+    }
+
+    /// 导入一篇带 `# book:` 的文本，返回标题。
+    fn import_chapter(app: &mut App, dir: &tempfile::TempDir, file: &str, title: &str, body: &str) {
+        let path = dir.path().join(file);
+        std::fs::write(
+            &path,
+            format!("# title: {title}\n# book: Animal Farm\n# source: Project Gutenberg\n\n{body}\n"),
+        )
+        .unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+    }
+
+    #[test]
+    fn chapters_from_the_same_file_header_land_in_one_book() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+
+        let books = app.store.text_books().unwrap();
+        assert_eq!(books.len(), 1, "same `# book:` header → one book: {books:?}");
+        assert_eq!(books[0].slug, "animal-farm");
+
+        app.execute(Command::Library).unwrap();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(&m.body, Body::Tool(t) if t.name == "library")),
+            "the library block lists books"
+        );
+    }
+
+    #[test]
+    fn reading_a_book_opens_its_next_unfinished_chapter() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+
+        app.execute(Command::Read("animal-farm".into())).unwrap();
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Chapter One"),
+            "a fresh book starts at the first chapter"
+        );
+
+        // 读完第一篇（两段）。
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Chapter Two"),
+            "finishing a chapter continues with the next one"
+        );
+    }
+
+    #[test]
+    fn a_finished_chapter_is_marked_done_in_the_book() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+
+        app.execute(Command::Read("animal-farm".into())).unwrap();
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        if app.reading.is_some() {
+            app.finish_reading().unwrap();
+        }
+        let progress = app.store.text_book_progress("animal-farm").unwrap();
+        assert_eq!((progress.finished, progress.total), (1, 1));
+        assert!(progress.is_done());
+    }
+
+    #[test]
+    fn a_text_without_a_book_does_not_chain_anywhere() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("alone.txt");
+        std::fs::write(&path, "One.\n\nTwo.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        assert!(
+            app.reading.is_some(),
+            "a loose text stays open instead of jumping elsewhere"
+        );
+        assert_eq!(app.reading.as_ref().unwrap().paragraph, 1);
     }
 
     #[test]

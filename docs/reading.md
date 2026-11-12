@@ -6,9 +6,11 @@
 ## 快速开始
 
 ```bash
-quietly read article.txt          # 导入一篇（可双语）
-quietly read                      # 列出已导入的
-quietly quiz "Why I Write" q.tsv  # 给某篇导入题目
+quietly read article.txt              # 导入一篇（可双语）
+quietly read ch1.txt --book "Animal Farm"   # 归入一本书
+quietly read                          # 列出阅读书与散篇进度
+quietly library                       # 只看书与进度
+quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 ```
 
 进入 TUI：
@@ -17,8 +19,43 @@ quietly quiz "Why I Write" q.tsv  # 给某篇导入题目
 /read article.txt        导入并开始阅读
 /read                    续读上次那篇
 /read Why I Write        按标题打开
+/read animal-farm        接着读这本书里下一篇没读完的
+/library                 列出书与每本进度
 /texts                   列出所有文本与进度
 ```
+
+## 阅读书：同源归一本
+
+零散地一篇一篇读，进度记不住；同一个来源的东西本来就该是一本书。规则很简单：
+
+| 来源 | 归到哪本书 |
+|---|---|
+| 文件头 `# book: Animal Farm` | `animal-farm` |
+| `quietly read x.txt --book "Animal Farm"` | 同上，批量导入时不用改文件头 |
+| 只有文件头 `# source: Project Gutenberg` | 用来源作书名（`project-gutenberg`） |
+| 两者都没有 | 散篇，不硬凑一本书 |
+
+书内顺序按导入先后排，`/next` 按它推进：
+
+```
+/read animal-farm        → 打开这本书里第一篇还没读完的
+读到末段再按 space/enter  → 自动接上一篇（书里还有的话）
+读完最后一篇              → "book finished · 3/3"
+```
+
+`/library` 的显示：
+
+```
+⏺ library  2 books · 9 texts · 1 on their own
+⎿ Animal Farm                  1/2 · next Chapter Two
+  Why I Write ·                2/2 · done Why I Write
+  1 texts without a book · /texts lists them
+  /read <book> continues its next text · /read <file> imports
+```
+
+`·` 标在「上次读的那篇所在的书」上。命令行对应 `quietly library`。
+
+一篇文章只能属于一本书，但它可以读完后随时重读（`/read <title>` 不会清进度）。
 
 ## 两种模式
 
@@ -133,8 +170,9 @@ badge 也显示段号，所以定位结果看得见。译文同样受 `tab` 控�
 
 | 命令 | 说明 |
 | --- | --- |
-| `/read <title|file>` | 打开一篇；不给参数续读上次那篇 |
+| `/read <title|file|book>` | 打开一篇、导入文件，或接着读一本书的下一篇 |
 | `/texts` | 列出已导入的文本与进度 |
+| `/library` | 阅读书与每本进度（别名 `/shelf`） |
 | `/drop <title>` | 删除一篇及其进度、标记、题目（不可撤销，需精确标题） |
 | `/mode` | 在全篇 / 精读之间切换 |
 | `/translate` | 显示 / 隐藏译文（`tab` 同效，默认隐藏，两种模式都生效） |
@@ -177,8 +215,16 @@ I had the lonely child's habit.
 
 译文可以只写前几段，没译的段落不显示 `translation` 区块。
 
-文件头的 `# title:` / `# source:` / `# license:` 会被读进元数据。`license` 尤其重要——
-导入有版权的文本时自己要清楚来源。
+文件头的 `# title:` / `# source:` / `# license:` / `# book:` 会被读进元数据。`license`
+尤其重要——导入有版权的文本时自己要清楚来源。`# book:` 决定它归到哪本书；没写时用
+`# source:` 的函数：
+
+```
+# title: Chapter One
+# book: Animal Farm
+# source: Project Gutenberg
+# license: public domain
+```
 
 ## 题目格式
 
@@ -204,25 +250,35 @@ TSV 五列，`#` 开头是注释：
 
 **中文对照是这个模块的硬约束**：程序不会翻译，译文必须随文本一起提供。
 
-| 来源 | 授权 | 有中文对照 |
-| --- | --- | --- |
-| 自己写的笔记 / 已购电子书 | 你自己的 | 视情况 |
-| [Project Gutenberg](https://www.gutenberg.org/) | 公有领域 | ❌ 纯英文 |
-| [Wikisource 多语言版](https://zh.wikisource.org/) | CC BY-SA / 公有领域 | ✅ 部分作品有旧译 |
-| [Tatoeba 句对](https://tatoeba.org/en/downloads) | CC-BY 2.0 FR | ✅ 句子级，非成篇 |
-| [TED 演讲字幕](https://www.ted.com/participate/translate) | CC BY-NC-ND | ✅ 逐句对照 |
-| [VOA Learning English](https://learningenglish.voanews.com/) | 美国政府作品 | ❌ 但用词分级，适合精读 |
-| [Simple English Wikipedia](https://simple.wikipedia.org/) | CC BY-SA | ❌ 同上 |
+| 来源 | 授权 | 有中文对照 | 适合当什么 |
+| --- | --- | --- | --- |
+| 自己写的笔记 / 已购电子书 | 你自己的 | 视情况 | 任意 |
+| [Project Gutenberg](https://www.gutenberg.org/) | 公有领域 | ❌ 纯英文 | 长篇原著；**一章一个文件**，`# book:` 用书名 |
+| [Standard Ebooks](https://standardebooks.org/) | 公有领域（重排版） | ❌ | 同上，排版干净、分章清楚 |
+| [Wikisource 多语言版](https://zh.wikisource.org/) | CC BY-SA / 公有领域 | ✅ 部分作品有旧译 | 中英对照长篇：原文取 Gutenberg，旧译取这里 |
+| [Tatoeba 句对](https://tatoeba.org/en/downloads) | CC-BY 2.0 FR | ✅ 句子级 | 短句精读素材，不是成篇 |
+| [TED 演讲字幕](https://www.ted.com/participate/translate) | CC BY-NC-ND | ✅ 逐句对照 | 演讲/口语，一个演讲一篇 |
+| [VOA Learning English](https://learningenglish.voanews.com/) | 美国政府作品 | ❌ | 分级新闻，按栏目归书（`# book: VOA Science`） |
+| [Simple English Wikipedia](https://simple.wikipedia.org/) | CC BY-SA | ❌ | 主题短文，按主题归书 |
+| [LibriVox 文本对照](https://librivox.org/) | 公有领域 | ❌ | 只用来找书，正文还是 Gutenberg |
+| [The Guardian / BBC 等](https://www.theguardian.com/) | 版权归媒体 | ❌ | **不推荐**：正文有版权，且无译文 |
 
-**推荐路径**：用 Gutenberg 拿原文，再找公有领域旧译（民国时期译本多已进入公有领域，
-但各家出版社的**新译**有版权，注意区分）。或者直接用 Tatoeba 的句对做短篇精读素材。
+**推荐路径**：
+
+1. 用 Gutenberg / Standard Ebooks 拿原文，**一章一个 `.txt`**，统一写 `# book: 书名`；
+2. 需要译文时找公有领域旧译（民国时期译本多已进入公有领域，但各家出版社的
+   **新译**有版权，注意区分），按 `---` 分段粘进同一个文件；
+3. `quietly read ch01.txt --book "书名"` 批量导入，`/library` 看进度，`/read <slug>` 按书推进。
+
+`packs/texts/` 里已经放了一篇带 `# source:` 的示例（`orwell.txt`），可以照它的头部格式写。
 
 > 不要抓扇贝、百词斩、新闻网站正文——和词书部分的结论一致。
 
 ## 数据表
 
 ```sql
-texts(id, title UNIQUE, source, license, body, translation, created_at)
+text_books(id, slug UNIQUE, name, source, created_at)   -- 阅读书
+texts(id, title UNIQUE, source, license, book_slug, rank, body, translation, created_at)
 reading_progress(text_id PK, paragraph, mode, updated_at)
 reading_log(id, text_id, day, started_at, ended_at, seconds,
             paragraphs, words_opened, words_added)
@@ -232,7 +288,10 @@ quiz_attempts(id, quiz_id, day, at, correct)
 ```
 
 - 段落不单独建表：`body` 存原文，切段在读取时做，所以重新导入同一篇不会打乱进度
-- 同一标题重复导入只更新正文与译文，**保留进度和标记**
+- 同一标题重复导入只更新正文与译文，**保留进度和标记**；顺带换书时才改 `book_slug`
+- `book_slug` 直接存 slug（`qe_core::reading::book_slug` 由书名生成，保留中文），
+  书内顺序由 `rank` 决定
+- 老库升级（v7）时按 `source` 自动回填成书，之前读的散篇不需要重新导入
 - 标记按 `(text_id, lemma)` 去重，跨会话保留
 
 ## 统计

@@ -68,6 +68,8 @@ pub trait Store {
 
     // ---- 阅读 ----
     /// 保存（或更新）一篇文章，按标题去重。返回文本 id。
+    ///
+    /// `text.book` 非空时顺带登记/更新这本书；同源的多篇因此归到同一本书里。
     fn save_text(&mut self, text: &crate::reading::Text) -> Result<i64>;
     /// 列出所有已导入的文本，最近导入的在前。
     fn texts(&self) -> Result<Vec<crate::reading::Text>>;
@@ -75,6 +77,12 @@ pub trait Store {
     fn text_titles(&self) -> Result<Vec<String>> {
         Ok(self.texts()?.into_iter().map(|text| text.title).collect())
     }
+    /// 所有阅读书（含每本书的篇数），按导入顺序。
+    fn text_books(&self) -> Result<Vec<crate::reading::TextBook>>;
+    /// 书里的文本，按书的阅读顺序。
+    fn texts_in_book(&self, slug: &str) -> Result<Vec<crate::reading::Text>>;
+    /// 一本书的进度：读了几篇、下一篇是哪篇。
+    fn text_book_progress(&self, slug: &str) -> Result<crate::reading::TextBookProgress>;
     /// 按标题取文本（不区分大小写）。
     fn text_by_title(&self, title: &str) -> Result<Option<crate::reading::Text>>;
     /// 删除一篇文章及其进度、标注、测验。

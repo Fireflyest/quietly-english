@@ -313,10 +313,15 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("read") => {
-            // `quietly read <file>` 导入文本；不给文件就列出已导入的。
-            match rest.iter().find(|arg| !arg.starts_with('-')) {
+            // `quietly read <file> [--book <name>]` 导入文本；不给文件就列出已导入的。
+            let file = rest.iter().find(|arg| !arg.starts_with('-'));
+            match file {
                 Some(path) => {
-                    let text = reader::load_text(std::path::Path::new(path))?;
+                    let mut text = reader::load_text(std::path::Path::new(path))?;
+                    // `--book` 优先于文件头：批量导入同一本书时不必改每个文件头。
+                    if let Some(book) = flag_value(&rest, "--book") {
+                        text.book = Some(book);
+                    }
                     let paragraphs = text.paragraph_count();
                     let has_translation = !text.translation.trim().is_empty();
                     let id = store.save_text(&text)?;
@@ -326,6 +331,12 @@ fn run() -> Result<()> {
                         text.title,
                         if has_translation { " · bilingual" } else { "" }
                     );
+                    if let Some(book) = &text.book {
+                        println!(
+                            "book: {book} ({})",
+                            qe_core::reading::book_slug(book)
+                        );
+                    }
                     if let Some(source) = &text.source {
                         println!("source: {source}");
                     }
@@ -336,27 +347,69 @@ fn run() -> Result<()> {
                     Ok(())
                 }
                 None => {
-                    let texts = store.texts()?;
-                    if texts.is_empty() {
+                    let books = store.text_books()?;
+                    for book in &books {
+                        let progress = store.text_book_progress(&book.slug)?;
+                        println!(
+                            "{:<24} {}/{} texts · next: {}",
+                            book.name,
+                            progress.finished,
+                            progress.total,
+                            progress.next_title.as_deref().unwrap_or("-")
+                        );
+                    }
+                    let loose: Vec<_> = store
+                        .texts()?
+                        .into_iter()
+                        .filter(|text| text.book.is_none())
+                        .collect();
+                    if books.is_empty() && loose.is_empty() {
                         println!("（没有文本，先运行 quietly read <文件>）");
                     }
-                    for text in texts {
-                        let progress = store
-                            .reading_progress(text.id)?
-                            .map(|(paragraph, mode)| {
-                                format!(
-                                    "{}/{} {}",
-                                    paragraph + 1,
-                                    text.paragraph_count(),
-                                    mode.label()
-                                )
-                            })
-                            .unwrap_or_else(|| format!("{} paragraphs", text.paragraph_count()));
-                        println!("{:<28} {}", text.title, progress);
+                    if !loose.is_empty() {
+                        if !books.is_empty() {
+                            println!();
+                        }
+                        println!("{} texts without a book:", loose.len());
+                        for text in loose {
+                            let progress = store
+                                .reading_progress(text.id)?
+                                .map(|(paragraph, mode)| {
+                                    format!(
+                                        "{}/{} {}",
+                                        paragraph + 1,
+                                        text.paragraph_count(),
+                                        mode.label()
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    format!("{} paragraphs", text.paragraph_count())
+                                });
+                            println!("  {:<26} {}", text.title, progress);
+                        }
                     }
                     Ok(())
                 }
             }
+        }
+        Some("library") => {
+            // `quietly library`：阅读书与进度。
+            let books = store.text_books()?;
+            if books.is_empty() {
+                println!("（没有阅读书，先运行 quietly read <文件> --book <书名>）");
+            }
+            for book in &books {
+                let progress = store.text_book_progress(&book.slug)?;
+                println!(
+                    "{:<10} {:<24} {:>3}/{:<3} next: {}",
+                    book.slug,
+                    book.name,
+                    progress.finished,
+                    progress.total,
+                    progress.next_title.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
         }
         Some("drop") | Some("delete-text") => {
             // `quietly drop <text>`：删掉一篇及其进度、标记、题目。
@@ -492,7 +545,8 @@ USAGE:
     quietly phrases <file>        批量导入常用词组（lemma,phrase,gloss）
     quietly phrase <词> <搭配> = <释义>   单条补录词组
     quietly word <lemma>          查看词条（含义项、搭配、词根、例句）
-    quietly read [file]           导入一篇文本，或不带参数列出已导入的
+    quietly read [file] [--book <name>]  导入一篇文本（用 --book 归入同名的书）
+    quietly library               阅读书与进度
     quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
@@ -514,14 +568,22 @@ TUI 命令：
     /import <p>  导入文件      /help        帮助
 
 阅读：
-    /read [file|title]  开始阅读   /texts  已导入的文本
-    /drop <title>       删除文本   /mode [full|intensive]  切换模式
+    /read [file|title|book]  开始阅读   /texts  已导入的文本
+    /library            阅读书与进度   /drop <title>  删除文本
     /mark <word> · /mark all      标记 / 取消标记生词
     /take <n>                     收第 n 个词进词书
     /next · /prev · /goto <n>     翻页
     /translate                    显示 / 隐藏译文
     /quiz [file]                  读后测验"
     );
+}
+
+/// `--flag value` 里的值；没有该开关时返回 `None`。
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let index = args.iter().position(|arg| arg == flag)?;
+    args.get(index + 1)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// 让译文从同一列开始。中文按两个字符宽度算，否则 `[医]` 之后会错位。

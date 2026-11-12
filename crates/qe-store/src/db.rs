@@ -99,6 +99,24 @@ CREATE INDEX IF NOT EXISTS idx_reviews_word ON reviews(word_id);
 
 const WORD_COLS: &str = "w.id, w.lemma, w.phonetic, w.translation, w.definition, w.roots, w.examples, w.tags, w.collocations, w.glosses";
 
+/// `texts` 的列顺序，与 [`decode_text`] 一一对应。
+const TEXT_COLS: &str =
+    "id, title, source, license, book_slug, rank, body, translation";
+
+/// 一行 `texts` → `Text`。列顺序必须与 [`TEXT_COLS`] 一致。
+fn decode_text(row: &Row<'_>) -> rusqlite::Result<qe_core::reading::Text> {
+    Ok(qe_core::reading::Text {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        source: row.get(2)?,
+        license: row.get(3)?,
+        book: row.get(4)?,
+        rank: row.get(5)?,
+        body: row.get(6)?,
+        translation: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+    })
+}
+
 /// v4：阅读模块。
 ///
 /// `texts.translation` 与 `body` 用同一套段落切分，所以两者按空行对齐；
@@ -171,6 +189,22 @@ CREATE INDEX IF NOT EXISTS idx_quizzes_text ON quizzes(text_id);
 /// 词典库里 `words.id` 是 AUTOINCREMENT，换一份词典或换导入顺序就会变，
 /// 而 `lemma` 在两个库里都唯一且稳定。迁移由 [`SqliteStore::rekey_on_lemma`] 完成，
 /// 这里只是新布局的说明。
+/// v7：阅读书。
+///
+/// `texts.book_slug` 直接存 slug（不做外键）：SQLite 的跨表约束在这里只会添乱，
+/// 而 slug 本身就是稳定的。`rank` 决定书里的阅读顺序，导入时递增。
+/// 列与索引在 [`SqliteStore::migrate_text_books`] 里补，因为老库的 `texts`
+/// 可能没有这两列（甚至还没有这张表）。
+const SCHEMA_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS text_books (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug    TEXT NOT NULL UNIQUE,
+    name    TEXT NOT NULL,
+    source  TEXT,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -286,6 +320,12 @@ impl SqliteStore {
             // 阅读模块。文本与译文都存原文，段落切分在读取时做，所以只需要一张表。
             self.conn.execute_batch(SCHEMA_V4)?;
             self.conn.execute_batch("PRAGMA user_version = 4")?;
+        }
+        if version < 7 {
+            // 阅读书：同源的若干篇归成一本，按书推进。
+            self.conn.execute_batch(SCHEMA_V7)?;
+            self.migrate_text_books()?;
+            self.conn.execute_batch("PRAGMA user_version = 7")?;
         }
         // 词典库的列不跟主库版本号走：老库和新库都要补齐这两列，补之前先看
         // 实际列名，所以重复执行也不会出错。
@@ -453,7 +493,96 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// 老布局（`words` 在学习库里）迁移到新布局。
+    /// v6 → v7：阅读书。
+    ///
+    /// 老库的 `texts` 没有 `book_slug` / `rank`，先补列；再按 `source` 回填——
+    /// 这正是「同源归一」的规则：同一来源的若干篇自动落进同一本书，
+    /// 书内按导入顺序排 rank。
+    fn migrate_text_books(&mut self) -> Result<()> {
+        // 老库可能连 `texts` 都没有（早期布局只建过词书表）。
+        let has_texts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'texts'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_texts == 0 {
+            return Ok(());
+        }
+
+        let mut columns: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("PRAGMA main.table_info(texts)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for row in rows {
+                columns.push(row?);
+            }
+        }
+        for (name, decl) in [
+            ("book_slug", "TEXT"),
+            ("rank", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE texts ADD COLUMN {name} {decl};"))?;
+            }
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_texts_book ON texts(book_slug, rank);",
+        )?;
+
+        // 按来源回填：只有还没有书、但有 source 的文本才动。
+        let sources: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT source FROM texts
+                 WHERE source IS NOT NULL AND trim(source) <> ''
+                   AND (book_slug IS NULL OR book_slug = '')
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = Utc::now().to_rfc3339();
+        for source in sources {
+            let name = source.trim();
+            let slug = qe_core::reading::book_slug(name);
+            self.conn.execute(
+                "INSERT INTO text_books(slug, name, source, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(slug) DO UPDATE SET
+                    name = CASE WHEN text_books.name = '' THEN excluded.name ELSE text_books.name END",
+                params![slug, name, name, now],
+            )?;
+            self.conn.execute(
+                "UPDATE texts SET book_slug = ?1
+                 WHERE source = ?2 AND (book_slug IS NULL OR book_slug = '')",
+                params![slug, source],
+            )?;
+        }
+
+        // 书内排序：按导入顺序重新编号，避免回填时 rank 全是 0。
+        let rows: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT book_slug, id FROM texts
+                 WHERE book_slug IS NOT NULL ORDER BY book_slug, id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut current: Option<String> = None;
+        let mut rank = 0i64;
+        for (slug, id) in rows {
+            if current.as_deref() != Some(slug.as_str()) {
+                current = Some(slug);
+                rank = 0;
+            }
+            self.conn
+                .execute("UPDATE texts SET rank = ?1 WHERE id = ?2", params![rank, id])?;
+            rank += 1;
+        }
+        Ok(())
+    }
+
     /// 老布局（`words` 在学习库里）迁移到新布局。返回是否真的搬过。
     fn move_words_out(&mut self) -> Result<bool> {
         let has_old: bool = self
@@ -1221,13 +1350,48 @@ impl Store for SqliteStore {
 
     fn save_text(&mut self, text: &qe_core::reading::Text) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
+        // 有书名就先登记这本书；同源的多篇因此归到同一本。
+        let book_slug = text
+            .book
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                let slug = qe_core::reading::book_slug(name);
+                (slug, name.to_string())
+            });
+        if let Some((slug, name)) = &book_slug {
+            self.conn.execute(
+                "INSERT INTO text_books(slug, name, source, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(slug) DO UPDATE SET
+                    source = COALESCE(NULLIF(excluded.source, ''), text_books.source)",
+                params![slug, name, text.source.as_deref(), now],
+            )?;
+        }
+        let rank = match &book_slug {
+            Some((slug, _)) => {
+                let next: i64 = self.conn.query_row(
+                    "SELECT COALESCE(MAX(rank), -1) + 1 FROM texts WHERE book_slug = ?1",
+                    [slug],
+                    |row| row.get(0),
+                )?;
+                next
+            }
+            None => 0,
+        };
+
         // 按标题去重：重新导入同一篇时更新正文与译文，但保留已有进度与标注。
         self.conn.execute(
-            "INSERT INTO texts(title, source, license, body, translation, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO texts(title, source, license, book_slug, rank, body, translation, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(title) DO UPDATE SET
                 source = COALESCE(NULLIF(excluded.source, ''), texts.source),
                 license = COALESCE(NULLIF(excluded.license, ''), texts.license),
+                book_slug = COALESCE(excluded.book_slug, texts.book_slug),
+                rank = CASE
+                    WHEN excluded.book_slug IS NOT NULL
+                     AND excluded.book_slug <> COALESCE(texts.book_slug, '')
+                    THEN excluded.rank ELSE texts.rank END,
                 body = excluded.body,
                 translation = CASE WHEN excluded.translation = '' THEN texts.translation
                                    ELSE excluded.translation END",
@@ -1235,6 +1399,8 @@ impl Store for SqliteStore {
                 text.title.trim(),
                 text.source.as_deref(),
                 text.license.as_deref(),
+                book_slug.as_ref().map(|(slug, _)| slug.as_str()),
+                rank,
                 text.body,
                 text.translation,
                 now,
@@ -1248,21 +1414,63 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
-    fn texts(&self) -> Result<Vec<qe_core::reading::Text>> {
+    fn text_books(&self) -> Result<Vec<qe_core::reading::TextBook>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, source, license, body, translation FROM texts
-             ORDER BY id DESC",
+            "SELECT slug, name, source FROM text_books
+             WHERE EXISTS (SELECT 1 FROM texts t WHERE t.book_slug = text_books.slug)
+             ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(qe_core::reading::Text {
-                id: row.get(0)?,
-                title: row.get(1)?,
+            Ok(qe_core::reading::TextBook {
+                slug: row.get(0)?,
+                name: row.get(1)?,
                 source: row.get(2)?,
-                license: row.get(3)?,
-                body: row.get(4)?,
-                translation: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn texts_in_book(&self, slug: &str) -> Result<Vec<qe_core::reading::Text>> {
+        let mut stmt = self.conn.prepare(
+            &format!("SELECT {TEXT_COLS} FROM texts WHERE book_slug = ?1 ORDER BY rank, id"),
+        )?;
+        let rows = stmt.query_map([slug.trim()], decode_text)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn text_book_progress(&self, slug: &str) -> Result<qe_core::reading::TextBookProgress> {
+        let texts = self.texts_in_book(slug)?;
+        let mut progress = qe_core::reading::TextBookProgress {
+            total: texts.len() as u32,
+            slug: slug.trim().to_string(),
+            ..Default::default()
+        };
+        for text in &texts {
+            let done = match self.reading_progress(text.id)? {
+                Some((paragraph, _)) => {
+                    progress.started += 1;
+                    paragraph + 1 >= text.paragraph_count().max(1)
+                }
+                None => false,
+            };
+            if done {
+                progress.finished += 1;
+            } else if progress.next_title.is_none() {
+                progress.next_title = Some(text.title.clone());
+            }
+        }
+        if progress.next_title.is_none() {
+            // 全部读完：停在最后一篇，方便复习。
+            progress.next_title = texts.last().map(|text| text.title.clone());
+        }
+        Ok(progress)
+    }
+
+    fn texts(&self) -> Result<Vec<qe_core::reading::Text>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {TEXT_COLS} FROM texts ORDER BY id DESC"))?;
+        let rows = stmt.query_map([], decode_text)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1276,19 +1484,9 @@ impl Store for SqliteStore {
         let text = self
             .conn
             .query_row(
-                "SELECT id, title, source, license, body, translation FROM texts
-                 WHERE lower(title) = lower(?1)",
+                &format!("SELECT {TEXT_COLS} FROM texts WHERE lower(title) = lower(?1)"),
                 [title.trim()],
-                |row| {
-                    Ok(qe_core::reading::Text {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        source: row.get(2)?,
-                        license: row.get(3)?,
-                        body: row.get(4)?,
-                        translation: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    })
-                },
+                decode_text,
             )
             .optional()?;
         Ok(text)
@@ -2470,8 +2668,133 @@ mod tests {
     }
 
     #[test]
-    fn an_old_single_file_database_is_split_on_open() {
-        // 造一个 v4 布局：words 还在学习库里，子表带指向它的外键。
+    fn texts_with_the_same_book_share_one_book() {
+        let (mut store, _dir) = temp_store();
+        let mut first = qe_core::reading::Text::new("Chapter One", "One.\n\nTwo.");
+        first.book = Some("Animal Farm".to_string());
+        first.source = Some("Project Gutenberg".to_string());
+        let mut second = qe_core::reading::Text::new("Chapter Two", "Three.\n\nFour.");
+        second.book = Some("animal  farm".to_string());
+        let loose = qe_core::reading::Text::new("Standalone", "Alone.");
+
+        store.save_text(&first).unwrap();
+        store.save_text(&second).unwrap();
+        store.save_text(&loose).unwrap();
+
+        let books = store.text_books().unwrap();
+        assert_eq!(books.len(), 1, "one book, not one per text: {books:?}");
+        assert_eq!(books[0].name, "Animal Farm");
+        assert_eq!(books[0].slug, "animal-farm");
+        assert_eq!(books[0].source.as_deref(), Some("Project Gutenberg"));
+
+        let chapters = store.texts_in_book("animal-farm").unwrap();
+        assert_eq!(
+            chapters.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Chapter One", "Chapter Two"],
+            "rank follows the import order"
+        );
+        assert_eq!(chapters[0].rank, 0);
+        assert_eq!(chapters[1].rank, 1);
+
+        let loose = store.texts().unwrap().into_iter().find(|t| t.title == "Standalone");
+        assert!(loose.unwrap().book.is_none(), "a text without a book stays loose");
+    }
+
+    #[test]
+    fn book_progress_advances_text_by_text() {
+        let (mut store, _dir) = temp_store();
+        for (title, body) in [
+            ("One", "a.\n\nb."),
+            ("Two", "c.\n\nd."),
+        ] {
+            let mut text = qe_core::reading::Text::new(title, body);
+            text.book = Some("Farm".to_string());
+            store.save_text(&text).unwrap();
+        }
+
+        let progress = store.text_book_progress("farm").unwrap();
+        assert_eq!((progress.total, progress.finished, progress.started), (2, 0, 0));
+        assert_eq!(progress.next_title.as_deref(), Some("One"));
+
+        // 读完第一篇（存到末段）。
+        let first = store.text_by_title("One").unwrap().unwrap();
+        store
+            .save_reading_progress(first.id, 1, qe_core::reading::ReadMode::Full)
+            .unwrap();
+        let progress = store.text_book_progress("farm").unwrap();
+        assert_eq!((progress.finished, progress.started), (1, 1));
+        assert_eq!(progress.next_title.as_deref(), Some("Two"));
+        assert_eq!(progress.percent(), 50);
+
+        // 读完第二篇：整本完成，next 停在最后一篇供复习。
+        let second = store.text_by_title("Two").unwrap().unwrap();
+        store
+            .save_reading_progress(second.id, 1, qe_core::reading::ReadMode::Full)
+            .unwrap();
+        let progress = store.text_book_progress("farm").unwrap();
+        assert!(progress.is_done());
+        assert_eq!(progress.next_title.as_deref(), Some("Two"));
+    }
+
+    #[test]
+    fn importing_a_text_again_keeps_its_book_and_rank() {
+        let (mut store, _dir) = temp_store();
+        let mut text = qe_core::reading::Text::new("One", "a.\n\nb.");
+        text.book = Some("Farm".to_string());
+        store.save_text(&text).unwrap();
+
+        // 重新导入同一篇（标题相同）不改 rank，也不新建书。
+        let mut again = qe_core::reading::Text::new("One", "a.\n\nb.\n\nc.");
+        again.book = Some("Farm".to_string());
+        store.save_text(&again).unwrap();
+        let chapters = store.texts_in_book("farm").unwrap();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].rank, 0);
+        assert_eq!(chapters[0].paragraph_count(), 3);
+    }
+
+    #[test]
+    fn an_old_database_groups_texts_by_source_on_open() {
+        // v6 布局：texts 没有 book_slug / rank。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO texts(title, source, body, created_at)
+                    VALUES ('A', 'Project Gutenberg', 'one.', ''),
+                           ('B', 'Project Gutenberg', 'two.', ''),
+                           ('C', NULL, 'three.', '');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+
+        let mut store = SqliteStore::open_at(&path).unwrap();
+        let books = store.text_books().unwrap();
+        assert_eq!(books.len(), 1, "same source → one book: {books:?}");
+        assert_eq!(books[0].slug, "project-gutenberg");
+        assert_eq!(store.texts_in_book("project-gutenberg").unwrap().len(), 2);
+
+        let loose = store
+            .texts()
+            .unwrap()
+            .into_iter()
+            .find(|text| text.title == "C")
+            .unwrap();
+        assert!(loose.book.is_none(), "a text without a source stays loose");
+
+        // 迁移后仍能正常写入新书。
+        let mut fresh = qe_core::reading::Text::new("D", "four.");
+        fresh.book = Some("Another Book".to_string());
+        store.save_text(&fresh).unwrap();
+        assert_eq!(store.text_books().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_old_single_file_database_is_split_on_open() {        // 造一个 v4 布局：words 还在学习库里，子表带指向它的外键。
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         {
