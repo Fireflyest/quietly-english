@@ -166,8 +166,10 @@ impl App {
             } else {
                 ViewMode::Input
             };
+            // 学习模式的按键提示只在页脚出现一次；占位符留空，避免同一行提示
+            // 在输入框和页脚各写一遍。
             let placeholder = if self.session.is_some() {
-                "1-4 grade · tab hint · esc end"
+                ""
             } else {
                 "type a word, or / for commands"
             };
@@ -1934,7 +1936,9 @@ impl App {
                     session.total()
                 )
             }
-            None => "ready · type a word, or /  for commands".to_string(),
+            // 空闲时状态栏只说「ready」：输入行占位符已经写了同样的提示，
+            // 两边都写会让同一句话在屏幕上出现两次。
+            None => "ready".to_string(),
         };
     }
 }
