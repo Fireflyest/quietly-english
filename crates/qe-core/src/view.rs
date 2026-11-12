@@ -595,6 +595,13 @@ impl CardState {
         self
     }
 
+    /// Drop the 1-4 rating row. Lookup shows the same revealed card but grading
+    /// there would write a review, so the keys are not offered.
+    pub fn without_ratings(mut self) -> Self {
+        self.show_ratings = false;
+        self
+    }
+
     pub fn graded(mut self, rating: Rating) -> Self {
         self.graded = Some(rating);
         self
@@ -1188,11 +1195,44 @@ mod tests {
 
     #[test]
     fn lookup_opens_with_the_glosses_already_shown() {
-        let view = ToolView::word_card(&CardState::new(word_with_glosses(), "lookup").revealed().with_glosses());
+        let view = ToolView::word_card(
+            &CardState::new(word_with_glosses(), "lookup")
+                .revealed()
+                .with_glosses()
+                .without_ratings(),
+        );
         assert_eq!(
             gloss_texts(&view).len(),
             2,
             "an explicit lookup shows everything"
+        );
+    }
+
+    #[test]
+    fn lookup_does_not_offer_grading() {
+        // Grading is only meaningful inside a study session: the keys would write
+        // a review for a word the reader merely looked up.
+        let view = ToolView::word_card(
+            &CardState::new(word_with_glosses(), "lookup")
+                .revealed()
+                .with_glosses()
+                .without_ratings(),
+        );
+        assert!(
+            !view
+                .lines
+                .iter()
+                .any(|line| matches!(line, ToolLine::Rating { .. })),
+            "no 1-4 rating row on a lookup card"
+        );
+
+        let study = ToolView::word_card(&CardState::new(word_with_glosses(), "1/9").revealed());
+        assert!(
+            study
+                .lines
+                .iter()
+                .any(|line| matches!(line, ToolLine::Rating { .. })),
+            "the study card keeps the rating row"
         );
     }
 }

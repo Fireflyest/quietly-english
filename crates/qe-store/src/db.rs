@@ -17,8 +17,9 @@ use qe_core::time;
 /// 词典表。它单独放在 `quietly-words.db` 里：327 万词条会让整个文件涨到 500 MB+，
 /// 而学习数据只有几 MB。分开之后学习数据可以进 git，词典随时能从下载包重建。
 ///
-/// 跨库外键在 SQLite 里不生效，所以 `book_words` / `cards` 只存 `word_id`，
-/// 由 `quietly doctor` 负责校验引用是否还有对应的词条。
+/// 跨库外键在 SQLite 里不生效，所以 `book_words` / `cards` / `reviews` 存的是
+/// `lemma`（v6 起）而不是 `dict.words.id`：词典重建时 id 会按导入顺序重排，
+/// 存 id 的词书会静默指向别的词。`quietly doctor` 负责校验引用是否还有对应词条。
 const SCHEMA_WORDS: &str = r#"
 CREATE TABLE IF NOT EXISTS dict.words (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -165,11 +166,47 @@ CREATE INDEX IF NOT EXISTS idx_reading_log_day ON reading_log(day);
 CREATE INDEX IF NOT EXISTS idx_quizzes_text ON quizzes(text_id);
 "#;
 
+/// v6：词书、卡片、复习流水改用 `lemma` 作为跨库键。
+///
+/// 词典库里 `words.id` 是 AUTOINCREMENT，换一份词典或换导入顺序就会变，
+/// 而 `lemma` 在两个库里都唯一且稳定。迁移由 [`SqliteStore::rekey_on_lemma`] 完成，
+/// 这里只是新布局的说明。
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
     /// 词典库文件（`quietly-words.db`），与 `path` 同目录。
     words_path: PathBuf,
+}
+
+/// `quietly doctor` 的结果。
+#[derive(Debug, Default, Clone)]
+pub struct DoctorReport {
+    /// 词典库里的词条数。
+    pub words: u64,
+    /// 每本词书的词数：`(slug, 条数)`。
+    pub decks: Vec<(String, u64)>,
+    /// 一条词都没有的词书。
+    pub empty_decks: Vec<String>,
+    /// 词书引用了、词典里却没有的词：`(slug, lemma)`。
+    pub missing_in_decks: Vec<(String, String)>,
+    /// 卡片引用了、词典里却没有的词。
+    pub missing_cards: Vec<String>,
+    /// 复习流水里引用不到词条的条数。
+    pub missing_reviews: u64,
+    /// `--fix` 清掉的悬空引用条数；没加 `--fix` 时恒为 0。
+    pub fixed: u64,
+}
+
+impl DoctorReport {
+    /// 引用是否完整（空词书只算提示，不算错误）。
+    pub fn is_clean(&self) -> bool {
+        self.missing_in_decks.is_empty() && self.missing_cards.is_empty() && self.missing_reviews == 0
+    }
+
+    /// 悬空引用总条数。
+    pub fn orphans(&self) -> u64 {
+        self.missing_in_decks.len() as u64 + self.missing_cards.len() as u64 + self.missing_reviews
+    }
 }
 
 impl SqliteStore {
@@ -268,6 +305,10 @@ impl SqliteStore {
                 self.conn.execute_batch("VACUUM")?;
             }
         }
+        if version < 6 {
+            // 词书、卡片、复习流水从 `word_id` 换成 `lemma`。
+            self.rekey_on_lemma()?;
+        }
         Ok(())
     }
 
@@ -294,6 +335,121 @@ impl SqliteStore {
                 ))?;
             }
         }
+        Ok(())
+    }
+
+    /// v5 → v6：词书、卡片、复习流水从 `word_id` 改成 `lemma`。
+    ///
+    /// 词典库的 `id` 是 AUTOINCREMENT，换一份词典或换导入顺序就会变；存 id 时
+    /// 词书会静默指向别的词（原来的 `alpha` 变成 `gamma`）。`lemma` 在两个库里
+    /// 都唯一，换词典后依然指向同一个词。
+    ///
+    /// 词典里已经找不到的词条会在迁移中丢弃——它们本来就无法显示，
+    /// 之后可以用 `quietly doctor` 看到引用是否完整。
+    fn rekey_on_lemma(&mut self) -> Result<()> {
+        // 老库可能是手工建的，缺表比缺列常见；缺哪张就直接建新布局。
+        let exists = |conn: &Connection, name: &str| -> Result<bool> {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        };
+        let has_book_words = exists(&self.conn, "book_words")?;
+        let has_cards = exists(&self.conn, "cards")?;
+        let has_reviews = exists(&self.conn, "reviews")?;
+
+        let mut sql = String::new();
+        if has_book_words {
+            sql.push_str(
+                "CREATE TABLE book_words_lemma (
+                    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                    lemma   TEXT NOT NULL COLLATE NOCASE,
+                    rank    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (book_id, lemma)
+                 );
+                 INSERT OR IGNORE INTO book_words_lemma(book_id, lemma, rank)
+                    SELECT bw.book_id, w.lemma, bw.rank
+                    FROM book_words bw JOIN dict.words w ON w.id = bw.word_id;
+                 DROP TABLE book_words;
+                 ALTER TABLE book_words_lemma RENAME TO book_words;",
+            );
+        } else {
+            sql.push_str(
+                "CREATE TABLE book_words (
+                    book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                    lemma   TEXT NOT NULL COLLATE NOCASE,
+                    rank    INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (book_id, lemma)
+                 );",
+            );
+        }
+        sql.push_str("CREATE INDEX IF NOT EXISTS idx_book_words_book ON book_words(book_id);");
+
+        const CARDS_V6: &str = "
+            lemma          TEXT NOT NULL COLLATE NOCASE PRIMARY KEY,
+            book_id        INTEGER,
+            phase          TEXT NOT NULL DEFAULT 'new',
+            step           INTEGER NOT NULL DEFAULT 0,
+            ease           REAL NOT NULL DEFAULT 2.5,
+            interval_days  INTEGER NOT NULL DEFAULT 0,
+            reps           INTEGER NOT NULL DEFAULT 0,
+            lapses         INTEGER NOT NULL DEFAULT 0,
+            due_at         TEXT,
+            due_ts         INTEGER,
+            last_review_at TEXT";
+        if has_cards {
+            sql.push_str(&format!(
+                "CREATE TABLE cards_lemma ({CARDS_V6});
+                 INSERT OR IGNORE INTO cards_lemma
+                    (lemma, book_id, phase, step, ease, interval_days, reps, lapses,
+                     due_at, due_ts, last_review_at)
+                    SELECT w.lemma, c.book_id, c.phase, c.step, c.ease, c.interval_days,
+                           c.reps, c.lapses, c.due_at, c.due_ts, c.last_review_at
+                    FROM cards c JOIN dict.words w ON w.id = c.word_id;
+                 DROP TABLE cards;
+                 ALTER TABLE cards_lemma RENAME TO cards;"
+            ));
+        } else {
+            sql.push_str(&format!("CREATE TABLE cards ({CARDS_V6});"));
+        }
+        sql.push_str("CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(due_ts);");
+
+        const REVIEWS_V6: &str = "
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            lemma           TEXT NOT NULL COLLATE NOCASE,
+            at              TEXT NOT NULL,
+            day             TEXT NOT NULL,
+            rating          TEXT NOT NULL,
+            phase_after     TEXT NOT NULL,
+            interval_after  INTEGER NOT NULL DEFAULT 0,
+            is_new          INTEGER NOT NULL DEFAULT 0";
+        if has_reviews {
+            sql.push_str(&format!(
+                "CREATE TABLE reviews_lemma ({REVIEWS_V6});
+                 INSERT INTO reviews_lemma
+                    (id, lemma, at, day, rating, phase_after, interval_after, is_new)
+                    SELECT r.id, w.lemma, r.at, r.day, r.rating, r.phase_after,
+                           r.interval_after, r.is_new
+                    FROM reviews r JOIN dict.words w ON w.id = r.word_id;
+                 DROP TABLE reviews;
+                 ALTER TABLE reviews_lemma RENAME TO reviews;"
+            ));
+        } else {
+            sql.push_str(&format!("CREATE TABLE reviews ({REVIEWS_V6});"));
+        }
+        sql.push_str(
+            "CREATE INDEX IF NOT EXISTS idx_reviews_day ON reviews(day);
+             CREATE INDEX IF NOT EXISTS idx_reviews_lemma ON reviews(lemma);
+             PRAGMA user_version = 6;",
+        );
+
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(&sql)?;
+        tx.commit()?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
         Ok(())
     }
 
@@ -437,7 +593,7 @@ impl SqliteStore {
                 format!("{pos} {translation}")
             };
 
-            let (id, inserted) = upsert_word_tx(
+            let (_, inserted) = upsert_word_tx(
                 &tx,
                 lemma,
                 phonetic.as_deref(),
@@ -478,8 +634,8 @@ impl SqliteStore {
                     };
                     let rank = ranks.entry(slug).or_insert(0);
                     tx.execute(
-                        "INSERT OR IGNORE INTO book_words(book_id, word_id, rank) VALUES (?1, ?2, ?3)",
-                        params![book_id, id, *rank],
+                        "INSERT OR IGNORE INTO book_words(book_id, lemma, rank) VALUES (?1, ?2, ?3)",
+                        params![book_id, lemma, *rank],
                     )?;
                     *rank += 1;
 
@@ -491,6 +647,86 @@ impl SqliteStore {
             }
         }
         tx.commit()?;
+        Ok(report)
+    }
+
+    /// `quietly doctor`：核对词书、卡片、复习流水引用的词条还在不在词典里。
+    ///
+    /// 引用以 `lemma` 为准（v6 起），换词典不会错位；只有词典里根本没有这个词时
+    /// 才算悬空。`fix` 为真时顺手清掉这些行——但词典为空时不动，否则一次误操作
+    /// 就能把全部进度删光。
+    pub fn doctor(&self, fix: bool) -> Result<DoctorReport> {
+        let mut report = DoctorReport::default();
+        report.words = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM dict.words", [], |row| row.get(0))?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT b.slug, COUNT(bw.lemma)
+             FROM books b LEFT JOIN book_words bw ON bw.book_id = b.id
+             GROUP BY b.id ORDER BY b.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        for row in rows {
+            let (slug, total) = row?;
+            if total == 0 {
+                report.empty_decks.push(slug.clone());
+            }
+            report.decks.push((slug, total));
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT b.slug, bw.lemma
+             FROM book_words bw JOIN books b ON b.id = bw.book_id
+             WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = bw.lemma)
+             ORDER BY b.id, bw.rank",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            report.missing_in_decks.push(row?);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT lemma FROM cards
+             WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = cards.lemma)
+             ORDER BY lemma",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            report.missing_cards.push(row?);
+        }
+
+        report.missing_reviews = self.conn.query_row(
+            "SELECT COUNT(*) FROM reviews
+             WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = reviews.lemma)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+
+        if fix && report.words > 0 {
+            let tx = self.conn.unchecked_transaction()?;
+            let decks = tx.execute(
+                "DELETE FROM book_words
+                 WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = book_words.lemma)",
+                [],
+            )?;
+            let cards = tx.execute(
+                "DELETE FROM cards
+                 WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = cards.lemma)",
+                [],
+            )?;
+            let reviews = tx.execute(
+                "DELETE FROM reviews
+                 WHERE NOT EXISTS (SELECT 1 FROM dict.words w WHERE w.lemma = reviews.lemma)",
+                [],
+            )?;
+            tx.commit()?;
+            report.fixed = (decks + cards + reviews) as u64;
+        }
         Ok(report)
     }
 }
@@ -735,13 +971,13 @@ impl Store for SqliteStore {
             |row| row.get(0),
         )?;
         let learned: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM book_words bw JOIN cards c ON c.word_id = bw.word_id
+            "SELECT COUNT(*) FROM book_words bw JOIN cards c ON c.lemma = bw.lemma
              WHERE bw.book_id = ?1",
             [book_id],
             |row| row.get(0),
         )?;
         let due: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM book_words bw JOIN cards c ON c.word_id = bw.word_id
+            "SELECT COUNT(*) FROM book_words bw JOIN cards c ON c.lemma = bw.lemma
              WHERE bw.book_id = ?1 AND c.due_ts IS NOT NULL AND c.due_ts <= ?2",
             params![book_id, Utc::now().timestamp()],
             |row| row.get(0),
@@ -758,8 +994,8 @@ impl Store for SqliteStore {
             "SELECT {WORD_COLS},
                     c.phase, c.step, c.ease, c.interval_days, c.reps, c.lapses, c.due_at, c.last_review_at
              FROM cards c
-             JOIN dict.words w ON w.id = c.word_id
-             JOIN book_words bw ON bw.word_id = w.id AND bw.book_id = ?1
+             JOIN dict.words w ON w.lemma = c.lemma
+             JOIN book_words bw ON bw.lemma = c.lemma AND bw.book_id = ?1
              WHERE c.due_ts IS NOT NULL AND c.due_ts <= ?2
              ORDER BY c.due_ts ASC
              LIMIT ?3"
@@ -781,10 +1017,10 @@ impl Store for SqliteStore {
         let sql = format!(
             "SELECT {WORD_COLS}
              FROM book_words bw
-             JOIN dict.words w ON w.id = bw.word_id
-             LEFT JOIN cards c ON c.word_id = w.id
-             WHERE bw.book_id = ?1 AND c.word_id IS NULL
-             ORDER BY bw.rank ASC, w.id ASC
+             JOIN dict.words w ON w.lemma = bw.lemma
+             LEFT JOIN cards c ON c.lemma = bw.lemma
+             WHERE bw.book_id = ?1 AND c.lemma IS NULL
+             ORDER BY bw.rank ASC
              LIMIT ?2"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -794,7 +1030,7 @@ impl Store for SqliteStore {
 
     fn record_review(
         &mut self,
-        word_id: i64,
+        lemma: &str,
         book_id: i64,
         _before: Option<&SrsCard>,
         after: &SrsCard,
@@ -804,9 +1040,9 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO cards(word_id, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
+            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(word_id) DO UPDATE SET
+             ON CONFLICT(lemma) DO UPDATE SET
                 book_id = excluded.book_id,
                 phase = excluded.phase,
                 step = excluded.step,
@@ -818,7 +1054,7 @@ impl Store for SqliteStore {
                 due_ts = excluded.due_ts,
                 last_review_at = excluded.last_review_at",
             params![
-                word_id,
+                lemma,
                 book_id,
                 after.phase.as_str(),
                 after.step as i64,
@@ -832,10 +1068,10 @@ impl Store for SqliteStore {
             ],
         )?;
         tx.execute(
-            "INSERT INTO reviews(word_id, at, day, rating, phase_after, interval_after, is_new)
+            "INSERT INTO reviews(lemma, at, day, rating, phase_after, interval_after, is_new)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                word_id,
+                lemma,
                 now.to_rfc3339(),
                 time::format_day(time::local_day(now)),
                 rating.as_str(),
@@ -850,7 +1086,7 @@ impl Store for SqliteStore {
 
     fn amend_review(
         &mut self,
-        word_id: i64,
+        lemma: &str,
         book_id: i64,
         after: &SrsCard,
         rating: Rating,
@@ -859,9 +1095,9 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO cards(word_id, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
+            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(word_id) DO UPDATE SET
+             ON CONFLICT(lemma) DO UPDATE SET
                 book_id = excluded.book_id,
                 phase = excluded.phase,
                 step = excluded.step,
@@ -873,7 +1109,7 @@ impl Store for SqliteStore {
                 due_ts = excluded.due_ts,
                 last_review_at = excluded.last_review_at",
             params![
-                word_id,
+                lemma,
                 book_id,
                 after.phase.as_str(),
                 after.step as i64,
@@ -889,8 +1125,8 @@ impl Store for SqliteStore {
 
         let latest: Option<i64> = tx
             .query_row(
-                "SELECT id FROM reviews WHERE word_id = ?1 ORDER BY id DESC LIMIT 1",
-                [word_id],
+                "SELECT id FROM reviews WHERE lemma = ?1 ORDER BY id DESC LIMIT 1",
+                [lemma],
                 |row| row.get(0),
             )
             .optional()?;
@@ -913,10 +1149,10 @@ impl Store for SqliteStore {
             }
             None => {
                 tx.execute(
-                    "INSERT INTO reviews(word_id, at, day, rating, phase_after, interval_after, is_new)
+                    "INSERT INTO reviews(lemma, at, day, rating, phase_after, interval_after, is_new)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
-                        word_id,
+                        lemma,
                         now.to_rfc3339(),
                         time::format_day(time::local_day(now)),
                         rating.as_str(),
@@ -1219,21 +1455,21 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn postpone(&mut self, word_id: i64, until: DateTime<Utc>) -> Result<()> {
+    fn postpone(&mut self, lemma: &str, until: DateTime<Utc>) -> Result<()> {
         self.conn.execute(
-            "UPDATE cards SET due_at = ?1, due_ts = ?2 WHERE word_id = ?3",
-            params![until.to_rfc3339(), until.timestamp(), word_id],
+            "UPDATE cards SET due_at = ?1, due_ts = ?2 WHERE lemma = ?3",
+            params![until.to_rfc3339(), until.timestamp(), lemma],
         )?;
         Ok(())
     }
 
-    fn restore_card(&mut self, word_id: i64, card: Option<&SrsCard>) -> Result<()> {
+    fn restore_card(&mut self, lemma: &str, card: Option<&SrsCard>) -> Result<()> {
         match card {
             Some(card) => {
                 self.conn.execute(
-                    "INSERT INTO cards(word_id, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
-                     VALUES (?1, (SELECT book_id FROM cards WHERE word_id = ?1), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT(word_id) DO UPDATE SET
+                    "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
+                     VALUES (?1, (SELECT book_id FROM cards WHERE lemma = ?1), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(lemma) DO UPDATE SET
                         phase = excluded.phase,
                         step = excluded.step,
                         ease = excluded.ease,
@@ -1244,7 +1480,7 @@ impl Store for SqliteStore {
                         due_ts = excluded.due_ts,
                         last_review_at = excluded.last_review_at",
                     params![
-                        word_id,
+                        lemma,
                         card.phase.as_str(),
                         card.step as i64,
                         card.ease,
@@ -1259,18 +1495,18 @@ impl Store for SqliteStore {
             }
             None => {
                 self.conn
-                    .execute("DELETE FROM cards WHERE word_id = ?1", [word_id])?;
+                    .execute("DELETE FROM cards WHERE lemma = ?1", [lemma])?;
             }
         }
         Ok(())
     }
 
-    fn drop_last_review(&mut self, word_id: i64) -> Result<()> {
+    fn drop_last_review(&mut self, lemma: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM reviews WHERE id = (
-                SELECT id FROM reviews WHERE word_id = ?1 ORDER BY id DESC LIMIT 1
+                SELECT id FROM reviews WHERE lemma = ?1 ORDER BY id DESC LIMIT 1
              )",
-            [word_id],
+            [lemma],
         )?;
         Ok(())
     }
@@ -1280,9 +1516,11 @@ impl Store for SqliteStore {
         let roots = serde_json::to_string(&word.roots)?;
         let examples = serde_json::to_string(&word.examples)?;
         let tags = serde_json::to_string(&word.tags)?;
-        let (id, _) = upsert_word_tx(
+        let lemma = word.lemma.trim();
+        // 词条必须在词典库里有一份，否则学习时 JOIN 不到它。
+        upsert_word_tx(
             &tx,
-            word.lemma.trim(),
+            lemma,
             word.phonetic.as_deref(),
             word.translation.trim(),
             word.definition.as_deref(),
@@ -1293,8 +1531,8 @@ impl Store for SqliteStore {
         )?;
         let rank = max_rank_tx(&tx, book_id)?;
         let changed = tx.execute(
-            "INSERT OR IGNORE INTO book_words(book_id, word_id, rank) VALUES (?1, ?2, ?3)",
-            params![book_id, id, rank],
+            "INSERT OR IGNORE INTO book_words(book_id, lemma, rank) VALUES (?1, ?2, ?3)",
+            params![book_id, lemma, rank],
         )?;
         tx.commit()?;
         Ok(changed > 0)
@@ -1326,9 +1564,9 @@ impl Store for SqliteStore {
     }
 
     fn deck_lemmas(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT lower(w.lemma) FROM book_words bw JOIN dict.words w ON w.id = bw.word_id",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT lower(lemma) FROM book_words")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1431,7 +1669,7 @@ impl Store for SqliteStore {
         let key = time::format_day(time::today());
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM reviews r
-             JOIN book_words bw ON bw.word_id = r.word_id AND bw.book_id = ?1
+             JOIN book_words bw ON bw.lemma = r.lemma AND bw.book_id = ?1
              WHERE r.day = ?2 AND r.is_new = 1",
             params![book_id, key],
             |row| row.get(0),
@@ -1502,7 +1740,7 @@ impl Store for SqliteStore {
             let roots = serde_json::to_string(&word.roots)?;
             let examples = serde_json::to_string(&word.examples)?;
             let tags = serde_json::to_string(&word.tags)?;
-            let (id, inserted) = upsert_word_tx(
+            let (_, inserted) = upsert_word_tx(
                 &tx,
                 lemma,
                 word.phonetic.as_deref(),
@@ -1519,8 +1757,8 @@ impl Store for SqliteStore {
                 report.updated += 1;
             }
             tx.execute(
-                "INSERT OR IGNORE INTO book_words(book_id, word_id, rank) VALUES (?1, ?2, ?3)",
-                params![book_id, id, rank],
+                "INSERT OR IGNORE INTO book_words(book_id, lemma, rank) VALUES (?1, ?2, ?3)",
+                params![book_id, lemma, rank],
             )?;
             rank += 1;
         }
@@ -1926,7 +2164,7 @@ mod tests {
         let word = &new_words[0];
         let card = srs::review(None, Rating::Good, Utc::now());
         store
-            .record_review(word.id, book.id, None, &card, Rating::Good, Utc::now(), true)
+            .record_review(&word.lemma, book.id, None, &card, Rating::Good, Utc::now(), true)
             .unwrap();
 
         assert!(store.new_cards(book.id, 10).unwrap().is_empty());
@@ -1961,26 +2199,25 @@ mod tests {
         assert_eq!(word.examples.len(), 2);
     }
 
-    fn graded_store() -> (SqliteStore, tempfile::TempDir, i64, i64) {
+    fn graded_store() -> (SqliteStore, tempfile::TempDir, i64) {
         let (mut store, dir) = temp_store();
         store.import_plan(&sample_plan()).unwrap();
         let book = store.current_book().unwrap().unwrap();
-        let word = store.word("inspect").unwrap().unwrap();
         let card = srs::review(None, Rating::Good, Utc::now());
         store
-            .record_review(word.id, book.id, None, &card, Rating::Good, Utc::now(), true)
+            .record_review("inspect", book.id, None, &card, Rating::Good, Utc::now(), true)
             .unwrap();
-        (store, dir, book.id, word.id)
+        (store, dir, book.id)
     }
 
     #[test]
     fn drop_last_review_and_restore_card_undo_a_grade() {
-        let (mut store, _dir, book_id, word_id) = graded_store();
+        let (mut store, _dir, book_id) = graded_store();
         assert_eq!(store.daily(time::today()).unwrap().reviews, 1);
         assert_eq!(store.progress(book_id).unwrap().learned, 1);
 
-        store.drop_last_review(word_id).unwrap();
-        store.restore_card(word_id, None).unwrap();
+        store.drop_last_review("inspect").unwrap();
+        store.restore_card("inspect", None).unwrap();
 
         assert_eq!(store.daily(time::today()).unwrap().reviews, 0);
         assert_eq!(store.progress(book_id).unwrap().learned, 0);
@@ -1990,9 +2227,9 @@ mod tests {
 
     #[test]
     fn restore_card_reinstates_the_previous_state() {
-        let (mut store, _dir, book_id, word_id) = graded_store();
+        let (mut store, _dir, book_id) = graded_store();
         let previous = SrsCard::new(Utc::now());
-        store.restore_card(word_id, Some(&previous)).unwrap();
+        store.restore_card("inspect", Some(&previous)).unwrap();
         let cards = store.due_cards(book_id, Utc::now(), 10).unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].card.as_ref().unwrap().phase, Phase::New);
@@ -2000,9 +2237,9 @@ mod tests {
 
     #[test]
     fn postpone_hides_a_card_from_today() {
-        let (mut store, _dir, book_id, word_id) = graded_store();
+        let (mut store, _dir, book_id) = graded_store();
         let tomorrow = time::day_start(time::today() + ChronoDuration::days(1));
-        store.postpone(word_id, tomorrow).unwrap();
+        store.postpone("inspect", tomorrow).unwrap();
         assert!(store.due_cards(book_id, Utc::now(), 10).unwrap().is_empty());
         // But it is due tomorrow.
         let later = tomorrow + ChronoDuration::hours(1);
@@ -2178,5 +2415,179 @@ mod tests {
             )
             .unwrap();
         assert_eq!(core_has, 0, "the legacy table is dropped after the move");
+    }
+
+    #[test]
+    fn v5_word_ids_are_rekeyed_to_lemmas_on_open() {
+        // v5 的布局：学习表还按 `words.id` 引用，词典已经在独立文件里。
+        let dir = tempfile::tempdir().unwrap();
+        let core = dir.path().join("v5.db");
+        let words = dir.path().join("v5-words.db");
+        {
+            let conn = Connection::open(&words).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE words (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lemma TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    phonetic TEXT, translation TEXT NOT NULL DEFAULT '',
+                    definition TEXT, roots TEXT NOT NULL DEFAULT '[]',
+                    examples TEXT NOT NULL DEFAULT '[]',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT '',
+                    collocations TEXT NOT NULL DEFAULT '[]',
+                    glosses TEXT NOT NULL DEFAULT '[]');
+                 INSERT INTO words(id, lemma, translation) VALUES (7, 'inspect', 'v. 检查');",
+            )
+            .unwrap();
+        }
+        {
+            let conn = Connection::open(&core).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(
+                "INSERT INTO books(slug, name) VALUES ('v5', 'V5 Deck');
+                 INSERT INTO book_words(book_id, word_id, rank) VALUES (1, 7, 0);
+                 INSERT INTO cards(word_id, book_id, phase, due_at, due_ts)
+                    VALUES (7, 1, 'review', '2026-01-01T00:00:00Z', 0);
+                 INSERT INTO reviews(word_id, at, day, rating, phase_after)
+                    VALUES (7, '2026-01-01T00:00:00Z', '2026-01-01', 'good', 'review');
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open_at(&core).unwrap();
+        let columns: Vec<String> = store
+            .conn
+            .prepare("PRAGMA main.table_info(book_words)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            columns.iter().any(|col| col == "lemma") && !columns.iter().any(|col| col == "word_id"),
+            "book_words must be keyed by lemma: {columns:?}"
+        );
+
+        let book = store.book_by_slug("v5").unwrap().unwrap();
+        assert_eq!(store.progress(book.id).unwrap().total, 1);
+        assert_eq!(store.progress(book.id).unwrap().learned, 1);
+        assert!(store.new_cards(book.id, 10).unwrap().is_empty());
+        assert_eq!(store.deck_lemmas().unwrap(), vec!["inspect".to_string()]);
+        let reviews: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reviews WHERE lemma = 'inspect'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(reviews, 1, "review history follows the word");
+    }
+
+    /// 同样的词、同样的词书，但词典重排了 id：词书和进度必须还指向原来的词。
+    #[test]
+    fn decks_and_cards_survive_a_dictionary_swap() {
+        let (mut store, dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+        let book = store.current_book().unwrap().unwrap();
+        let card = srs::review(None, Rating::Good, Utc::now());
+        store
+            .record_review("inspect", book.id, None, &card, Rating::Good, Utc::now(), true)
+            .unwrap();
+
+        // 换一份词典：先插一个别的词，`inspect` 的 id 从 1 变成 2。
+        let words_path = dir.path().join("test-words.db");
+        store.conn.execute_batch("DETACH DATABASE dict").unwrap();
+        fs::remove_file(&words_path).unwrap();
+        store
+            .conn
+            .execute("ATTACH DATABASE ?1 AS dict", [words_path.to_str().unwrap()])
+            .unwrap();
+        store.conn.execute_batch(SCHEMA_WORDS).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE dict.words ADD COLUMN collocations TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE dict.words ADD COLUMN glosses TEXT NOT NULL DEFAULT '[]';
+                 INSERT INTO dict.words(lemma, translation) VALUES ('zzz', 'x'), ('inspect', 'v. 检查');",
+            )
+            .unwrap();
+        assert_eq!(store.word("inspect").unwrap().unwrap().id, 2, "ids shifted");
+
+        // lemma 是跨库键，所以词书、卡片、进度都不受影响。
+        assert_eq!(store.progress(book.id).unwrap().learned, 1);
+        assert!(store.new_cards(book.id, 10).unwrap().is_empty());
+        let later = Utc::now() + ChronoDuration::days(2);
+        let due = store.due_cards(book.id, later, 10).unwrap();
+        assert_eq!(due.len(), 1, "the card still rides on `inspect`");
+        assert_eq!(due[0].word.lemma, "inspect");
+        assert_eq!(store.deck_lemmas().unwrap(), vec!["inspect".to_string()]);
+        assert!(store.doctor(false).unwrap().is_clean());
+    }
+
+    #[test]
+    fn doctor_reports_and_prunes_dangling_lemma_refs() {
+        let (mut store, _dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+        let book = store.current_book().unwrap().unwrap();
+
+        // 词典里没有的词混进词书、卡片和流水。
+        store
+            .conn
+            .execute(
+                "INSERT INTO book_words(book_id, lemma, rank) VALUES (?1, 'ghost', 99)",
+                [book.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO cards(lemma, book_id, phase) VALUES ('ghost', ?1, 'new')",
+                [book.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO reviews(lemma, at, day, rating, phase_after)
+                 VALUES ('ghost', '2026-01-01T00:00:00Z', '2026-01-01', 'good', 'review')",
+                [],
+            )
+            .unwrap();
+
+        let report = store.doctor(false).unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(
+            report.missing_in_decks,
+            vec![("unit".to_string(), "ghost".to_string())]
+        );
+        assert_eq!(report.missing_cards, vec!["ghost".to_string()]);
+        assert_eq!(report.missing_reviews, 1);
+        assert_eq!(report.orphans(), 3);
+        assert_eq!(report.fixed, 0);
+        assert_eq!(store.progress(book.id).unwrap().total, 2, "no --fix, no delete");
+
+        let report = store.doctor(true).unwrap();
+        assert_eq!(report.fixed, 3);
+        let after = store.doctor(false).unwrap();
+        assert!(after.is_clean());
+        assert_eq!(after.decks, vec![("unit".to_string(), 1)]);
+        assert_eq!(after.words, 1);
+    }
+
+    #[test]
+    fn doctor_never_prunes_against_an_empty_dictionary() {
+        // 词典库丢了的时候 `--fix` 会把整个词书删光，这比留下悬空引用更糟。
+        let (mut store, _dir) = temp_store();
+        store.import_plan(&sample_plan()).unwrap();
+        let book = store.current_book().unwrap().unwrap();
+        store
+            .conn
+            .execute_batch("DELETE FROM dict.words")
+            .unwrap();
+
+        let report = store.doctor(true).unwrap();
+        assert_eq!(report.fixed, 0);
+        assert_eq!(store.progress(book.id).unwrap().total, 1, "deck untouched");
     }
 }

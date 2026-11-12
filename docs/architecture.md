@@ -83,10 +83,10 @@ sequenceDiagram
 
 ```sql
 books(id, slug UNIQUE, name, description, builtin)
-book_words(book_id, word_id, rank)          -- 词书内容与顺序
-cards(word_id PK, book_id, phase, step, ease, interval_days,
+book_words(book_id, lemma, rank)            -- 词书内容与顺序
+cards(lemma PK, book_id, phase, step, ease, interval_days,
       reps, lapses, due_at, last_review_at) -- 每词一张卡
-reviews(id, word_id, at, day, rating, phase_after, interval_after, is_new)
+reviews(id, lemma, at, day, rating, phase_after, interval_after, is_new)
 sessions(id, day, started_at, ended_at, seconds, new_count, review_count)
 settings(key, value)
 texts(id, title UNIQUE, source, license, body, translation, created_at)
@@ -107,10 +107,14 @@ words(id, lemma UNIQUE NOCASE, phonetic, translation, definition,
 
 - `roots` / `examples` / `tags` / `collocations` / `glosses` 用 JSON 存，避免过早拆表；
   解析失败时静默降级为空。
-- `cards` 以 `word_id` 为主键：一个词只有一份记忆状态，多个词书共享。
+- `cards` 以 `lemma` 为主键：一个词只有一份记忆状态，多个词书共享。
 - `reviews` 是流水，`daily` / `streak` / `due` 全部从它和 `cards` 派生，没有冗余计数器。
-- **跨库外键在 SQLite 里不生效**，所以 `book_words` / `cards` 只存 `word_id` 数值。
-  词典库重建时只要沿用同一份导入顺序，id 就保持不变；`quietly db` 用于核对两个文件的体积。
+- **跨库外键在 SQLite 里不生效**，所以 `book_words` / `cards` / `reviews` 用 `lemma`
+  而不是 `words.id` 做跨库键。词典库的 `id` 是 AUTOINCREMENT，换一份词典或换导入顺序
+  就会变；存 id 时词书会静默指向别的词（原来的 `alpha` 变成 `gamma`）。`lemma` 在两个
+  库里都唯一，换词典后依然指向同一个词。
+- 引用是否完整由 `quietly doctor` 核对；`--fix` 清掉词典里已经不存在的词。词典库是空的
+  时 `--fix` 不会动手，免得一次误操作把全部进度删光。
 
 ## 记忆曲线
 

@@ -32,7 +32,8 @@ const MAX_UNDO: usize = 50;
 
 /// One reversible grading action.
 struct UndoEntry {
-    word_id: i64,
+    /// 卡片按 lemma 归属（`cards` 表的主键），不是词典里的 `words.id`。
+    lemma: String,
     card: StudyCard,
     before: Option<SrsCard>,
     /// Message index of the card block, so undo can jump back to it.
@@ -516,7 +517,10 @@ impl App {
         if let Some(word) = words.get(row_index) {
             let word = word.clone();
             self.push(Message::card(
-                CardState::new(word, "lookup").revealed().with_glosses(),
+                CardState::new(word, "lookup")
+                    .revealed()
+                    .with_glosses()
+                    .without_ratings(),
             ));
         }
     }
@@ -670,7 +674,10 @@ impl App {
         };
         let _ = index;
         self.push(Message::card(
-            CardState::new(word, "lookup").revealed().with_glosses(),
+            CardState::new(word, "lookup")
+                .revealed()
+                .with_glosses()
+                .without_ratings(),
         ));
         true
     }
@@ -804,7 +811,6 @@ impl App {
             };
             view = view.kv(label.clone(), format!("{size}  {path}"));
         }
-        view = view.muted("study 存词书/卡片/阅读，可进 git；words 是词典，可重建");
         self.push(Message::tool(view));
         Ok(())
     }
@@ -936,7 +942,7 @@ impl App {
             return Ok(());
         };
         let until = time::day_start(time::today()) + chrono::Duration::days(1);
-        self.store.postpone(card.word.id, until)?;
+        self.store.postpone(&card.word.lemma, until)?;
         // Take it out of the session the same way a skip does, so the `2/12` badge
         // still lands on `12/12` at the end. A new word has no `cards` row yet, so
         // the UPDATE above changed nothing — dropping it from the queue is the only
@@ -957,8 +963,8 @@ impl App {
             self.note("nothing to undo");
             return Ok(());
         };
-        self.store.drop_last_review(entry.word_id)?;
-        self.store.restore_card(entry.word_id, entry.before.as_ref())?;
+        self.store.drop_last_review(&entry.lemma)?;
+        self.store.restore_card(&entry.lemma, entry.before.as_ref())?;
 
         if let Some(session) = self.session.as_mut() {
             if entry.was_new {
@@ -972,7 +978,7 @@ impl App {
                 let position = session
                     .queue
                     .iter()
-                    .position(|card| card.word.id == entry.word_id);
+                    .position(|card| card.word.lemma.eq_ignore_ascii_case(&entry.lemma));
                 if let Some(position) = position {
                     session.queue.remove(position);
                     session.review_total = session.review_total.saturating_sub(1);
@@ -984,7 +990,7 @@ impl App {
             let current_is_other = session
                 .current
                 .as_ref()
-                .map(|card| card.word.id != entry.word_id)
+                .map(|card| !card.word.lemma.eq_ignore_ascii_case(&entry.lemma))
                 .unwrap_or(false);
             if current_is_other {
                 if let Some(current) = session.current.take() {
@@ -1049,7 +1055,10 @@ impl App {
         if !text.contains(char::is_whitespace) {
             if let Some(word) = self.store.word(text)? {
                 self.push(Message::card(
-                    CardState::new(word, "lookup").revealed().with_glosses(),
+                    CardState::new(word, "lookup")
+                        .revealed()
+                        .with_glosses()
+                        .without_ratings(),
                 ));
                 return Ok(());
             }
@@ -1066,7 +1075,8 @@ impl App {
                 self.push(Message::card(
                     CardState::new(hits[0].clone(), "lookup")
                         .revealed()
-                        .with_glosses(),
+                        .with_glosses()
+                        .without_ratings(),
                 ));
                 Ok(())
             }
@@ -1480,7 +1490,7 @@ impl App {
         let after = srs::review(card.card.as_ref(), rating, now);
         if first_time {
             self.store.record_review(
-                card.word.id,
+                &card.word.lemma,
                 book_id,
                 card.card.as_ref(),
                 &after,
@@ -1489,13 +1499,19 @@ impl App {
                 card.is_new,
             )?;
         } else {
-            self.store
-                .amend_review(card.word.id, book_id, &after, rating, now, card.is_new)?;
+            self.store.amend_review(
+                &card.word.lemma,
+                book_id,
+                &after,
+                rating,
+                now,
+                card.is_new,
+            )?;
         }
 
         if first_time {
             self.undo.push(UndoEntry {
-                word_id: card.word.id,
+                lemma: card.word.lemma.clone(),
                 card: card.clone(),
                 before: card.card.clone(),
                 message: card_message,

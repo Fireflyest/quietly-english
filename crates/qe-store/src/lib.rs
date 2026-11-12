@@ -8,5 +8,5 @@ pub mod merge;
 pub mod stardict;
 pub mod tatoeba;
 
-pub use db::SqliteStore;
+pub use db::{DoctorReport, SqliteStore};
 pub use etymology::EtymologyReport;

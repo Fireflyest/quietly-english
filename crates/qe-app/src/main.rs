@@ -410,6 +410,55 @@ fn run() -> Result<()> {
             println!("database: {}", store.path().display());
             Ok(())
         }
+        Some("doctor") => {
+            // 引用以 lemma 为准，所以换词典不会错位；只有词典里没有这个词才算悬空。
+            let fix = rest.iter().any(|arg| arg == "--fix" || arg == "-f");
+            let report = store.doctor(fix)?;
+            println!("words     {} 条词条", report.words);
+            println!("decks     {}", report.decks.len());
+            for (slug, total) in &report.decks {
+                println!("  {:<10} {:>6}", slug, total);
+            }
+            if report.is_clean() {
+                println!("\n引用完整：词书、卡片、复习流水都能在词典里找到对应词条。");
+            } else {
+                println!("\n{} 条悬空引用：", report.orphans());
+                if !report.missing_in_decks.is_empty() {
+                    println!(
+                        "  词书缺词 {} 条{}",
+                        report.missing_in_decks.len(),
+                        if report.missing_in_decks.len() > 10 {
+                            "（只列前 10）"
+                        } else {
+                            ""
+                        }
+                    );
+                    for (slug, lemma) in report.missing_in_decks.iter().take(10) {
+                        println!("    {slug:<10} {lemma}");
+                    }
+                }
+                if !report.missing_cards.is_empty() {
+                    println!("  卡片缺词 {}: {}", report.missing_cards.len(),
+                        report.missing_cards.iter().take(10).cloned().collect::<Vec<_>>().join(", "));
+                }
+                if report.missing_reviews > 0 {
+                    println!("  复习流水缺词 {} 条", report.missing_reviews);
+                }
+                if fix {
+                    if report.fixed > 0 {
+                        println!("\n已清理 {} 条悬空引用。", report.fixed);
+                    }
+                } else if report.words == 0 {
+                    println!("\n词典库是空的，先导入词典再考虑 --fix。");
+                } else {
+                    println!("\n用 quietly doctor --fix 清掉这些行。");
+                }
+            }
+            if !report.empty_decks.is_empty() {
+                println!("空词书: {}", report.empty_decks.join(", "));
+            }
+            Ok(())
+        }
         Some(other) => bail!("未知子命令 {other}（用 --help 查看用法）"),
     }
 }
@@ -430,6 +479,7 @@ USAGE:
     quietly read [file]           导入一篇文本，或不带参数列出已导入的
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
+    quietly doctor [--fix]        核对词书/卡片引用的词条是否还在词典里
     quietly stats                 今日统计
     quietly db                    两个数据库文件的位置与体积
     quietly where                 打印数据库路径

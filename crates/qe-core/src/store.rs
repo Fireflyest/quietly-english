@@ -24,9 +24,11 @@ pub trait Store {
     // ---- 学习队列 ----
     fn due_cards(&self, book_id: i64, now: DateTime<Utc>, limit: usize) -> Result<Vec<StudyCard>>;
     fn new_cards(&self, book_id: i64, limit: usize) -> Result<Vec<Word>>;
+    /// 记一次评分。`lemma` 是跨库键：词书与卡片存它而不是 `words.id`，
+    /// 这样换一份词典也不会把进度挂到别的词上。
     fn record_review(
         &mut self,
-        word_id: i64,
+        lemma: &str,
         book_id: i64,
         before: Option<&SrsCard>,
         after: &SrsCard,
@@ -38,7 +40,7 @@ pub trait Store {
     /// Counters must not be incremented again.
     fn amend_review(
         &mut self,
-        word_id: i64,
+        lemma: &str,
         book_id: i64,
         after: &SrsCard,
         rating: Rating,
@@ -49,11 +51,11 @@ pub trait Store {
 
     // ---- 卡片控制 ----
     /// 把一张卡推迟到之后（bury）。
-    fn postpone(&mut self, word_id: i64, until: DateTime<Utc>) -> Result<()>;
+    fn postpone(&mut self, lemma: &str, until: DateTime<Utc>) -> Result<()>;
     /// 恢复到之前的记忆状态；`None` 表示删除卡片（撤销新学）。
-    fn restore_card(&mut self, word_id: i64, card: Option<&SrsCard>) -> Result<()>;
+    fn restore_card(&mut self, lemma: &str, card: Option<&SrsCard>) -> Result<()>;
     /// 删除该词最新的一条评分流水。
-    fn drop_last_review(&mut self, word_id: i64) -> Result<()>;
+    fn drop_last_review(&mut self, lemma: &str) -> Result<()>;
     /// 把词条加入词书（已存在则忽略）。返回是否新增。
     fn add_to_book(&mut self, book_id: i64, word: &Word) -> Result<bool>;
 
