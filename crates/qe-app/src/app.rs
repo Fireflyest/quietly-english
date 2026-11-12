@@ -43,6 +43,14 @@ struct UndoEntry {
     requeued: bool,
 }
 
+/// 一个待补全的参数值。
+struct Candidate {
+    /// 按 tab 之后填进输入行的文本。
+    value: String,
+    /// 面板右侧的说明：词书名称、`dir` 之类。
+    help: String,
+}
+
 pub struct App {
     pub(crate) store: Box<dyn Store>,
     book: Option<Book>,
@@ -144,9 +152,8 @@ impl App {
                 self.book.as_ref().map(|book| book.name.clone())
             };
             let meta = self.meta_line();
-            let ghost = command::ghost(&input);
-            let suggestions = build_suggestions(&input, self.suggestion_index);
-            let suggestions_more = hidden_suggestions(&input);
+            let ghost = command::ghost(&input).or_else(|| self.arg_ghost(&input));
+            let (suggestions, suggestions_more) = self.suggestions_for(&input);
             let mode = if self.session.is_some() {
                 ViewMode::Study
             } else {
@@ -272,7 +279,7 @@ impl App {
         // Any keypress cancels a pending "press esc again".
         let was_confirming = self.confirm_exit;
 
-        let suggestion_count = command::matches(&self.editor.text()).len().min(MAX_SUGGESTIONS);
+        let suggestion_count = self.suggestions_for(&self.editor.text()).0.len();
 
         // Global keys come first.
         match key.code {
@@ -548,24 +555,10 @@ impl App {
     fn tab_complete(&mut self) {
         let text = self.editor.text();
 
-        // Completing an argument: deck slugs for /book, paths for /import.
+        // Completing an argument: deck slugs for /book, titles and paths for
+        // /read and /quiz, files for /import.
         if let Some((name, partial)) = command::arg_completion_target(&text) {
-            let candidates = self.arg_candidates(name);
-            if let Some(done) = command::complete_arg(&candidates, partial) {
-                self.editor.set_text(&format!("{name} {done}"));
-                return;
-            }
-            if !candidates.is_empty() {
-                let rows = candidates
-                    .iter()
-                    .take(12)
-                    .map(|candidate| vec![candidate.clone()])
-                    .collect();
-                self.push(Message::table(
-                    TableView::new(vec!["candidates".into()], rows)
-                        .caption(format!("{name} · {} options", candidates.len())),
-                ));
-            }
+            self.complete_argument(name, partial);
             return;
         }
 
@@ -604,34 +597,130 @@ impl App {
         }
     }
 
-    /// Candidate values for a command argument.
-    fn arg_candidates(&self, _command: &str) -> Vec<String> {
-        // Deck slugs, then files in the working directory for imports.
-        let mut out: Vec<String> = self
+    /// Tab inside a command argument.
+    ///
+    /// Fills the highlighted candidate when the user moved the highlight, otherwise
+    /// the shared prefix, otherwise the first match — repeated tab therefore cycles
+    /// through `/book` decks. Commands with no candidate list only get a usage hint.
+    fn complete_argument(&mut self, name: &'static str, partial: &str) {
+        let candidates = self.arg_candidates(name, partial);
+        if candidates.is_empty() {
+            if let Some(usage) = command::usage(name) {
+                self.note(format!("usage: {usage}"));
+            }
+            return;
+        }
+
+        let values: Vec<String> = candidates.iter().map(|c| c.value.clone()).collect();
+        let hits = command::arg_hits(&values, partial);
+        if hits.is_empty() {
+            self.note(format!(
+                "no match for \"{}\" · {} options",
+                partial.trim(),
+                values.len()
+            ));
+            return;
+        }
+
+        let picked = if hits.len() == 1 {
+            hits[0].clone()
+        } else if self.suggestion_index > 0 {
+            hits[self.suggestion_index.min(hits.len() - 1)].clone()
+        } else {
+            match command::complete_arg(&values, partial) {
+                Some(prefix) if prefix.chars().count() > partial.chars().count() => {
+                    self.editor.set_text(&format!("{name} {prefix}"));
+                    return;
+                }
+                _ => hits[0].clone(),
+            }
+        };
+
+        self.editor.set_text(&format!("{name} {picked}"));
+        self.suggestion_index = (self.suggestion_index + 1) % hits.len().min(MAX_SUGGESTIONS);
+    }
+
+    /// 参数补全的候选。
+    ///
+    /// 每类参数只列它自己的东西：`/book` 是词书，`/import` 是当前目录的路径，
+    /// `/read` 是已导入的标题加路径。以前这里把所有命令都混成一个「词书 + 文件」
+    /// 的列表，所以在 `/search` 后面按 tab 会冒出文件名的提示。
+    fn arg_candidates(&self, command: &str, partial: &str) -> Vec<Candidate> {
+        match command::arg_kind(command) {
+            command::ArgKind::Deck => self.deck_candidates(),
+            command::ArgKind::Path => path_candidates(partial),
+            command::ArgKind::TextOrPath => {
+                let mut out = text_candidates(self);
+                out.extend(path_candidates(partial));
+                out
+            }
+            command::ArgKind::Choice(values) => values
+                .iter()
+                .map(|value| Candidate {
+                    value: (*value).to_string(),
+                    help: String::new(),
+                })
+                .collect(),
+            command::ArgKind::Number | command::ArgKind::Free => Vec::new(),
+        }
+    }
+
+    fn deck_candidates(&self) -> Vec<Candidate> {
+        let mut out: Vec<Candidate> = self
             .store
             .list_books()
             .unwrap_or_default()
             .into_iter()
-            .map(|book| book.slug)
+            .map(|book| Candidate {
+                value: book.slug,
+                help: book.name,
+            })
             .collect();
-        if let Ok(entries) = std::fs::read_dir(".") {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let path = entry.path();
-                let display = if path.is_dir() {
-                    format!("{name}/")
-                } else {
-                    name
-                };
-                out.push(display);
-            }
-        }
-        out.sort();
-        out.dedup();
+        out.sort_by(|a, b| a.value.cmp(&b.value));
         out
+    }
+
+    /// 提示行和补全面板：命令名，或命令的参数。
+    fn suggestions_for(&self, input: &str) -> (Vec<Suggestion>, usize) {
+        if let Some((name, partial)) = command::arg_completion_target(input) {
+            let all = self.arg_candidates(name, partial);
+            let values: Vec<String> = all.iter().map(|c| c.value.clone()).collect();
+            let hits = command::arg_hits(&values, partial);
+            let rows = hits
+                .iter()
+                .take(MAX_SUGGESTIONS)
+                .enumerate()
+                .map(|(index, value)| Suggestion {
+                    name: value.clone(),
+                    args: String::new(),
+                    help: all
+                        .iter()
+                        .find(|candidate| &candidate.value == value)
+                        .map(|candidate| candidate.help.clone())
+                        .unwrap_or_default(),
+                    selected: index == self.suggestion_index,
+                })
+                .collect();
+            return (rows, hits.len().saturating_sub(MAX_SUGGESTIONS));
+        }
+        (
+            build_suggestions(input, self.suggestion_index),
+            hidden_suggestions(input),
+        )
+    }
+
+    /// 灰字提示：参数只剩一种可能时，把没打出来的部分画出来。
+    fn arg_ghost(&self, input: &str) -> Option<String> {
+        let (name, partial) = command::arg_completion_target(input)?;
+        let candidates = self.arg_candidates(name, partial);
+        let values: Vec<String> = candidates.iter().map(|c| c.value.clone()).collect();
+        let hits = command::arg_hits(&values, partial);
+        if hits.len() != 1 {
+            return None;
+        }
+        let hit = &hits[0];
+        let typed = partial.chars().count();
+        (hit.chars().count() > typed).then(|| hit.chars().skip(typed).collect())
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -1747,6 +1836,47 @@ fn build_suggestions(input: &str, selected: usize) -> Vec<Suggestion> {
         .collect()
 }
 
+/// 当前目录（或 `partial` 指向的目录）里的条目，按路径前缀补全。
+fn path_candidates(partial: &str) -> Vec<Candidate> {
+    let (dir, _) = match partial.rfind(['/', '\\']) {
+        Some(index) => partial.split_at(index + 1),
+        None => ("", partial),
+    };
+    let base = if dir.is_empty() { "." } else { dir };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Candidate> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return None;
+            }
+            let is_dir = entry.path().is_dir();
+            Some(Candidate {
+                value: format!("{dir}{name}{}", if is_dir { "/" } else { "" }),
+                help: if is_dir { "dir".into() } else { String::new() },
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.value.cmp(&b.value));
+    out
+}
+
+/// 已导入文本的标题。只查标题，不读正文。
+fn text_candidates(app: &App) -> Vec<Candidate> {
+    app.store
+        .text_titles()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|title| Candidate {
+            value: title,
+            help: "text".into(),
+        })
+        .collect()
+}
+
 /// 命中但没显示出来的条数。
 fn hidden_suggestions(input: &str) -> usize {
     command::matches(input)
@@ -2055,6 +2185,108 @@ mod tests {
             .messages
             .iter()
             .any(|m| matches!(&m.body, Body::Tool(t) if t.name == "error")));
+    }
+
+    #[test]
+    fn tab_completes_a_deck_slug_and_cycles_the_rest() {
+        let Harness { mut app, _dir } = harness();
+        let mut second = qe_core::model::ImportPlan::new("cet6", "CET-6 核心词", "fixture");
+        second
+            .words
+            .push(qe_core::model::Word::new("serendipity", "n. 意外发现"));
+        app.store.import_plan(&second).unwrap();
+
+        // 唯一命中：`/book te` 补全成 `test`。
+        app.editor.set_text("/book te");
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/book test");
+
+        // 有歧义时先补公共前缀，补不动了就开始循环候选。
+        app.editor.set_text("/book c");
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/book cet6");
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/book cet6", "only one deck starts with `cet6`");
+    }
+
+    #[test]
+    fn tab_lists_the_candidates_for_an_ambiguous_argument() {
+        let Harness { mut app, _dir } = harness();
+        for slug in ["cet4", "cet6"] {
+            let mut plan = qe_core::model::ImportPlan::new(slug, slug.to_uppercase(), "fixture");
+            plan.words.push(qe_core::model::Word::new("alpha", "n. 甲"));
+            app.store.import_plan(&plan).unwrap();
+        }
+
+        let (rows, _) = app.suggestions_for("/book cet");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["cet4", "cet6"]);
+        assert_eq!(rows[0].help, "CET4", "the panel names the deck, not just the slug");
+
+        // 高亮移动之后 tab 填的是高亮那条，而不是第一个。
+        app.editor.set_text("/book cet");
+        app.suggestion_index = 1;
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/book cet6");
+    }
+
+    #[test]
+    fn the_argument_ghost_shows_the_unique_remainder() {
+        let Harness { app, _dir } = harness();
+        assert_eq!(app.arg_ghost("/book te").as_deref(), Some("st"));
+        assert_eq!(app.arg_ghost("/book zz"), None);
+        // 命令名本身由 command::ghost 负责，参数提示不抢。
+        assert_eq!(app.arg_ghost("/bo"), None);
+    }
+
+    #[test]
+    fn free_text_arguments_offer_no_candidates_but_a_usage_hint() {
+        let Harness { mut app, _dir } = harness();
+        // 以前这里会把词书和当前目录的文件名混进 `/search` 的提示里。
+        assert!(app.arg_candidates("/search", "ins").is_empty());
+        assert!(app.arg_candidates("/add", "").is_empty());
+
+        app.editor.set_text("/search ");
+        app.tab_complete();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(&m.body, Body::Text(t) if t.contains("usage: /search <query>"))),
+            "tab still explains the argument"
+        );
+    }
+
+    #[test]
+    fn import_completes_paths_in_subdirectories() {
+        let Harness { app, _dir } = harness();
+        let packs = _dir.path().join("packs").join("decks");
+        std::fs::create_dir_all(&packs).unwrap();
+        std::fs::write(packs.join("CET6_T.json"), "[]").unwrap();
+
+        // 补全按「最后一个分隔符之前」找目录，所以绝对路径也能用。
+        let root = _dir.path().to_string_lossy().replace('\\', "/");
+        let partial = format!("{root}/pack");
+        let candidates = app.arg_candidates("/import", &partial);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.value.ends_with("packs/")),
+            "打字到 `pack` 应该能把 `packs/` 补出来: {:?}",
+            candidates.iter().map(|c| &c.value).collect::<Vec<_>>()
+        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.help == "dir"));
+
+        let deeper = format!("{root}/packs/de");
+        let decks = app.arg_candidates("/import", &deeper);
+        assert!(
+            decks.iter().any(|candidate| candidate.value.ends_with("decks/")),
+            "二级目录也要往下走: {:?}",
+            decks.iter().map(|c| &c.value).collect::<Vec<_>>()
+        );
+        let file = app.arg_candidates("/import", &format!("{root}/packs/decks/CET"));
+        assert!(file.iter().any(|candidate| candidate.value.ends_with("CET6_T.json")));
     }
 
     #[test]

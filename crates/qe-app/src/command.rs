@@ -392,6 +392,72 @@ pub fn arg_completion_target(input: &str) -> Option<(&'static str, &str)> {
     Some((spec.name, partial))
 }
 
+/// 一个参数该用什么补全。
+///
+/// 命令表（[`SPECS`]）只说“这个命令收参数”，具体是词书、路径还是固定取值
+/// 由这里声明，补全和提示都按它决定候选来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    /// 词书 slug（`/book`）。
+    Deck,
+    /// 相对当前目录的文件或目录（`/import`）。
+    Path,
+    /// 文本标题或文件路径（`/read`、`/quiz`）。
+    TextOrPath,
+    /// 固定取值（`/mode`）。
+    Choice(&'static [&'static str]),
+    /// 纯数字（`/study`、`/limit`、`/goto`、`/take`）。
+    Number,
+    /// 没有候选，只能手输（`/search`、`/add`、`/phrase`、`/mark`、`/root`）。
+    Free,
+}
+
+/// 参数类型表。没有列在这里的命令一律按 [`ArgKind::Free`] 处理。
+pub const ARG_KINDS: &[(&str, ArgKind)] = &[
+    ("/book", ArgKind::Deck),
+    ("/import", ArgKind::Path),
+    ("/read", ArgKind::TextOrPath),
+    ("/quiz", ArgKind::TextOrPath),
+    ("/mode", ArgKind::Choice(&["full", "intensive"])),
+    ("/study", ArgKind::Number),
+    ("/limit", ArgKind::Number),
+    ("/goto", ArgKind::Number),
+    ("/take", ArgKind::Number),
+];
+
+/// 命令的参数类型。别名按规范名解析（`/use` 与 `/book` 同一种）。
+pub fn arg_kind(name: &str) -> ArgKind {
+    let canonical = spec(name).map(|spec| spec.name).unwrap_or(name);
+    ARG_KINDS
+        .iter()
+        .find(|(command, _)| command.eq_ignore_ascii_case(canonical))
+        .map(|(_, kind)| *kind)
+        .unwrap_or(ArgKind::Free)
+}
+
+/// 按命令名取规格（含别名）。
+pub fn spec(name: &str) -> Option<&'static Spec> {
+    SPECS
+        .iter()
+        .find(|spec| spec.forms().any(|form| form.eq_ignore_ascii_case(name)))
+}
+
+/// 与 `partial` 前缀匹配的候选，保持原有顺序。
+pub fn arg_hits(candidates: &[String], partial: &str) -> Vec<String> {
+    let needle = partial.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|candidate| candidate.to_ascii_lowercase().starts_with(needle.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// 规范名之后的参数写法，用于提示：`/book <slug>`。
+pub fn usage(name: &str) -> Option<String> {
+    let spec = spec(name)?;
+    Some(format!("{}{}", spec.name, spec.args))
+}
+
 /// Complete the argument of a command against a candidate list.
 ///
 /// Matches case-insensitively on the prefix and returns the unique completion, or
@@ -489,6 +555,48 @@ mod tests {
         assert_eq!(complete_arg(&decks, "cet"), None);
         assert_eq!(complete_arg(&decks, "toe"), Some("toefl".to_string()));
         assert_eq!(complete_arg(&decks, "zz"), None);
+    }
+
+    #[test]
+    fn arg_kinds_name_real_commands() {
+        for (name, kind) in ARG_KINDS {
+            assert!(spec(name).is_some(), "{name} is not a command");
+            assert!(
+                !matches!(kind, ArgKind::Free),
+                "{name} is listed but declares no candidates"
+            );
+        }
+        // 带候选的命令漏了声明，补全会静默失灵。
+        for name in ["/book", "/import", "/read", "/quiz", "/mode"] {
+            assert_ne!(arg_kind(name), ArgKind::Free, "{name} needs an ArgKind");
+        }
+    }
+
+    #[test]
+    fn arg_kinds_route_to_the_right_candidates() {
+        assert_eq!(arg_kind("/book"), ArgKind::Deck);
+        assert_eq!(arg_kind("/use"), ArgKind::Deck, "aliases resolve too");
+        assert_eq!(arg_kind("/import"), ArgKind::Path);
+        assert_eq!(arg_kind("/read"), ArgKind::TextOrPath);
+        assert_eq!(arg_kind("/mode"), ArgKind::Choice(&["full", "intensive"]));
+        assert_eq!(arg_kind("/goto"), ArgKind::Number);
+        assert_eq!(arg_kind("/search"), ArgKind::Free);
+    }
+
+    #[test]
+    fn usage_spells_out_the_argument() {
+        assert_eq!(usage("/book").as_deref(), Some("/book <slug>"));
+        assert_eq!(usage("/use").as_deref(), Some("/book <slug>"));
+        assert_eq!(usage("/books"), Some("/books".to_string()));
+        assert_eq!(usage("/nope"), None);
+    }
+
+    #[test]
+    fn arg_hits_keep_candidate_order() {
+        let decks = vec!["cet4".to_string(), "cet6".to_string(), "toefl".to_string()];
+        assert_eq!(arg_hits(&decks, "ce"), vec!["cet4".to_string(), "cet6".to_string()]);
+        assert_eq!(arg_hits(&decks, "CET"), vec!["cet4".to_string(), "cet6".to_string()]);
+        assert!(arg_hits(&decks, "zz").is_empty());
     }
 
     #[test]

@@ -71,6 +71,10 @@ pub trait Store {
     fn save_text(&mut self, text: &crate::reading::Text) -> Result<i64>;
     /// 列出所有已导入的文本，最近导入的在前。
     fn texts(&self) -> Result<Vec<crate::reading::Text>>;
+    /// 已导入文本的标题，用于 `/read` 的参数补全（不读正文）。
+    fn text_titles(&self) -> Result<Vec<String>> {
+        Ok(self.texts()?.into_iter().map(|text| text.title).collect())
+    }
     /// 按标题取文本（不区分大小写）。
     fn text_by_title(&self, title: &str) -> Result<Option<crate::reading::Text>>;
     /// 删除一篇文章及其进度、标注、测验。

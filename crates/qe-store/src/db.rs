@@ -1239,6 +1239,12 @@ impl Store for SqliteStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    fn text_titles(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT title FROM texts ORDER BY id DESC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn text_by_title(&self, title: &str) -> Result<Option<qe_core::reading::Text>> {
         let text = self
             .conn
