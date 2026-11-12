@@ -328,7 +328,11 @@ impl App {
         }
 
         // 测验快捷键：有题目待答时，数字选选项，回车提交/翻页。
-        if !self.quizzes.is_empty() && self.editor.is_empty() {
+        //
+        // 学习会话优先：`/study` 与阅读、测验可能同时存在（例如先 `/read` 再
+        // `/study`），此时屏幕上画的是学习卡，数字键必须去评分，不能被下面几块
+        // 截走——否则按 1-4 会变成「打开第 n 个词」的查词卡片。
+        if self.session.is_none() && !self.quizzes.is_empty() && self.editor.is_empty() {
             match key.code {
                 KeyCode::Char(ch @ '1'..='9') => {
                     let index = ch.to_digit(10).unwrap_or(1) as usize;
@@ -350,7 +354,7 @@ impl App {
 
         // 阅读快捷键：同样只在输入行为空时生效，字母键留给查词与 `/命令`。
         // 只用非字母键，所以想输入 `n` 开头的单词不会被吞掉。
-        if self.reading.is_some() && self.editor.is_empty() {
+        if self.session.is_none() && self.reading.is_some() && self.editor.is_empty() {
             match key.code {
                 KeyCode::Char(ch @ '1'..='9') => {
                     let index = ch.to_digit(10).unwrap_or(1) as usize;
@@ -1388,6 +1392,13 @@ impl App {
             take_due = !take_due;
         }
 
+        // 阅读与学习互斥：`start_reading` 已经会收尾学习会话，反方向也要收尾，
+        // 否则阅读队列会和学习队列抢同一批数字键（按 1-4 变成查词）。
+        if self.reading.is_some() {
+            self.finish_reading()?;
+            self.note("reading closed before study");
+        }
+
         self.session = Some(StudySession::new(book.clone(), queue, new_total, review_total));
         self.push(Message::tool(
             ToolView::new("study")
@@ -2057,6 +2068,67 @@ mod tests {
         app.toggle_glosses();
         assert!(!expanded(&app, study_card));
         assert!(expanded(&app, lookup_card));
+    }
+
+    #[test]
+    fn starting_to_study_closes_the_reading_session() {
+        // 先 `/read` 再 `/study`：两个队列同时活着时，数字键会被阅读的「打开第 n
+        // 个词」抢走，显示成查词卡片，评分也不会写进库。
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("article.txt");
+        std::fs::write(&path, "First paragraph here.\n\nSecond paragraph here.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        assert!(app.reading.is_some(), "reading started");
+
+        app.execute(Command::Study(Some(2))).unwrap();
+        assert!(app.reading.is_none(), "study takes over the number keys");
+        assert!(app.session.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.store.daily(qe_core::time::today()).unwrap().reviews,
+            1,
+            "1-4 grades instead of opening a word"
+        );
+        assert!(
+            app.messages.iter().all(|message| message
+                .card_state()
+                .map(|state| state.badge != "lookup")
+                .unwrap_or(true)),
+            "no lookup card appears while studying"
+        );
+    }
+
+    #[test]
+    fn study_keys_win_over_reading_even_if_both_survive() {
+        // 防御性：即便两个会话同时存在（旧状态、或将来有新入口），学习卡在屏幕上
+        // 时数字键也只能用于评分。
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("article.txt");
+        std::fs::write(&path, "First paragraph here.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.execute(Command::Study(Some(1))).unwrap();
+        // 把阅读会话塞回去，模拟互斥失效的状态。
+        let reading = qe_core::reading::ReadingSession::new(
+            app.store
+                .text_by_title("article")
+                .unwrap()
+                .expect("the imported text"),
+            qe_core::reading::ReadMode::Full,
+            0,
+        );
+        app.reading = Some(reading);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.store.daily(qe_core::time::today()).unwrap().reviews,
+            1,
+            "the rating was recorded, not a lookup"
+        );
     }
 
     #[test]
