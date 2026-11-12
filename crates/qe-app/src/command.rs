@@ -212,8 +212,8 @@ pub const SPECS: &[Spec] = &[
     Spec {
         name: "/take",
         alias: "keep",
-        args: " <n>",
-        help: "add the nth word of this paragraph to the deck",
+        args: " [n]",
+        help: "add the nth word, or the selected word, to the deck",
     },
     Spec {
         name: "/translate",

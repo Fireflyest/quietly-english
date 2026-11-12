@@ -6,6 +6,9 @@
 
 use crate::model::{DailyStats, Example, Quiz, Rating, ReadingStats, Word};
 
+/// 选词说明块右栏最多列几条词组：再多会把卡片撑长，剩下的留给完整卡片。
+const MAX_PANEL_PHRASES: usize = 6;
+
 /// 一个可以按序号打开的候选词（精读模式下段落里的词）。
 #[derive(Debug, Clone, Default)]
 pub struct Candidate {
@@ -134,6 +137,88 @@ pub struct ToolView {
     pub accent: Accent,
 }
 
+/// 段落里选中的词：紧跟在段落（与译文）后面的一小块说明，不用另开一张卡片。
+///
+/// 只放「读这段时需要」的信息：音标、前两三条义项、标记状态。词根和例句仍在
+/// `enter` 打开的完整卡片里，免得一块说明把正文顶出屏幕。
+fn word_panel(
+    mut view: ToolView,
+    session: &crate::reading::ReadingSession,
+    lemma: &str,
+    word: Option<&Word>,
+) -> ToolView {
+    let marked = session.is_marked(lemma);
+    view = view.spacer().muted(if marked {
+        "word · marked".to_string()
+    } else {
+        "word".to_string()
+    });
+
+    let Some(word) = word else {
+        // 词典里没有这个词条时也要给出反馈，否则读者会以为点击没生效。
+        view = view.line(ToolLine::Accent(lemma.to_string()));
+        return view.muted("(no definition in the dictionary) · /add takes it from here");
+    };
+
+    let mut head = word.lemma.clone();
+    if let Some(phonetic) = &word.phonetic {
+        if !phonetic.trim().is_empty() {
+            head.push_str("  ");
+            head.push_str(phonetic.trim());
+        }
+    }
+
+    let mut left = vec![ToolLine::Accent(head)];
+    let parsed = word.senses();
+    let mut shown = 0;
+    for sense in parsed.senses.iter().filter(|sense| !sense.is_secondary()) {
+        if shown == 3 {
+            break;
+        }
+        left.push(ToolLine::Sense {
+            label: sense.pos.clone(),
+            text: sense.text.clone(),
+        });
+        shown += 1;
+    }
+    if shown == 0 {
+        // 词典里没有释义时也别空着：至少说明为什么只有词组。
+        left.push(ToolLine::Muted("(no definition in the dictionary)".to_string()));
+    }
+
+    // 只提示**本段里真的写着**的词组：词条里登记但这段没用到的搭配不列出来，
+    // 否则每个多义词都会拖出一长串与当前阅读无关的短语。
+    let matched = match (session.current(), session.focused_span()) {
+        (Some(paragraph), Some(span)) => {
+            crate::reading::phrases_covering(paragraph, span, &word.collocations)
+        }
+        _ => Vec::new(),
+    };
+    if matched.is_empty() {
+        return view.lines(left);
+    }
+
+    let mut right: Vec<ToolLine> = matched
+        .iter()
+        .take(MAX_PANEL_PHRASES)
+        .map(|phrase| ToolLine::PhraseInline {
+            phrase: phrase.phrase.clone(),
+            gloss: phrase.gloss.clone(),
+        })
+        .collect();
+    let hidden = matched.len().saturating_sub(MAX_PANEL_PHRASES);
+    if hidden > 0 {
+        right.push(ToolLine::Muted(format!(
+            "+{hidden} more · enter the full card"
+        )));
+    }
+
+    // 右栏从第 0 行就开始写词组，不额外加标题：标题会把词组整体压下一行，
+    // 第一行留空读起来像「词组没对上单词」。
+    let view = view.split(left, right);
+    view.muted("enter full card · /mark marks it · esc clears the selection")
+}
+
 impl ToolView {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -173,6 +258,11 @@ impl ToolView {
         self
     }
 
+    pub fn lines(mut self, lines: Vec<ToolLine>) -> Self {
+        self.lines.extend(lines);
+        self
+    }
+
     pub fn text(mut self, text: impl Into<String>) -> Self {
         self.lines.push(ToolLine::Text(text.into()));
         self
@@ -201,14 +291,23 @@ impl ToolView {
         self
     }
 
-    /// 阅读卡片：原文（已标记的词高亮）+ 可选译文 + 可选的候选词列表。
+    /// 两栏内容：宽终端并排，窄终端把右栏折到下方。
+    pub fn split(mut self, left: Vec<ToolLine>, right: Vec<ToolLine>) -> Self {
+        self.lines.push(ToolLine::Split { left, right });
+        self
+    }
+
+    /// 阅读卡片：原文（标记词高亮、选中词反显）+ 可选译文 + 选中词的说明块。
     ///
     /// 全篇模式一次给出全部段落，译文跟随各自段落；精读模式只给当前段。
     /// `show_translation` 由 `/translate` 与 `tab` 控制，两种模式都认。
+    /// `selection` 是选中的词：`(lemma, 词条)`；词条为 `None` 表示词典里没有，
+    /// 卡片仍会显示选中的是哪个词。
     pub fn reading_card(
         session: &crate::reading::ReadingSession,
         candidates: &[Candidate],
         show_translation: bool,
+        selection: Option<(&str, Option<&Word>)>,
     ) -> Self {
         let text = &session.text;
         let mut badge = format!("{} · {}", session.mode.label(), session.progress());
@@ -227,6 +326,7 @@ impl ToolView {
 
         let marked: Vec<String> = session.marked.iter().map(|m| m.lemma.clone()).collect();
         let is_marked = |word: &str| marked.iter().any(|lemma| lemma == word);
+        let focus = session.focus;
 
         match session.mode {
             crate::reading::ReadMode::Full => {
@@ -237,15 +337,23 @@ impl ToolView {
                     }
                     // 全篇模式没有「当前段」的独立画面，用一行暗色标记指出
                     // `next` / `goto` 把位置移到哪了，否则这两个键看不出效果。
+                    // `Anchor` 让渲染层回报这一行的位置，滚动时据此把当前段带回视野。
                     if index == session.paragraph && text.paragraph_count() > 1 {
-                        view = view.muted(format!(
+                        view = view.line(ToolLine::Anchor(format!(
                             "▸ {}/{}",
                             session.paragraph + 1,
                             text.paragraph_count()
-                        ));
+                        )));
                     }
-                    view = view.line(ToolLine::Marked {
-                        segments: crate::reading::highlight_segments(paragraph, is_marked),
+                    // 每段都标上段号：词序号只在段内有效，点击时要用段号定位。
+                    let focus_here = if index == session.paragraph { focus } else { None };
+                    view = view.line(ToolLine::Paragraph {
+                        pieces: crate::reading::paragraph_pieces(
+                            paragraph,
+                            is_marked,
+                            focus_here,
+                        ),
+                        index: Some(index),
                     });
                     if show_translation {
                         if let Some(translation) = text.translation_at(index) {
@@ -254,12 +362,20 @@ impl ToolView {
                             }
                         }
                     }
+                    // 选中词的说明块紧跟**当前段**，不是整篇末尾：长文里否则要滚到底
+                    // 才能看到释义，等于没看到。
+                    if index == session.paragraph {
+                        if let Some((lemma, word)) = selection {
+                            view = word_panel(view, session, lemma, word);
+                        }
+                    }
                 }
             }
             crate::reading::ReadMode::Intensive => {
                 if let Some(paragraph) = session.current() {
-                    view = view.line(ToolLine::Marked {
-                        segments: crate::reading::highlight_segments(paragraph, is_marked),
+                    view = view.line(ToolLine::Paragraph {
+                        pieces: crate::reading::paragraph_pieces(paragraph, is_marked, focus),
+                        index: None,
                     });
                 }
                 if let Some(translation) = session.current_translation() {
@@ -272,6 +388,9 @@ impl ToolView {
                     } else {
                         view = view.spacer().muted("translation hidden · tab to show".to_string());
                     }
+                }
+                if let Some((lemma, word)) = selection {
+                    view = word_panel(view, session, lemma, word);
                 }
                 if !candidates.is_empty() {
                     view = view.spacer().muted(format!(
@@ -293,7 +412,7 @@ impl ToolView {
         view
     }
 
-    /// 阅读结束时的统计块。
+/// 阅读结束时的统计块。
     pub fn reading_summary(
         text: &str,
         paragraphs: u32,
@@ -741,9 +860,26 @@ pub enum ToolLine {
         label: String,
         text: String,
     },
-    /// A reading paragraph. `true` marks a word the reader flagged, so it is drawn
-    /// in the accent colour inside otherwise plain prose.
-    Marked { segments: Vec<(String, bool)> },
+    /// A reading paragraph: pre-split pieces so the renderer can draw marked and
+    /// focused words differently, and report which word sits in which cell.
+    ///
+    /// `index` 是这段在全文里的段号：点击时据此判断点到的是不是当前段，
+    /// 词序号只在段内有效，跨段必须带上段号才不会选错词。
+    Paragraph {
+        pieces: Vec<crate::reading::Piece>,
+        index: Option<usize>,
+    },
+    /// 阅读时的当前段标记（`▸ 12/50`）。渲染层回报它的行号，滚动时用来把
+    /// 当前段带回视野；它只是位置提示，没有别的含义。
+    Anchor(String),
+    /// 一个块内部的两栏：宽终端并排，窄终端把右栏折到下方。
+    ///
+    /// 选词说明块用它把词组放在释义右侧——`ToolView::aside` 贴着整张卡片顶部，
+    /// 而说明块在段落下方，用 aside 会把词组画到段落旁边。
+    Split {
+        left: Vec<ToolLine>,
+        right: Vec<ToolLine>,
+    },
     /// One word from the current paragraph, selectable by its number.
     Pick {
         index: usize,
@@ -752,7 +888,14 @@ pub enum ToolLine {
         marked: bool,
     },
     /// A fixed expression: `for the sake of → 为了`.
+    ///
+    /// Rendered as a boxed table, which suits the full word card.
     Phrase { phrase: String, gloss: String },
+    /// 一行一条的 `phrase → gloss`，不画表格。
+    ///
+    /// 选词说明块的右栏只有二三十列，表格框线会把内容挤成一条窄缝；这里直接用
+    /// 缩进+箭头，和左栏逐行对齐。
+    PhraseInline { phrase: String, gloss: String },
     /// One English gloss from Wiktionary, with optional register tags.
     Gloss { text: String, tags: Vec<String> },
     /// Four rating options, the selected one highlighted.

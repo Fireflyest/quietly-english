@@ -132,15 +132,44 @@ pub fn pad_left(text: &str, width: usize) -> String {
 
 /// 消息 → 若干渲染行。
 pub fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
+    message_lines_hits(message, width).0
+}
+
+/// 词在当前段落行里的位置：`(起始列, 结束列, 词序号)`，列号不含轨道前缀。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordBox {
+    /// 行号，相对它所属那个块的开始。
+    pub row: usize,
+    pub start: u16,
+    pub end: u16,
+    /// 词在当前段落里的序号（只数词，从 0 开始）。
+    pub token: usize,
+    /// 这段在全文里的段号（全篇模式）；`None` 表示就是当前段（精读模式）。
+    pub paragraph: Option<usize>,
+}
+
+/// 一个块里可供交互的位置：段落中的词，以及当前段的锚点行。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockHits {
+    pub words: Vec<WordBox>,
+    /// 锚点行的行号（相对块首），全篇模式下就是 `▸ 12/50` 那一行。
+    pub anchors: Vec<usize>,
+}
+
+/// 同 [`message_lines`]，另外回报可交互位置：段落里的词与当前段锚点行。
+pub fn message_lines_hits(message: &Message, width: usize) -> (Vec<Line<'static>>, BlockHits) {
     match &message.body {
-        Body::Text(text) => match message.role {
-            Role::User => body("› ", text, theme::text(), theme::user(), width),
-            Role::Agent => rail_text(text, width, theme::accent_plain(), theme::text()),
-            Role::System => body("  ", text, theme::muted(), theme::dim(), width),
-        },
-        Body::Tool(tool) => tool_lines(tool, width),
-        Body::Card(state) => tool_lines(&ToolView::word_card(state), width),
-        Body::Table(table) => table_lines(table, width),
+        Body::Text(text) => (
+            match message.role {
+                Role::User => body("› ", text, theme::text(), theme::user(), width),
+                Role::Agent => rail_text(text, width, theme::accent_plain(), theme::text()),
+                Role::System => body("  ", text, theme::muted(), theme::dim(), width),
+            },
+            BlockHits::default(),
+        ),
+        Body::Tool(tool) => tool_lines_hits(tool, width),
+        Body::Card(state) => tool_lines_hits(&ToolView::word_card(state), width),
+        Body::Table(table) => (table_lines(table, width), BlockHits::default()),
     }
 }
 
@@ -243,7 +272,11 @@ fn accent_style(accent: Accent) -> Style {
     }
 }
 
-fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
+/// 把 `ToolView` 渲染成行。
+///
+/// 段落里的词落在第几行第几列、当前段锚点在第几行，也一并回报：前者让鼠标点击
+/// 能换算成选中的词，后者让滚动能把当前段带回视野。
+fn tool_lines_hits(tool: &ToolView, width: usize) -> (Vec<Line<'static>>, BlockHits) {
     let rail = accent_style(tool.accent);
     let mut out = Vec::new();
 
@@ -265,6 +298,8 @@ fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
         }
         out.extend(rows);
     }
+    // 命中区间以块首行为基准，所以要记住详情开始前已经有几行。
+    let head_rows = out.len();
 
     // Two columns when the terminal allows it: details on the left, examples on the
     // right. Narrow terminals stack the aside underneath, because side-by-side text
@@ -282,7 +317,7 @@ fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
         width
     };
 
-    let mut left = detail_rows(&tool.lines, left_width);
+    let (mut left, mut hits) = rows_in(&tool.lines, left_width, Palette::plain());
 
     if aside_width > 0 {
         let right = detail_rows(&tool.aside, aside_width);
@@ -299,7 +334,16 @@ fn tool_lines(tool: &ToolView, width: usize) -> Vec<Line<'static>> {
         }
     }
 
-    out
+    for hit in &mut hits.words {
+        hit.row += head_rows;
+        hit.start += RAIL_WIDTH as u16;
+        hit.end += RAIL_WIDTH as u16;
+    }
+    for anchor in &mut hits.anchors {
+        *anchor += head_rows;
+    }
+
+    (out, hits)
 }
 
 /// Styles for the transcript. Kept as a small struct so a future tinted variant
@@ -323,12 +367,28 @@ impl Palette {
 
 /// Render `ToolLine`s into rows of spans, without the leading rail.
 fn detail_rows(lines: &[ToolLine], width: usize) -> Vec<Vec<Span<'static>>> {
-    rows_in(lines, width, Palette::plain())
+    rows_in(lines, width, Palette::plain()).0
 }
 
-fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'static>>> {
+fn rows_in(
+    lines: &[ToolLine],
+    width: usize,
+    palette: Palette,
+) -> (Vec<Vec<Span<'static>>>, BlockHits) {
     let inner = width.saturating_sub(RAIL_WIDTH).max(8);
+    rows_with_inner(lines, inner, palette)
+}
+
+/// 同 [`rows_in`]，但宽度已经是内容宽度（不再扣掉轨道前缀）。
+///
+/// 双栏块要嵌套调用，所以把「扣前缀」这一步单独留在最外层。
+fn rows_with_inner(
+    lines: &[ToolLine],
+    inner: usize,
+    palette: Palette,
+) -> (Vec<Vec<Span<'static>>>, BlockHits) {
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut hits = BlockHits::default();
 
     let mut cursor = 0;
     while cursor < lines.len() {
@@ -359,6 +419,9 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
                 for piece in wrap(text, inner) {
                     rows.push(vec![Span::styled(piece, palette.accent)]);
                 }
+            }
+            ToolLine::PhraseInline { phrase, gloss } => {
+                rows.extend(phrase_inline_rows(phrase, gloss, inner));
             }
             ToolLine::Kv { key, value } => {
                 // Values can be full sentences (Wiktionary glosses), so they wrap
@@ -414,8 +477,90 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
             ToolLine::Sense { label, text } => {
                 rows.extend(sense_rows(label, text, inner));
             }
-            ToolLine::Marked { segments } => {
-                rows.extend(marked_rows(segments, inner));
+            ToolLine::Paragraph { pieces, index } => {
+                let (paragraph, boxes) = paragraph_rows(pieces, inner);
+                let base = rows.len();
+                for hit in boxes {
+                    hits.words.push(WordBox {
+                        row: base + hit.row,
+                        start: hit.start,
+                        end: hit.end,
+                        token: hit.token,
+                        paragraph: *index,
+                    });
+                }
+                rows.extend(paragraph);
+            }
+            ToolLine::Split { left, right } => {
+                let base = rows.len();
+                // 右侧至少要 28 列才有意义；不够就把右栏折到下方，而不是挤成一团。
+                let right_width = if inner >= 64 {
+                    ((inner - 2) * 42 / 100).clamp(28, 46)
+                } else {
+                    0
+                };
+
+                if right_width == 0 {
+                    let (left_rows, left_hits) = rows_with_inner(left, inner, palette);
+                    for hit in left_hits.words {
+                        hits.words.push(WordBox {
+                            row: base + hit.row,
+                            ..hit
+                        });
+                    }
+                    rows.extend(left_rows);
+                    rows.push(Vec::new());
+                    let right_base = rows.len();
+                    let (right_rows, right_hits) = rows_with_inner(right, inner, palette);
+                    for hit in right_hits.words {
+                        hits.words.push(WordBox {
+                            row: right_base + hit.row,
+                            ..hit
+                        });
+                    }
+                    rows.extend(right_rows);
+                } else {
+                    let left_width = inner.saturating_sub(right_width + 3).max(8);
+                    let (left_rows, left_hits) = rows_with_inner(left, left_width, palette);
+                    let (right_rows, right_hits) = rows_with_inner(right, right_width, palette);
+                    for hit in left_hits.words {
+                        hits.words.push(WordBox {
+                            row: base + hit.row,
+                            ..hit
+                        });
+                    }
+                    for hit in right_hits.words {
+                        hits.words.push(WordBox {
+                            row: base + hit.row,
+                            start: hit.start + left_width as u16 + 3,
+                            end: hit.end + left_width as u16 + 3,
+                            ..hit
+                        });
+                    }
+
+                    let total = left_rows.len().max(right_rows.len());
+                    for index in 0..total {
+                        let mut spans = left_rows.get(index).cloned().unwrap_or_default();
+                        let used = row_width(&spans);
+                        if used < left_width {
+                            spans.push(Span::styled(
+                                " ".repeat(left_width - used),
+                                Style::default(),
+                            ));
+                        }
+                        spans.push(Span::styled("   ", Style::default()));
+                        if let Some(right_row) = right_rows.get(index) {
+                            spans.extend(right_row.clone());
+                        }
+                        rows.push(spans);
+                    }
+                }
+            }
+            ToolLine::Anchor(text) => {
+                hits.anchors.push(rows.len());
+                for piece in wrap(text, inner) {
+                    rows.push(vec![Span::styled(piece, palette.muted)]);
+                }
             }
             ToolLine::Pick {
                 index,
@@ -455,7 +600,7 @@ fn rows_in(lines: &[ToolLine], width: usize, palette: Palette) -> Vec<Vec<Span<'
         cursor += 1;
     }
 
-    rows
+    (rows, hits)
 }
 
 /// Render morphology as a code block:
@@ -616,6 +761,33 @@ fn sense_rows(label: &str, text: &str, width: usize) -> Vec<Vec<Span<'static>>> 
     rows
 }
 
+/// 窄栏里的词组：`for the sake of → 为了`，放不下就续行。
+fn phrase_inline_rows(phrase: &str, gloss: &str, width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut spans = vec![Span::styled(phrase.to_string(), theme::value())];
+    if !gloss.trim().is_empty() {
+        spans.push(Span::styled(" → ", theme::faint()));
+        spans.push(Span::styled(gloss.trim().to_string(), theme::muted()));
+    }
+    wrap_spans(&spans, width)
+}
+
+/// 窄栏里的词组：`for the sake of → 为了`，放不下就续行。
+fn compact_phrases(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    for (index, (phrase, gloss)) in entries.iter().enumerate() {
+        if index > 0 {
+            rows.push(Vec::new());
+        }
+        let mut spans = vec![Span::styled((*phrase).to_string(), theme::value())];
+        if !gloss.trim().is_empty() {
+            spans.push(Span::styled(" → ", theme::faint()));
+            spans.push(Span::styled(gloss.trim().to_string(), theme::muted()));
+        }
+        rows.extend(wrap_spans(&spans, width));
+    }
+    rows
+}
+
 /// Fixed expressions as a boxed two-column table.
 ///
 /// ```text
@@ -640,6 +812,12 @@ fn phrase_table(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     if entries.is_empty() {
         return rows;
+    }
+
+    // 侧栏只有二三十列时，框线本身就要占掉一半，读起来像一堵墙。
+    // 窄处改成一行一条 `phrase → meaning`，靠换行对齐。
+    if width < 44 {
+        return compact_phrases(entries, width);
     }
 
     let usable = width.saturating_sub(FRAME).max(16);
@@ -711,32 +889,67 @@ fn phrase_table(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>
     rows
 }
 
-/// 阅读段落：普通文字用正文色，读者标记过的词用强调色并加底部标记。
+/// 阅读段落：正文色、标记词用强调色、选中词反显。
 ///
-/// 复用 `wrap_spans` 做换行，因为它已经能按词边界断行并保留逐段样式。
-fn marked_rows(segments: &[(String, bool)], width: usize) -> Vec<Vec<Span<'static>>> {
+/// 同时回报每个词的位置（行号相对段落首行，列号含行首缩进），鼠标点击据此
+/// 换算成「第几个词」。行号不含轨道前缀所在的行，由调用方补。
+fn paragraph_rows(
+    pieces: &[qe_core::reading::Piece],
+    width: usize,
+) -> (Vec<Vec<Span<'static>>>, Vec<WordBox>) {
     const INDENT: usize = 2;
 
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(INDENT), Style::default())];
-    for (text, marked) in segments {
-        let style = if *marked {
-            theme::mark()
-        } else {
-            theme::text()
-        };
-        spans.push(Span::styled(text.clone(), style));
-    }
-    // 换行后缩进与首行对齐，读起来像一段引文。
-    wrap_spans(&spans, width)
-        .into_iter()
-        .map(|row| {
-            let mut out = row;
-            if out.is_empty() {
-                out = vec![Span::styled(" ".repeat(INDENT), Style::default())];
+    let laid_out = qe_core::reading::layout_pieces(pieces, width);
+    let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(laid_out.len());
+    let mut hits: Vec<WordBox> = Vec::new();
+
+    for (row_index, row) in laid_out.iter().enumerate() {
+        if row.is_empty() {
+            out.push(vec![Span::styled(" ".repeat(INDENT), Style::default())]);
+            continue;
+        }
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(INDENT), Style::default())];
+        let mut column = INDENT;
+        for piece in row {
+            let style = match piece.kind {
+                qe_core::reading::PieceKind::Plain => theme::text(),
+                qe_core::reading::PieceKind::Marked => theme::mark(),
+                qe_core::reading::PieceKind::Focus => theme::focus(),
+            };
+            let width = display_width(&piece.text);
+            if let Some(token) = piece.token {
+                push_hit(
+                    &mut hits,
+                    row_index,
+                    column as u16,
+                    (column + width) as u16,
+                    token,
+                );
             }
-            out
-        })
-        .collect()
+            column += width;
+            spans.push(Span::styled(piece.text.clone(), style));
+        }
+        out.push(spans);
+    }
+
+    (out, hits)
+}
+
+/// 同一个词被切成相邻几段时合成一个命中区间；同一行里重复出现的同一个词不合并。
+fn push_hit(hits: &mut Vec<WordBox>, row: usize, start: u16, end: u16, token: usize) {
+    if let Some(last) = hits.last_mut() {
+        if last.row == row && last.token == token && last.end == start {
+            last.end = end;
+            return;
+        }
+    }
+    hits.push(WordBox {
+        row,
+        start,
+        end,
+        token,
+        paragraph: None,
+    });
 }
 
 /// 候选词行：`1 tyranny   n. 专制, 暴政   ●`（● 表示已标记）。
@@ -1296,7 +1509,7 @@ mod tests {
             },
         ];
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &candidates, true)),
+            &Message::tool(ToolView::reading_card(&session, &candidates, true, None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1311,7 +1524,7 @@ mod tests {
     fn hiding_the_translation_leaves_a_hint_instead() {
         let session = reading_session(qe_core::reading::ReadMode::Intensive);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], false)),
+            &Message::tool(ToolView::reading_card(&session, &[], false, None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1323,7 +1536,7 @@ mod tests {
     fn full_mode_renders_every_paragraph_without_a_word_list() {
         let session = reading_session(qe_core::reading::ReadMode::Full);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], false)),
+            &Message::tool(ToolView::reading_card(&session, &[], false, None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1344,10 +1557,202 @@ mod tests {
     fn full_mode_shows_translations_under_each_paragraph() {
         let session = reading_session(qe_core::reading::ReadMode::Full);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], true)),
+            &Message::tool(ToolView::reading_card(&session, &[], true, None)),
             80,
         ));
         let joined = text.join("\n");
         assert!(joined.contains("从很小的时候"), "translation per paragraph: {joined}");
+    }
+
+    #[test]
+    fn the_word_panel_sits_under_the_current_paragraph_in_full_mode() {
+        // 长文里说明块若挂在整篇末尾，等于要滚到底才看得见；它必须紧跟当前段。
+        let mut session = reading_session(qe_core::reading::ReadMode::Full);
+        session.focus_on(1);
+        assert_eq!(session.paragraph, 0, "first paragraph is current");
+
+        let mut word = qe_core::model::Word::new("from", "prep. 从");
+        word.phonetic = Some("/frɒm/".into());
+        let message = Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            Some(("from", Some(&word))),
+        ));
+        let text = flat(&message_lines(&message, 80));
+
+        let panel = text
+            .iter()
+            .position(|line| line.contains("prep.") && line.contains("从"))
+            .unwrap_or_else(|| panic!("panel is missing: {text:?}"));
+        let second = text
+            .iter()
+            .position(|line| line.contains("lonely child's habit"))
+            .unwrap_or_else(|| panic!("second paragraph is missing: {text:?}"));
+        assert!(
+            panel < second,
+            "the panel must come before the next paragraph: {text:?}"
+        );
+    }
+
+    #[test]
+    fn paragraph_words_report_hit_boxes() {
+        // 点击选词靠这些命中区间，所以列号必须与画出来的位置一致。
+        let session = reading_session(qe_core::reading::ReadMode::Intensive);
+        let message = Message::tool(ToolView::reading_card(&session, &[], false, None));
+        let (lines, hits) = message_lines_hits(&message, 80);
+        assert!(!hits.words.is_empty(), "the paragraph must report word boxes");
+
+        let first = hits.words[0];
+        let row = &lines[first.row];
+        let rendered: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        let chars: Vec<char> = rendered.chars().collect();
+        let start = first.start as usize;
+        let end = first.end as usize;
+        let clicked: String = chars[start..end].iter().collect();
+        assert_eq!(clicked, "From", "the box must sit on the word: {rendered:?}");
+
+        // 词序号按出现顺序递增，且第一个词是 0。
+        assert_eq!(first.token, 0);
+        assert!(hits.words.windows(2).all(|pair| pair[1].token >= pair[0].token));
+    }
+
+    #[test]
+    fn phrases_ride_alongside_the_definition_in_the_word_panel() {
+        // 只有本段真的写着的词组才提示：读 `early` 时给出 `early age`，
+        // 词条里另有 `early bird` 但这段没有，就不该出现。
+        let mut session = reading_session(qe_core::reading::ReadMode::Intensive);
+        session.focus_on(3); // early
+        let mut word = qe_core::model::Word::new("early", "a. 早的");
+        word.collocations = vec![
+            qe_core::model::Collocation::new("early age", "早年"),
+            qe_core::model::Collocation::new("early bird", "早起的人"),
+        ];
+        let message = Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            Some(("early", Some(&word))),
+        ));
+
+        let wide = flat(&message_lines(&message, 100));
+        // 词组从**第一行**开始，和词头并排：加标题会把它整体压下一行。
+        let head_row = wide
+            .iter()
+            .position(|line| {
+                line.trim_start_matches(['│', ' ']).starts_with("early")
+                    && !line.contains("very early")
+            })
+            .unwrap_or_else(|| panic!("headword row is missing: {wide:?}"));
+        assert!(
+            wide[head_row].contains("early age"),
+            "the phrase sits on the headword row, not one line below: {wide:?}"
+        );
+        let head = wide[head_row].find("early").expect("headword");
+        let phrase = wide[head_row].find("early age").expect("phrase");
+        assert!(
+            head < phrase,
+            "the phrase column sits right of the headword: {:?}",
+            wide[head_row]
+        );
+        assert!(
+            !wide.iter().any(|line| line.contains("early bird")),
+            "a phrase absent from the paragraph is not listed: {wide:?}"
+        );
+
+        let narrow = flat(&message_lines(&message, 60));
+        let phrase_row = narrow
+            .iter()
+            .position(|line| line.contains("早年"))
+            .unwrap_or_else(|| panic!("the matched phrase is missing: {narrow:?}"));
+        let sense_row = narrow
+            .iter()
+            .position(|line| line.contains("早的"))
+            .expect("the sense is rendered");
+        assert!(
+            sense_row < phrase_row,
+            "stacked below the definition when the terminal is narrow: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_whose_phrases_are_not_in_the_paragraph_shows_no_phrase_column() {
+        let mut session = reading_session(qe_core::reading::ReadMode::Intensive);
+        session.focus_on(3);
+        let mut word = qe_core::model::Word::new("early", "a. 早的");
+        word.collocations = vec![
+            qe_core::model::Collocation::new("early bird", "早起的人"),
+            qe_core::model::Collocation::new("early on", "在早期"),
+        ];
+        let message = Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            Some(("early", Some(&word))),
+        ));
+        let text = flat(&message_lines(&message, 100));
+        assert!(
+            !text.iter().any(|line| line.contains("phrase")),
+            "no phrase column when the paragraph does not use any: {text:?}"
+        );
+        assert!(!text.iter().any(|line| line.contains("early bird")));
+    }
+
+    #[test]
+    fn a_word_without_phrases_has_no_phrase_column() {
+        let mut session = reading_session(qe_core::reading::ReadMode::Intensive);
+        session.focus_on(3);
+        let word = qe_core::model::Word::new("writer", "n. 作家, 作者");
+        let message = Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            Some(("writer", Some(&word))),
+        ));
+        let text = flat(&message_lines(&message, 100));
+        assert!(
+            !text.iter().any(|line| line.contains("phrases")),
+            "no phrases header when there is nothing to show: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_selected_word_is_drawn_in_the_focus_style() {
+        let mut session = reading_session(qe_core::reading::ReadMode::Intensive);
+        session.focus_on(3);
+        let selected = session.focused_lemma().expect("a word is selected");
+
+        let message = Message::tool(ToolView::reading_card(&session, &[], false, None));
+        let (lines, hits) = message_lines_hits(&message, 80);
+        let focused = hits
+            .words
+            .iter()
+            .find(|hit| hit.token == 3)
+            .expect("a box for the selected word");
+        let row = &lines[focused.row];
+        let chars: Vec<char> = row.spans.iter().flat_map(|s| s.content.chars()).collect();
+        let clicked: String = chars[focused.start as usize..focused.end as usize]
+            .iter()
+            .collect();
+        assert_eq!(clicked.to_ascii_lowercase(), selected);
+
+        let span = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains(clicked.as_str()))
+            .expect("the word is rendered");
+        assert_eq!(
+            span.style,
+            theme::focus(),
+            "selected words use the focus style, marked ones stay bold"
+        );
+
+        // 读者标记过的词仍用标记样式，两者不互相覆盖。
+        let marked = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("writer"))
+            .expect("the marked word is drawn");
+        assert_eq!(marked.style, theme::mark());
     }
 }

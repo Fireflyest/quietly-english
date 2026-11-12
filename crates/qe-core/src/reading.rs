@@ -9,7 +9,7 @@
 //! **不判断哪个词是生词。** 生词由用户自己选：标注动作是显式的，模块只负责
 //! 把用户选中的词整理成可查询、可加进词书的形式。
 
-use crate::model::Word;
+use crate::model::{Collocation, Word};
 
 /// 阅读模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -245,6 +245,246 @@ fn push_segment(out: &mut Vec<(String, bool)>, text: &str, marked: bool) {
     out.push((text.to_string(), marked));
 }
 
+/// 段落里出现、且覆盖了选中词的一个词组。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhraseMatch {
+    pub phrase: String,
+    pub gloss: String,
+}
+
+/// 找出段落中**实际出现并覆盖 `span`** 的词组。
+///
+/// 只看本段原文，不把所有搭配都列出来：读者点到 `writer` 时，只有当段落里真的
+/// 写着 `a writer of ...` 才值得提示 `a writer of = …的作者`。词条里登记但本段
+/// 没用到的搭配仍然可以在完整卡片里查到。
+pub fn phrases_covering(
+    paragraph: &str,
+    span: (usize, usize),
+    collocations: &[Collocation],
+) -> Vec<PhraseMatch> {
+    let mut out: Vec<PhraseMatch> = Vec::new();
+    for collocation in collocations {
+        let phrase = collocation.phrase.trim();
+        if phrase.is_empty() {
+            continue;
+        }
+        let hit = find_phrase(paragraph, phrase)
+            .into_iter()
+            .any(|(start, end)| start <= span.0 && end >= span.1);
+        if hit {
+            out.push(PhraseMatch {
+                phrase: phrase.to_string(),
+                gloss: collocation.gloss.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// 在段落里找 `phrase` 的所有出现位置（字节区间），大小写不敏感，只认整词边界。
+///
+/// 不直接 `to_lowercase()`：那会改变非 ASCII 文本的字节长度，算出来的偏移就和
+/// token 的偏移对不上了。这里按原串逐字符前进，用 `eq_ignore_ascii_case` 比较等长切片。
+pub fn find_phrase(paragraph: &str, phrase: &str) -> Vec<(usize, usize)> {
+    let phrase = phrase.trim();
+    let mut out = Vec::new();
+    if phrase.is_empty() || phrase.len() > paragraph.len() {
+        return out;
+    }
+    let mut start = 0;
+    while start + phrase.len() <= paragraph.len() {
+        if !paragraph.is_char_boundary(start) {
+            start += 1;
+            continue;
+        }
+        let end = start + phrase.len();
+        if paragraph.is_char_boundary(end) {
+            let slice = &paragraph[start..end];
+            if slice.eq_ignore_ascii_case(phrase) && at_word_boundaries(paragraph, start, end) {
+                out.push((start, end));
+            }
+        }
+        match paragraph[start..].chars().next() {
+            Some(ch) => start += ch.len_utf8(),
+            None => break,
+        }
+    }
+    out
+}
+
+/// 词组两端不能紧贴字母：`a writer of` 不该在 `data writer of` 里命中。
+///
+/// 允许紧贴标点与空白（`writer of,` / `"writer of"`），那才是正常的引用形态。
+fn at_word_boundaries(paragraph: &str, start: usize, end: usize) -> bool {
+    let before = paragraph[..start].chars().next_back();
+    let after = paragraph[end..].chars().next();
+    !before.is_some_and(|ch| ch.is_alphanumeric() || ch == '\'' || ch == '-')
+        && !after.is_some_and(|ch| ch.is_alphanumeric() || ch == '\'' || ch == '-')
+}
+
+/// 段落里一段文字的角色。读者标记的词和当前选中的词要画成不同样子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieceKind {
+    /// 正文：标点、空白、未标记的词。
+    Plain,
+    /// 读者标记过的词。
+    Marked,
+    /// 当前选中的词（`, .` 或鼠标点击选中）。
+    Focus,
+}
+
+/// 段落的一个排版单元：一段文字 + 它的角色 + 它属于第几个**词**。
+///
+/// `token` 只对词有效（`is_word()` 为真的 token），编号按出现顺序从 0 开始，
+/// 与 [`ReadingSession::focus`] 用的是同一套编号，所以鼠标位置能直接换算成选中项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    pub text: String,
+    pub kind: PieceKind,
+    pub token: Option<usize>,
+}
+
+impl Piece {
+    pub fn new(text: impl Into<String>, kind: PieceKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+            token: None,
+        }
+    }
+}
+
+/// 把段落切成带角色的片段。`focus` 是词序号（见 [`Piece::token`]）。
+pub fn paragraph_pieces(
+    paragraph: &str,
+    is_marked: impl Fn(&str) -> bool,
+    focus: Option<usize>,
+) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    let mut cursor = 0;
+    let mut word_index = 0;
+
+    for token in tokenize(paragraph) {
+        if token.start > cursor {
+            push_piece(&mut out, &paragraph[cursor..token.start], PieceKind::Plain, None);
+        }
+        let is_word = token.is_word();
+        let kind = if is_word && focus == Some(word_index) {
+            PieceKind::Focus
+        } else if is_word && is_marked(&token.lower) {
+            PieceKind::Marked
+        } else {
+            PieceKind::Plain
+        };
+        let index = is_word.then_some(word_index);
+        push_piece(&mut out, &paragraph[token.start..token.end], kind, index);
+        if is_word {
+            word_index += 1;
+        }
+        cursor = token.end;
+    }
+    if cursor < paragraph.len() {
+        push_piece(&mut out, &paragraph[cursor..], PieceKind::Plain, None);
+    }
+    out
+}
+
+fn push_piece(out: &mut Vec<Piece>, text: &str, kind: PieceKind, token: Option<usize>) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut() {
+        if last.kind == kind && last.token == token {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    out.push(Piece {
+        text: text.to_string(),
+        kind,
+        token,
+    });
+}
+
+/// 按显示宽度折行，规则与渲染层一致：优先在空格处断开，超长单词硬断。
+///
+/// 放在 `qe-core` 是因为鼠标点击要先把「点在第几行第几列」换算成词序号，
+/// 换算必须与渲染用同一套折行结果，否则点到的词和选中的词会差一个。
+pub fn layout_pieces(pieces: &[Piece], width: usize) -> Vec<Vec<Piece>> {
+    let max = width.max(8);
+    let flat: Vec<(char, PieceKind, Option<usize>)> = pieces
+        .iter()
+        .flat_map(|piece| {
+            piece
+                .text
+                .chars()
+                .map(move |ch| (ch, piece.kind, piece.token))
+        })
+        .collect();
+
+    if flat.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let char_width = |ch: char| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    let mut rows: Vec<Vec<Piece>> = Vec::new();
+    let mut line: Vec<(char, PieceKind, Option<usize>)> = Vec::new();
+    let mut width = 0usize;
+    let mut last_space: Option<usize> = None;
+
+    for (ch, kind, token) in flat {
+        let cw = char_width(ch);
+        if width + cw > max && width > 0 {
+            match last_space {
+                Some(index) if index > 0 => {
+                    let rest = line.split_off(index + 1);
+                    line.truncate(index);
+                    rows.push(coalesce_pieces(&line));
+                    line = rest;
+                }
+                _ => {
+                    rows.push(coalesce_pieces(&line));
+                    line.clear();
+                }
+            }
+            width = line.iter().map(|(c, _, _)| char_width(*c)).sum();
+            last_space = line.iter().rposition(|(c, _, _)| *c == ' ');
+        }
+
+        line.push((ch, kind, token));
+        width += cw;
+        if ch == ' ' {
+            last_space = Some(line.len() - 1);
+        }
+    }
+
+    if !line.is_empty() {
+        rows.push(coalesce_pieces(&line));
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+fn coalesce_pieces(chars: &[(char, PieceKind, Option<usize>)]) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    for (ch, kind, token) in chars {
+        if let Some(last) = out.last_mut() {
+            if last.kind == *kind && last.token == *token {
+                last.text.push(*ch);
+                continue;
+            }
+        }
+        out.push(Piece {
+            text: ch.to_string(),
+            kind: *kind,
+            token: *token,
+        });
+    }
+    out
+}
+
 /// 用户标注过的一个词。
 #[derive(Debug, Clone)]
 pub struct Marked {
@@ -266,6 +506,8 @@ pub struct ReadingSession {
     pub marked: Vec<Marked>,
     /// 精读模式下当前选中的第几个生词（配合数字键）。
     pub cursor: Option<usize>,
+    /// 当前段里选中的词序号（按出现顺序，只数词），`, .` 与鼠标点击都改它。
+    pub focus: Option<usize>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// 打开过几个词条。
     pub opened: u32,
@@ -283,6 +525,7 @@ impl ReadingSession {
             paragraph,
             marked: Vec::new(),
             cursor: None,
+            focus: None,
             started_at: chrono::Utc::now(),
             opened: 0,
             added: 0,
@@ -328,6 +571,7 @@ impl ReadingSession {
         }
         self.paragraph += 1;
         self.cursor = None;
+        self.focus = None;
         true
     }
 
@@ -337,6 +581,7 @@ impl ReadingSession {
         }
         self.paragraph -= 1;
         self.cursor = None;
+        self.focus = None;
         true
     }
 
@@ -346,7 +591,63 @@ impl ReadingSession {
         }
         self.paragraph = index;
         self.cursor = None;
+        self.focus = None;
         true
+    }
+
+    /// 当前段里能选中的词（按出现顺序，含重复）。
+    pub fn current_words(&self) -> Vec<Token> {
+        self.current()
+            .map(|paragraph| {
+                tokenize(paragraph)
+                    .into_iter()
+                    .filter(|token| token.is_word())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 选中第 `index` 个词。
+    pub fn focus_on(&mut self, index: usize) -> bool {
+        if index >= self.current_words().len() {
+            return false;
+        }
+        self.focus = Some(index);
+        true
+    }
+
+    /// `,` / `←` 那样按词移动。返回是否真的移动了。
+    pub fn focus_move(&mut self, delta: isize) -> bool {
+        let count = self.current_words().len();
+        if count == 0 {
+            return false;
+        }
+        let next = match self.focus {
+            Some(current) => (current as isize + delta).clamp(0, count as isize - 1) as usize,
+            None if delta < 0 => count - 1,
+            None => 0,
+        };
+        let changed = self.focus != Some(next);
+        self.focus = Some(next);
+        changed
+    }
+
+    pub fn clear_focus(&mut self) -> bool {
+        self.focus.take().is_some()
+    }
+
+    /// 选中的词条（小写）。用于查词与标记。
+    pub fn focused_lemma(&self) -> Option<String> {
+        let index = self.focus?;
+        self.current_words().get(index).map(|token| token.lower.clone())
+    }
+
+    /// 选中的词在当前段里的字节区间，用来判断它落在哪个词组里。
+    pub fn focused_span(&self) -> Option<(usize, usize)> {
+        let index = self.focus?;
+        self.current_words()
+            .get(index)
+            .map(|token| (token.start, token.end))
     }
 
     pub fn is_marked(&self, lemma: &str) -> bool {
@@ -523,5 +824,160 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].0, "All quiet.");
         assert!(!segments[0].1);
+    }
+
+    fn word_tokens(pieces: &[Piece]) -> Vec<(String, Option<usize>, PieceKind)> {
+        pieces
+            .iter()
+            .filter(|piece| piece.token.is_some())
+            .map(|piece| (piece.text.clone(), piece.token, piece.kind))
+            .collect()
+    }
+
+    #[test]
+    fn pieces_number_words_in_order() {
+        let pieces = paragraph_pieces("All quiet on the western front.", |_| false, None);
+        let words = word_tokens(&pieces);
+        assert_eq!(words.len(), 6);
+        assert_eq!(words[0], ("All".to_string(), Some(0), PieceKind::Plain));
+        assert_eq!(words[5].1, Some(5));
+        // 拼回来必须与原文一致，标点不能丢。
+        let rebuilt: String = pieces.iter().map(|piece| piece.text.as_str()).collect();
+        assert_eq!(rebuilt, "All quiet on the western front.");
+    }
+
+    #[test]
+    fn the_focused_word_wins_over_a_reader_mark() {
+        let pieces = paragraph_pieces("All quiet on the western front.", |word| word == "quiet", Some(1));
+        let focus: Vec<&Piece> = pieces
+            .iter()
+            .filter(|piece| piece.kind == PieceKind::Focus)
+            .collect();
+        assert_eq!(focus.len(), 1);
+        assert_eq!(focus[0].text, "quiet");
+        assert_eq!(focus[0].token, Some(1));
+    }
+
+    #[test]
+    fn layout_wraps_and_keeps_token_ids() {
+        let pieces = paragraph_pieces("alpha beta gamma delta epsilon", |_| false, Some(2));
+        let rows = layout_pieces(&pieces, 12);
+        assert!(rows.len() > 1, "narrow width must wrap: {rows:?}");
+        // 每个词都能在某一行里找到，且序号不变。
+        let tokens: Vec<usize> = rows
+            .iter()
+            .flatten()
+            .filter_map(|piece| piece.token)
+            .collect();
+        assert_eq!(tokens, vec![0, 1, 2, 3, 4]);
+        for row in &rows {
+            let used: usize = row
+                .iter()
+                .map(|piece| unicode_width::UnicodeWidthStr::width(piece.text.as_str()))
+                .sum();
+            assert!(used <= 12, "row exceeds the width: {used} {row:?}");
+        }
+    }
+
+    #[test]
+    fn focus_moves_word_by_word_and_clamps() {
+        let text = Text::new("t", "one two three");
+        let mut session = ReadingSession::new(text, ReadMode::Intensive, 0);
+        assert!(session.focused_lemma().is_none());
+
+        assert!(session.focus_move(1));
+        assert_eq!(session.focused_lemma().as_deref(), Some("one"));
+        session.focus_move(1);
+        assert_eq!(session.focused_lemma().as_deref(), Some("two"));
+        // 到头就停住，不绕回开头。
+        session.focus_move(1);
+        session.focus_move(1);
+        assert_eq!(session.focused_lemma().as_deref(), Some("three"));
+        session.focus_move(-1);
+        assert_eq!(session.focused_lemma().as_deref(), Some("two"));
+
+        assert!(session.focus_on(0));
+        assert_eq!(session.focused_lemma().as_deref(), Some("one"));
+        assert!(!session.focus_on(99), "out of range keeps the old focus");
+
+        assert!(session.clear_focus());
+        assert!(session.focused_lemma().is_none());
+    }
+
+    #[test]
+    fn moving_to_another_paragraph_drops_the_selection() {
+        let text = Text::new("t", "one two\n\nthree four");
+        let mut session = ReadingSession::new(text, ReadMode::Intensive, 0);
+        session.focus_on(1);
+        assert_eq!(session.focused_lemma().as_deref(), Some("two"));
+
+        assert!(session.next());
+        assert!(session.focused_lemma().is_none(), "the old index means nothing here");
+    }
+
+    #[test]
+    fn find_phrase_matches_whole_words_only() {
+        let paragraph = "A writer of note, and a data writer of sorts.";
+        let hits = find_phrase(paragraph, "a writer of");
+        // 第一个 "A writer of" 命中；"data writer of" 前面紧贴字母，不能算。
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        let (start, end) = hits[0];
+        assert_eq!(&paragraph[start..end], "A writer of");
+    }
+
+    #[test]
+    fn find_phrase_ignores_case_and_punctuation_boundaries() {
+        let paragraph = "\"The Sake Of It\", he said, for the sake of argument.";
+        assert_eq!(find_phrase(paragraph, "for the sake of").len(), 1);
+        assert_eq!(
+            find_phrase(paragraph, "the sake of").len(),
+            2,
+            "both the quoted and the lower-case one"
+        );
+        assert!(!find_phrase(paragraph, "sake of argument").is_empty());
+    }
+
+    #[test]
+    fn phrases_covering_keeps_only_the_phrase_around_the_word() {
+        let paragraph = "From a very early age I knew I should be a writer.";
+        let words = tokenize(paragraph);
+        let early = words
+            .iter()
+            .find(|token| token.lower == "early")
+            .expect("early");
+        let writer = words
+            .iter()
+            .find(|token| token.lower == "writer")
+            .expect("writer");
+        let collocations = vec![
+            Collocation::new("early age", "早年"),
+            Collocation::new("a writer of", "…的作者"),
+            Collocation::new("should be", "应该是"),
+        ];
+
+        let hits = phrases_covering(paragraph, (early.start, early.end), &collocations);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].phrase, "early age");
+        assert_eq!(hits[0].gloss, "早年");
+
+        // `a writer of` 不在本段原文里，选中 writer 时不该冒出来。
+        assert!(phrases_covering(paragraph, (writer.start, writer.end), &collocations).is_empty());
+    }
+
+    #[test]
+    fn a_phrase_spanning_the_selected_word_is_matched() {
+        // 词组可以只在中段覆盖选中词：读 `the` 时 `for the sake of` 也要生效。
+        let paragraph = "He did it for the sake of argument.";
+        let token = tokenize(paragraph)
+            .into_iter()
+            .find(|token| token.lower == "sake")
+            .expect("sake");
+        let hits = phrases_covering(
+            paragraph,
+            (token.start, token.end),
+            &[Collocation::new("for the sake of", "为了")],
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].gloss, "为了");
     }
 }

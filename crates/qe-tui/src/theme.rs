@@ -74,6 +74,14 @@ pub fn mark() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// 阅读时选中的那个词：反显，与「标记」的加粗区分开，一眼能看出光标停在哪。
+pub fn focus() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
 /// 面板背景。像代码块：一整块底色把内容圈起来，不画边框。
 pub const PANEL_BG: Color = Color::Indexed(236);
 

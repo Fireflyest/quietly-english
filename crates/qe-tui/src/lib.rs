@@ -5,5 +5,5 @@ pub mod render;
 pub mod terminal;
 pub mod theme;
 
-pub use render::{draw, DrawInfo, Suggestion, View, ViewMode};
+pub use render::{draw, DrawInfo, Suggestion, View, ViewMode, WordHit};
 pub use terminal::TerminalSession;

@@ -94,6 +94,8 @@ pub struct App {
     pub(crate) quiz_correct: u32,
     /// 阅读时是否显示译文（`/translate` 与 `tab` 切换，两种模式都生效）。
     pub(crate) show_translation: bool,
+    /// 下一帧把当前段滚进视野（全篇模式下翻页、选词后使用）。
+    pub(crate) reveal_anchor: bool,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
             quiz_correct: 0,
             // 译文默认隐藏：先读原文，需要对照时再按 tab。
             show_translation: false,
+            reveal_anchor: false,
         };
         app.load_history();
         app.greet()?;
@@ -192,6 +195,13 @@ impl App {
                 info = draw(frame, &view);
             })?;
             self.draw_info = info;
+
+            // 全篇模式下整篇文章一起渲染，当前段可能落在视野外（长文尤甚）。
+            // 翻页或选词后请求一次「把当前段带回来」，只在这一帧真滚动——
+            // 读者自己滚到别处再触发重画时，不会因为已经在视野内而被拽走。
+            if std::mem::take(&mut self.reveal_anchor) {
+                self.scroll_to_anchor();
+            }
 
             // Imports read a whole dictionary file; run them only once the frame is
             // on screen so the "importing" line is visible while it works.
@@ -265,6 +275,14 @@ impl App {
     }
 
     fn meta_line(&self) -> Option<String> {
+        // 阅读中显示「第几段 · 选中哪个词」，否则状态栏对选词毫无反馈。
+        if let Some(session) = self.reading.as_ref() {
+            let mut line = format!("{}/{}", session.paragraph + 1, session.total());
+            if let Some(lemma) = session.focused_lemma() {
+                line.push_str(&format!(" · {lemma}"));
+            }
+            return Some(line);
+        }
         let book = self.book.as_ref()?;
         let progress = self.store.progress(book.id).ok()?;
         let streak = self.store.streak().unwrap_or(0);
@@ -367,7 +385,24 @@ impl App {
                     self.open_word_at(index)?;
                     return Ok(());
                 }
-                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => {
+                // `,` `.` 按词移动选中位置：不占字母键，也不常用在英文输入里。
+                KeyCode::Char(',') => {
+                    self.move_focus(-1)?;
+                    return Ok(());
+                }
+                KeyCode::Char('.') => {
+                    self.move_focus(1)?;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    // 选中了词就打开它的完整卡片，否则翻到下一段。
+                    if self.focused_lemma().is_some() {
+                        return self.open_focused();
+                    }
+                    self.reading_next()?;
+                    return Ok(());
+                }
+                KeyCode::Char(' ') | KeyCode::Right => {
                     self.reading_next()?;
                     return Ok(());
                 }
@@ -380,6 +415,11 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Esc => {
+                    // 先取消选中，再按才是结束阅读。
+                    if self.focused_lemma().is_some() {
+                        self.clear_focus()?;
+                        return Ok(());
+                    }
                     self.finish_reading()?;
                     return Ok(());
                 }
@@ -491,7 +531,7 @@ impl App {
                     self.dragging = true;
                     self.scrub_to(mouse.row);
                 } else {
-                    self.open_row_at(mouse.row);
+                    self.open_row_at(mouse.row, mouse.column);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
@@ -502,8 +542,34 @@ impl App {
         }
     }
 
-    /// Clicking a row inside a result table opens that word.
-    fn open_row_at(&mut self, row: u16) {
+    /// 点击阅读段落里的词就选中它；表格行仍然打开整张词卡。
+    fn open_row_at(&mut self, row: u16, column: u16) {
+        // 阅读段落优先：命中区间精确到列，点空白处不选中任何词。
+        if let Some(hit) = self
+            .draw_info
+            .word_hits
+            .iter()
+            .find(|hit| hit.row == row && column >= hit.start && column < hit.end)
+            .copied()
+        {
+            let on_card = self
+                .reading
+                .as_ref()
+                .and_then(|session| session.message)
+                .map(|message| message == hit.message)
+                .unwrap_or(false);
+            if self.reading.is_some() && on_card {
+                // 词序号只在段内有效：点到别的段时先跳到那段，否则会选中当前段
+                // 里同序号的另一个词。
+                let _ = self.select_word_in(hit.paragraph, hit.token);
+                return;
+            }
+        }
+        self.open_table_row(row);
+    }
+
+    /// 点击结果表格里的某一行，打开该词。
+    fn open_table_row(&mut self, row: u16) {
         let info = &self.draw_info;
         let track = info.transcript;
         if row < track.y || row >= track.y + track.height {
@@ -540,6 +606,31 @@ impl App {
                     .without_ratings(),
             ));
         }
+    }
+
+    /// 把当前段锚点滚到视野顶部附近；只在这一帧的几何信息里算，不需要知道宽度。
+    ///
+    /// 已经在视野内的锚点不动：读者自己滚到别处再触发重画（切译文、标记）时，
+    /// 不该被强行拽回。
+    fn scroll_to_anchor(&mut self) {
+        let info = &self.draw_info;
+        let Some(line) = info.anchor_line else {
+            return;
+        };
+        if info.max_back == 0 {
+            return;
+        }
+        let offset = info.max_back.saturating_sub(self.scroll_back) as i32;
+        let screen_row = line as i32 - offset + i32::from(info.transcript.y);
+        let top = i32::from(info.transcript.y);
+        let bottom = top + i32::from(info.transcript.height);
+        if screen_row >= top && screen_row < bottom {
+            return;
+        }
+        // 目标：锚点落在视野第二行，上面留一行上下文。
+        let wanted = (line as i32 - 1).clamp(0, i32::from(info.max_back));
+        self.scroll_back = info.max_back - wanted as u16;
+        self.unread = 0;
     }
 
     fn scroll_by(&mut self, delta: i32) {        let next = self.scroll_back as i32 + delta;
@@ -846,13 +937,20 @@ impl App {
                     Ok(())
                 }
             },
-            Command::Take(arg) => match arg.trim().parse::<usize>() {
-                Ok(n) => self.add_reading_word(n),
-                Err(_) => {
-                    self.note("usage: /take <word number>");
-                    Ok(())
+            Command::Take(arg) => {
+                if arg.trim().is_empty() {
+                    // 不给序号时取选中的词，配合 `,` `.` / 点击使用。
+                    self.add_focused()
+                } else {
+                    match arg.trim().parse::<usize>() {
+                        Ok(n) => self.add_reading_word(n),
+                        Err(_) => {
+                            self.note("usage: /take <word number> · /take takes the selected word");
+                            Ok(())
+                        }
+                    }
                 }
-            },
+            }
             Command::Drop(title) => self.drop_text(&title),
             Command::Bury => self.bury_current(),
             Command::Undo => self.undo_last(),
@@ -888,7 +986,8 @@ impl App {
         body.push_str(
             "\ntype an English word to look it up.\n\
              in a session: 1-4 grade · enter next · tab hint · esc end\n\
-             reading: enter/→ next · ← prev · 1-9 open a word · tab translation\n\
+             reading: , . select a word (or click one) · enter full card · /take keeps it\n\
+             \t        space/→ next · ← prev · 1-9 open a word · tab translation · esc ends\n\
              \n\
              F2 releases the mouse so you can select and copy text; press it again \
              to get scroll and click back. Most terminals also accept shift+drag \
@@ -2216,6 +2315,306 @@ mod tests {
 
         // 不存在的标题只提示，不报错。
         app.execute(Command::Drop("nope".into())).unwrap();
+    }
+
+    fn reading_fixture(app: &mut App, dir: &tempfile::TempDir) -> String {
+        // 用 fixture 词书里的词，这样「选中词有词条」和「选中词查不到」两条路径
+        // 都能在同一段里测到（`the` 不在词书里）。
+        let path = dir.path().join("flow.txt");
+        std::fs::write(
+            &path,
+            "Inspect the consistent reject here.\n\nSecond paragraph here.",
+        )
+        .unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        "flow".to_string()
+    }
+
+    fn reading_card_view(app: &App) -> ToolView {
+        app.messages
+            .iter()
+            .rev()
+            .find_map(|message| match &message.body {
+                Body::Tool(view) if view.name == "read" => Some((**view).clone()),
+                _ => None,
+            })
+            .expect("reading card")
+    }
+
+    #[test]
+    fn comma_and_period_move_the_selection_and_show_it_inline() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.focused_lemma().as_deref(), Some("inspect"));
+
+        // 选中后，说明块就在同一张阅读卡里，不是新推一条消息。
+        let before = app.messages.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.messages.len(), before, "the card is replaced in place");
+        assert_eq!(app.focused_lemma().as_deref(), Some("the"));
+
+        let view = reading_card_view(&app);
+        assert!(
+            view.lines
+                .iter()
+                .any(|line| matches!(line, qe_core::view::ToolLine::Accent(text) if text.contains("the"))),
+            "the selected word's headword is drawn inline"
+        );
+        // `the` 不在测试词书里：说明块仍要出现，并说明词典没有这个词。
+        assert!(
+            view.lines.iter().any(|line| matches!(
+                line,
+                qe_core::view::ToolLine::Muted(text) if text.contains("no definition")
+            )),
+            "an unknown word still gets a panel"
+        );
+    }
+
+    #[test]
+    fn escaping_clears_the_selection_before_ending_the_reading() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.reading.is_some(), "first esc only drops the selection");
+        assert!(app.focused_lemma().is_none());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.reading.is_none(), "second esc ends the reading");
+    }
+
+    #[test]
+    fn enter_opens_the_full_card_for_the_selected_word() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        let before = card_count(&app);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(card_count(&app), before + 1, "a full word card is appended");
+        assert_eq!(app.reading.as_ref().unwrap().opened, 1);
+    }
+
+    /// 用渲染层给的命中区间模拟一次点击：这就是鼠标事件走的那条路径。
+    fn click_word(app: &mut App, pick: impl Fn(&qe_tui::lines::WordBox) -> bool) -> String {
+        let message_index = app
+            .reading
+            .as_ref()
+            .and_then(|session| session.message)
+            .expect("card message index");
+        let (_, hits) = qe_tui::lines::message_lines_hits(&app.messages[message_index], 80);
+        let hit = *hits
+            .words
+            .iter()
+            .find(|hit| pick(hit))
+            .expect("a matching word box");
+
+        app.draw_info.word_hits = hits
+            .words
+            .into_iter()
+            .map(|hit| qe_tui::WordHit {
+                row: hit.row as u16 + 1,
+                start: hit.start,
+                end: hit.end,
+                token: hit.token,
+                paragraph: hit.paragraph,
+                message: message_index,
+            })
+            .collect();
+        app.open_row_at(hit.row as u16 + 1, hit.start + 1);
+        app.focused_lemma().unwrap_or_default()
+    }
+
+    #[test]
+    fn clicking_a_word_in_the_paragraph_selects_it() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+
+        let clicked = click_word(&mut app, |hit| hit.token == 2);
+        assert_eq!(clicked, "consistent", "clicked word");
+    }
+
+    #[test]
+    fn clicking_a_word_below_the_current_paragraph_jumps_there_first() {
+        // 词序号只在段内有效：点第二段的第 3 个词，不能拿这个序号去第一段选词。
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.execute(Command::Mode("full".into())).unwrap();
+        assert_eq!(app.reading.as_ref().unwrap().paragraph, 0);
+
+        // 第二段是 "Second paragraph here."：token 2 = here。
+        let clicked = click_word(&mut app, |hit| hit.paragraph == Some(1) && hit.token == 2);
+        assert_eq!(clicked, "here", "the clicked word, not the first paragraph's");
+        assert_eq!(
+            app.reading.as_ref().unwrap().paragraph,
+            1,
+            "the reading position follows the click"
+        );
+        assert_eq!(
+            app.store
+                .reading_progress(app.store.text_by_title("flow").unwrap().unwrap().id)
+                .unwrap()
+                .map(|(paragraph, _)| paragraph),
+            Some(1),
+            "progress is persisted"
+        );
+    }
+
+    #[test]
+    fn closing_reading_keeps_the_paragraph_reached_by_a_click() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.execute(Command::Mode("full".into())).unwrap();
+        click_word(&mut app, |hit| hit.paragraph == Some(1) && hit.token == 0);
+        app.finish_reading().unwrap();
+
+        let id = app.store.texts().unwrap()[0].id;
+        assert_eq!(
+            app.store.reading_progress(id).unwrap().map(|(p, _)| p),
+            Some(1),
+            "resuming lands on the paragraph the reader clicked"
+        );
+    }
+
+    #[test]
+    fn slash_mark_with_no_argument_marks_the_selected_word() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        let focused = app.focused_lemma().expect("a selection");
+
+        app.execute(Command::Mark(String::new())).unwrap();
+        assert!(
+            app.reading.as_ref().unwrap().is_marked(&focused),
+            "the selected word is the one that gets marked"
+        );
+    }
+
+    #[test]
+    fn scroll_to_anchor_brings_an_offscreen_paragraph_into_view() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.execute(Command::Mode("full".into())).unwrap();
+
+        // 模拟一帧：40 行内容、10 行视口、锚点在第 25 行，现在停在顶部。
+        app.draw_info.transcript = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.draw_info.max_back = 30;
+        app.draw_info.anchor_line = Some(25);
+        app.scroll_back = 30; // offset = 0 → 锚点在第 25 行，视野外
+        app.scroll_to_anchor();
+        assert_eq!(app.scroll_back, 6, "anchor moves to the second visible line");
+
+        // 已经在视野内就不动，免得读者刚滚到别处就被拽回来。
+        app.draw_info.anchor_line = Some(30); // offset 24 → 屏幕第 6 行
+        let before = app.scroll_back;
+        app.scroll_to_anchor();
+        assert_eq!(app.scroll_back, before, "a visible anchor is left alone");
+
+        // 锚点跑到视口上方（往回翻）时同样要滚回去。
+        app.draw_info.anchor_line = Some(10);
+        app.scroll_to_anchor();
+        assert_eq!(app.scroll_back, 21, "an anchor above the viewport scrolls up");
+    }
+
+    #[test]
+    fn selecting_a_word_keeps_the_reader_in_place_in_full_mode() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.execute(Command::Mode("full".into())).unwrap();
+        // 读者已经滚到文章中间。
+        app.scroll_back = 12;
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.reveal_anchor,
+            "the next frame should check whether the paragraph is on screen"
+        );
+        assert_eq!(app.scroll_back, 12, "selection must not jump to the end");
+    }
+
+    #[test]
+    fn selecting_a_word_with_phrases_shows_them_next_to_the_definition() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        // fixture 段落是 "Inspect the consistent reject here."：
+        // 只有真的出现在这段里的词组才会被提示。
+        app.store
+            .add_collocation("inspect", "inspect the", "检查那些")
+            .unwrap();
+        app.store
+            .add_collocation("inspect", "inspect for", "检查是否存在")
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.focused_lemma().as_deref(), Some("inspect"));
+
+        let view = reading_card_view(&app);
+        let split = view
+            .lines
+            .iter()
+            .find_map(|line| match line {
+                qe_core::view::ToolLine::Split { right, .. } => Some(right.clone()),
+                _ => None,
+            })
+            .expect("a phrase column for the matched phrase");
+        assert!(
+            !split
+                .iter()
+                .any(|line| matches!(line, qe_core::view::ToolLine::Muted(_))),
+            "no header row: the phrases start on the first line so they line up \
+             with the headword"
+        );
+        let phrases: Vec<(String, String)> = split
+            .iter()
+            .filter_map(|line| match line {
+                qe_core::view::ToolLine::PhraseInline { phrase, gloss } => {
+                    Some((phrase.clone(), gloss.clone()))
+                }
+                qe_core::view::ToolLine::Phrase { phrase, gloss } => {
+                    Some((phrase.clone(), gloss.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phrases,
+            vec![("inspect the".to_string(), "检查那些".to_string())],
+            "only the phrase the paragraph actually uses"
+        );
+    }
+
+    #[test]
+    fn a_phrase_absent_from_the_paragraph_is_not_shown() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        // `inspect for` 不在本段原文里，选中 inspect 时不该出现。
+        app.store
+            .add_collocation("inspect", "inspect for", "检查是否存在")
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
+            .unwrap();
+        let view = reading_card_view(&app);
+        assert!(
+            !view.lines.iter().any(|line| matches!(
+                line,
+                qe_core::view::ToolLine::Split { .. } | qe_core::view::ToolLine::Phrase { .. }
+            )),
+            "nothing to show when the paragraph does not use the phrase"
+        );
     }
 
     #[test]

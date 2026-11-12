@@ -61,6 +61,25 @@ pub struct DrawInfo {
     pub row_message: Vec<usize>,
     /// Line offset of each message inside its own block, parallel to `row_message`.
     pub row_offset: Vec<usize>,
+    /// 阅读段落里每个词占的屏幕位置，供点击选词。
+    pub word_hits: Vec<WordHit>,
+    /// 当前段锚点行（`▸ 12/50`）在渲染行里的绝对行号，滚动时用它把当前段带回视野。
+    pub anchor_line: Option<usize>,
+}
+
+/// 一个词在屏幕上的矩形（列范围 + 行）：`(row, start, end, token, message)`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordHit {
+    /// 绝对行号（终端坐标）。
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+    /// 词在当前段落里的序号（只数词，从 0 开始）。
+    pub token: usize,
+    /// 这段在全文里的段号；`None` 表示就是当前段（精读模式）。
+    pub paragraph: Option<usize>,
+    /// 这条词所属的消息下标。
+    pub message: usize,
 }
 
 pub fn draw(frame: &mut Frame, view: &View) -> DrawInfo {
@@ -130,6 +149,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
     // Parallel array: which message each rendered line came from, and the line's
     // offset inside that message's block. Used for click-to-select.
     let mut owners: Vec<(usize, usize)> = Vec::new();
+    // Word boxes relative to the unpadded transcript, shifted to screen rows below.
+    let mut word_boxes: Vec<(usize, u16, u16, usize, Option<usize>, usize)> = Vec::new();
+    // 锚点行（相对未填充的 transcript）。
+    let mut anchor_rows: Vec<usize> = Vec::new();
 
     let mut previous_was_text = false;
     for (index, message) in view.messages.iter().enumerate() {
@@ -140,7 +163,21 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
             rendered.push(Line::from(""));
             owners.push((index, usize::MAX));
         }
-        let block = crate::lines::message_lines(message, width);
+        let (block, hits) = crate::lines::message_lines_hits(message, width);
+        let base_row = rendered.len();
+        for hit in hits.words {
+            word_boxes.push((
+                base_row + hit.row,
+                hit.start,
+                hit.end,
+                hit.token,
+                hit.paragraph,
+                index,
+            ));
+        }
+        for row in hits.anchors {
+            anchor_rows.push(base_row + row);
+        }
         for (offset, line) in block.into_iter().enumerate() {
             rendered.push(line);
             owners.push((index, offset));
@@ -189,12 +226,33 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
         frame.render_stateful_widget(bar, area, &mut state);
     }
 
+    // 只在可见行上换算屏幕坐标，滚动出去的词不该还能被点到。
+    let word_hits: Vec<WordHit> = word_boxes
+        .into_iter()
+        .filter_map(|(row, start, end, token, paragraph, message)| {
+            let screen_row = (row as i64) - i64::from(offset) + i64::from(area.y);
+            if screen_row < i64::from(area.y) || screen_row >= i64::from(area.y + area.height) {
+                return None;
+            }
+            Some(WordHit {
+                row: screen_row as u16,
+                start: area.x + start,
+                end: area.x + end,
+                token,
+                paragraph,
+                message,
+            })
+        })
+        .collect();
+
     DrawInfo {
         transcript: area,
         scrollbar_x,
         max_back,
         row_message,
         row_offset,
+        word_hits,
+        anchor_line: anchor_rows.first().copied(),
     }
 }
 
@@ -372,6 +430,18 @@ mod tests {
         out
     }
 
+    fn draw_info(view: &View, width: u16, height: u16) -> DrawInfo {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut info = DrawInfo::default();
+        terminal
+            .draw(|frame| {
+                info = draw(frame, view);
+            })
+            .unwrap();
+        info
+    }
+
     fn sample_word() -> Word {
         let mut word = Word::new("inspect", "v. 检查；视察");
         word.phonetic = Some("/ɪnˈspekt/".into());
@@ -463,9 +533,78 @@ mod tests {
         assert!(text.contains('█'), "thumb should be visible:\n{text}");
     }
 
+    fn reading_view<'a>(messages: &'a [Message], scroll_back: u16) -> View<'a> {
+        View {
+            messages,
+            input: "",
+            input_cursor: 0,
+            mode: ViewMode::Input,
+            title: "",
+            context: None,
+            meta: None,
+            status: "",
+            placeholder: "",
+            ghost: None,
+            suggestions: &[],
+            suggestions_more: 0,
+            scroll_back,
+            cursor_on: true,
+            unread: 0,
+        }
+    }
+
+    fn long_article(paragraphs: usize) -> qe_core::reading::Text {
+        let body = (1..=paragraphs)
+            .map(|n| format!("Paragraph {n} keeps going with enough words to wrap a line."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        qe_core::reading::Text::new("Long", body)
+    }
+
     #[test]
-    fn cards_are_separated_by_blank_lines() {
-        let messages = vec![
+    fn full_mode_reports_the_current_paragraph_anchor() {
+        // 长文里当前段可能在视野外，渲染层要把它所在行回报给 app，才能滚回去。
+        let session = qe_core::reading::ReadingSession::new(
+            long_article(40),
+            qe_core::reading::ReadMode::Full,
+            20,
+        );
+        let messages = vec![Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            None,
+        ))];
+        let info = draw_info(&reading_view(&messages, 0), 60, 10);
+        let line = info.anchor_line.expect("the anchor line is reported");
+        assert!(line > info.transcript.height as usize, "anchor is off-screen: {line}");
+
+        // 滚到它附近之后仍能报出来，app 据此判断「已经在视野内」。
+        let offset = (line as u16).saturating_sub(2);
+        let info = draw_info(&reading_view(&messages, info.max_back - offset), 60, 10);
+        assert_eq!(info.anchor_line, Some(line));
+    }
+
+    #[test]
+    fn close_reading_has_no_anchor() {
+        // 精读模式一屏只有一段，没有需要追踪的锚点行。
+        let session = qe_core::reading::ReadingSession::new(
+            long_article(5),
+            qe_core::reading::ReadMode::Intensive,
+            2,
+        );
+        let messages = vec![Message::tool(ToolView::reading_card(
+            &session,
+            &[],
+            false,
+            None,
+        ))];
+        let info = draw_info(&reading_view(&messages, 0), 60, 12);
+        assert_eq!(info.anchor_line, None);
+    }
+
+    #[test]
+    fn cards_are_separated_by_blank_lines() {        let messages = vec![
             Message::tool(ToolView::new("word").badge("1/2").result("alpha")),
             Message::tool(ToolView::new("word").badge("2/2").result("beta")),
         ];

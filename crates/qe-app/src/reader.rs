@@ -5,8 +5,7 @@
 
 use anyhow::Result;
 use qe_core::model::{Quiz, ReadingLog, Word};
-use qe_core::reading::{ReadMode, ReadingSession, Text};
-use qe_core::view::{Accent, Candidate, Message, ToolView};
+use qe_core::reading::{ReadMode, ReadingSession, Text};use qe_core::view::{Accent, Candidate, Message, ToolView};
 
 use crate::app::App;
 
@@ -115,14 +114,36 @@ impl App {
         out
     }
 
+    /// 阅读时显示选中的词（状态栏用），没选词时为 `None`。
+    pub(crate) fn focused_lemma(&self) -> Option<String> {
+        self.reading.as_ref()?.focused_lemma()
+    }
+
     /// 重画阅读卡片（原地替换那条消息）。
     pub fn render_reading(&mut self) -> Result<()> {
         let Some(session) = self.reading.as_ref() else {
             return Ok(());
         };
         let candidates = self.reading_candidates();
-        let view = ToolView::reading_card(session, &candidates, self.show_translation);
+        // 选中词的说明块就在卡片里，不另开一张卡：查不到词条时把 lemma 也传进去，
+        // 卡片会显示「未收录」，读者仍能看出选中的是哪个词。
+        let focused = session
+            .focused_lemma()
+            .map(|lemma| {
+                let word = self.store.word(&lemma).ok().flatten();
+                (lemma, word)
+            });
+        let selection = focused
+            .as_ref()
+            .map(|(lemma, word)| (lemma.as_str(), word.as_ref()));
+        let view = ToolView::reading_card(
+            session,
+            &candidates,
+            self.show_translation,
+            selection,
+        );
         let message = Message::tool(view);
+        let full_mode = session.mode == ReadMode::Full;
         match session.message {
             Some(index) if index < self.messages.len() => self.messages[index] = message,
             _ => {
@@ -133,7 +154,14 @@ impl App {
                 }
             }
         }
-        self.scroll_back = 0;
+        if full_mode {
+            // 全篇模式把整篇画成一条消息：保持当前滚动位置，交给下一帧的
+            // `scroll_to_anchor` 判断当前段是否需要被带回视野，避免先跳到全文
+            // 末尾再跳回来。
+            self.reveal_anchor = true;
+        } else {
+            self.scroll_back = 0;
+        }
         self.refresh_status();
         Ok(())
     }
@@ -376,11 +404,16 @@ impl App {
             return Ok(());
         };
         let lemma = if arg.trim().is_empty() {
-            self.reading_candidates()
-                .into_iter()
-                .find(|candidate| !candidate.marked)
-                .map(|candidate| candidate.lemma)
-                .unwrap_or_default()
+            // 有选中词就标它；否则退回到「第一个还没标记的候选」。
+            if let Some(focused) = session.focused_lemma() {
+                focused
+            } else {
+                self.reading_candidates()
+                    .into_iter()
+                    .find(|candidate| !candidate.marked)
+                    .map(|candidate| candidate.lemma)
+                    .unwrap_or_default()
+            }
         } else if arg.trim().eq_ignore_ascii_case("all") {
             return self.mark_all_candidates();
         } else {
@@ -552,6 +585,99 @@ impl App {
                 .muted("text, progress, marks and quizzes deleted"),
         ));
         self.refresh_status();
+        Ok(())
+    }
+
+    /// 选中当前段第 `index` 个词（0 基），并重画卡片。
+    pub fn select_word(&mut self, index: usize) -> Result<()> {
+        let Some(session) = self.reading.as_mut() else {
+            return Ok(());
+        };
+        if !session.focus_on(index) {
+            return Ok(());
+        }
+        self.render_reading()
+    }
+
+    /// 选中第 `paragraph` 段的第 `index` 个词。
+    ///
+    /// 全篇模式下一屏里能看到好几段，点击落在哪一段都得选对：词序号只在段内
+    /// 有效，所以点到别的段时先把阅读位置移过去（并落库），再选词。
+    pub fn select_word_in(&mut self, paragraph: Option<usize>, index: usize) -> Result<()> {
+        let Some(session) = self.reading.as_mut() else {
+            return Ok(());
+        };
+        let Some(paragraph) = paragraph.filter(|&paragraph| paragraph != session.paragraph) else {
+            return self.select_word(index);
+        };
+        if paragraph >= session.total() {
+            return Ok(());
+        }
+        session.paragraph = paragraph;
+        session.cursor = None;
+        if !session.focus_on(index) {
+            return Ok(());
+        }
+        let (id, paragraph, mode) = (session.text.id, session.paragraph, session.mode);
+        self.store.save_reading_progress(id, paragraph, mode)?;
+        self.render_reading()?;
+        Ok(())
+    }
+
+    /// `,` / `.`：按词移动选中位置。`delta` 为 −1 时向前。
+    pub fn move_focus(&mut self, delta: isize) -> Result<()> {
+        let Some(session) = self.reading.as_mut() else {
+            return Ok(());
+        };
+        if !session.focus_move(delta) {
+            return Ok(());
+        }
+        self.render_reading()
+    }
+
+    pub fn clear_focus(&mut self) -> Result<()> {
+        let Some(session) = self.reading.as_mut() else {
+            return Ok(());
+        };
+        if !session.clear_focus() {
+            return Ok(());
+        }
+        self.render_reading()
+    }
+
+    /// 打开选中词的完整卡片（词根、例句、搭配都在那里）。
+    pub fn open_focused(&mut self) -> Result<()> {
+        let Some(session) = self.reading.as_ref() else {
+            return Ok(());
+        };
+        let Some(lemma) = session.focused_lemma() else {
+            self.note("no word selected · , and . move between words · click one too");
+            return Ok(());
+        };
+        self.lookup(&lemma)?;
+        if let Some(session) = self.reading.as_mut() {
+            session.opened += 1;
+            // 卡片沉到历史里，下次翻页再起一张。
+            session.message = None;
+        }
+        Ok(())
+    }
+
+    /// 把选中的词收进词书。
+    pub fn add_focused(&mut self) -> Result<()> {
+        let Some(session) = self.reading.as_ref() else {
+            self.note("not reading · /read to start");
+            return Ok(());
+        };
+        let Some(lemma) = session.focused_lemma() else {
+            self.note("no word selected · , and . move between words");
+            return Ok(());
+        };
+        self.add_word(&lemma)?;
+        if let Some(session) = self.reading.as_mut() {
+            session.added += 1;
+            session.message = None;
+        }
         Ok(())
     }
 
