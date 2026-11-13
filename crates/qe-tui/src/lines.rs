@@ -415,6 +415,23 @@ fn rows_with_inner(
                     rows.push(vec![Span::styled(piece, palette.muted)]);
                 }
             }
+            ToolLine::ReadingTranslation { text, active } => {
+                for piece in wrap(text, inner) {
+                    let mut style = theme::muted();
+                    if *active {
+                        style = style.bg(theme::READING_BG);
+                    }
+                    let width = display_width(&piece);
+                    let mut row = vec![Span::styled(piece.clone(), style)];
+                    if *active && width < inner {
+                        row.push(Span::styled(
+                            " ".repeat(inner - width),
+                            theme::reading_fill(),
+                        ));
+                    }
+                    rows.push(row);
+                }
+            }
             ToolLine::Accent(text) => {
                 for piece in wrap(text, inner) {
                     rows.push(vec![Span::styled(piece, palette.accent)]);
@@ -477,8 +494,12 @@ fn rows_with_inner(
             ToolLine::Sense { label, text } => {
                 rows.extend(sense_rows(label, text, inner));
             }
-            ToolLine::Paragraph { pieces, index } => {
-                let (paragraph, boxes) = paragraph_rows(pieces, inner);
+            ToolLine::Paragraph {
+                pieces,
+                index,
+                active,
+            } => {
+                let (paragraph, boxes) = paragraph_rows(pieces, inner, *active);
                 let base = rows.len();
                 for hit in boxes {
                     hits.words.push(WordBox {
@@ -490,6 +511,28 @@ fn rows_with_inner(
                     });
                 }
                 rows.extend(paragraph);
+            }
+            ToolLine::ReadingProgress {
+                value,
+                max,
+                complete,
+            } => {
+                const BAR_WIDTH: usize = 24;
+                let filled = if *max == 0 {
+                    0
+                } else {
+                    ((*value as usize * BAR_WIDTH) / *max as usize).min(BAR_WIDTH)
+                };
+                let style = if *complete {
+                    theme::accent_plain()
+                } else {
+                    theme::faint()
+                };
+                rows.push(vec![
+                    Span::styled("  ".to_string(), theme::faint()),
+                    Span::styled("━".repeat(filled), style),
+                    Span::styled("─".repeat(BAR_WIDTH - filled), theme::faint()),
+                ]);
             }
             ToolLine::Split { left, right } => {
                 let base = rows.len();
@@ -896,6 +939,7 @@ fn phrase_table(entries: &[(&str, &str)], width: usize) -> Vec<Vec<Span<'static>
 fn paragraph_rows(
     pieces: &[qe_core::reading::Piece],
     width: usize,
+    active: bool,
 ) -> (Vec<Vec<Span<'static>>>, Vec<WordBox>) {
     const INDENT: usize = 2;
 
@@ -905,17 +949,33 @@ fn paragraph_rows(
 
     for (row_index, row) in laid_out.iter().enumerate() {
         if row.is_empty() {
-            out.push(vec![Span::styled(" ".repeat(INDENT), Style::default())]);
+            let style = if active {
+                theme::reading_fill()
+            } else {
+                Style::default()
+            };
+            out.push(vec![
+                Span::styled(" ".repeat(INDENT), style),
+                Span::styled(" ".repeat(width.saturating_sub(INDENT)), style),
+            ]);
             continue;
         }
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(INDENT), Style::default())];
+        let row_style = if active {
+            theme::reading_fill()
+        } else {
+            Style::default()
+        };
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(" ".repeat(INDENT), row_style)];
         let mut column = INDENT;
         for piece in row {
-            let style = match piece.kind {
+            let mut style = match piece.kind {
                 qe_core::reading::PieceKind::Plain => theme::text(),
                 qe_core::reading::PieceKind::Marked => theme::mark(),
                 qe_core::reading::PieceKind::Focus => theme::focus(),
             };
+            if active && piece.kind != qe_core::reading::PieceKind::Focus {
+                style = style.bg(theme::READING_BG);
+            }
             let width = display_width(&piece.text);
             if let Some(token) = piece.token {
                 push_hit(
@@ -928,6 +988,12 @@ fn paragraph_rows(
             }
             column += width;
             spans.push(Span::styled(piece.text.clone(), style));
+        }
+        if active && column < width {
+            spans.push(Span::styled(
+                " ".repeat(width - column),
+                theme::reading_fill(),
+            ));
         }
         out.push(spans);
     }

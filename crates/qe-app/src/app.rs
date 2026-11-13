@@ -101,6 +101,8 @@ pub struct App {
     pub(crate) pin_view: bool,
     /// 上一帧段落锚点的行号，用来算 `pin_view` 要补的位移。
     prev_anchor: Option<usize>,
+    /// 上次为阅读进度条重绘的时间。
+    reading_progress_tick: Instant,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落结果)`。
@@ -157,6 +159,7 @@ impl App {
             reveal_anchor: false,
             pin_view: false,
             prev_anchor: None,
+            reading_progress_tick: Instant::now(),
             news_fetch: None,
             translation_fetch: None,
             db_path: None,
@@ -317,6 +320,12 @@ impl App {
             self.poll_news_fetch();
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
+            if self.reading.is_some()
+                && self.reading_progress_tick.elapsed() >= Duration::from_secs(1)
+            {
+                self.reading_progress_tick = Instant::now();
+                let _ = self.render_reading();
+            }
 
             if self.toggle_mouse {
                 self.toggle_mouse = false;
@@ -2375,7 +2384,11 @@ mod tests {
         };
         let has_translation = |view: &ToolView| {
             view.lines.iter().any(|line| {
-                matches!(line, qe_core::view::ToolLine::Muted(text) if text.contains("从很小的时候"))
+                matches!(
+                    line,
+                    qe_core::view::ToolLine::ReadingTranslation { text, .. }
+                        if text.contains("从很小的时候")
+                )
             })
         };
 
@@ -2672,9 +2685,9 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_word_in_another_paragraph_keeps_the_reading_position() {
+    fn clicking_a_word_in_another_paragraph_advances_reading_position() {
         // 词序号只在段内有效：点第二段的第 3 个词，不能拿这个序号去第一段选词；
-        // 但顺手把阅读位置和进度挪过去就成了「点一下词全文乱跳」。
+        // 同时把它设为当前段，让鼠标阅读自然推进。
         let Harness { mut app, _dir } = harness();
         reading_fixture(&mut app, &_dir);
         app.execute(Command::Mode("full".into())).unwrap();
@@ -2684,22 +2697,24 @@ mod tests {
         let clicked = click_word(&mut app, |hit| hit.paragraph == Some(1) && hit.token == 2);
         assert_eq!(clicked, "here", "the clicked word, not the first paragraph's");
         let session = app.reading.as_ref().unwrap();
-        assert_eq!(session.paragraph, 0, "the reading position stays put");
+        assert_eq!(session.paragraph, 1, "clicking a later paragraph advances to it");
         assert_eq!(
             session.focus_paragraph(),
             Some(1),
             "the selection is remembered with its own paragraph"
         );
-        let id = app.store.text_by_title("flow").unwrap().unwrap().id;
         assert_eq!(
-            app.store.reading_progress(id).unwrap().map(|(p, _)| p),
+            app.store
+                .reading_progress(app.store.text_by_title("flow").unwrap().unwrap().id)
+                .unwrap()
+                .map(|(p, _)| p),
             Some(0),
-            "a click is not progress: /mode saved paragraph 0, the click did not move it"
+            "the new position is persisted when reading is closed"
         );
     }
 
     #[test]
-    fn closing_reading_keeps_the_position_reached_by_navigation() {
+    fn closing_reading_persists_a_paragraph_reached_by_click() {
         let Harness { mut app, _dir } = harness();
         reading_fixture(&mut app, &_dir);
         app.execute(Command::Mode("full".into())).unwrap();
@@ -2709,8 +2724,8 @@ mod tests {
         let id = app.store.texts().unwrap()[0].id;
         assert_eq!(
             app.store.reading_progress(id).unwrap().map(|(p, _)| p),
-            Some(0),
-            "a click does not move the paragraph that closing persists"
+            Some(1),
+            "a click advances the paragraph that closing persists"
         );
     }
 

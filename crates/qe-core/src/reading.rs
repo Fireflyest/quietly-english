@@ -586,6 +586,8 @@ pub struct ReadingSession {
     /// `paragraph`；否则点一下就把读者的进度和视野一起挪走了。
     pub focus_at: Option<usize>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// 当前段开始阅读的时间，用于段间阅读进度提示。
+    pub paragraph_started_at: chrono::DateTime<chrono::Utc>,
     /// 机器翻译补上的段落译文：段落序号 → 译文。
     ///
     /// 单独放，不写进 `text.translation`：那个字段按空行对齐段落，中间插空段
@@ -601,6 +603,7 @@ pub struct ReadingSession {
 
 impl ReadingSession {
     pub fn new(text: Text, mode: ReadMode, paragraph: usize) -> Self {
+        let now = chrono::Utc::now();
         Self {
             text,
             mode,
@@ -609,7 +612,8 @@ impl ReadingSession {
             cursor: None,
             focus: None,
             focus_at: None,
-            started_at: chrono::Utc::now(),
+            started_at: now,
+            paragraph_started_at: now,
             machine: std::collections::BTreeMap::new(),
             opened: 0,
             added: 0,
@@ -644,6 +648,20 @@ impl ReadingSession {
         self.translation_at(self.paragraph)
     }
 
+    /// Estimated reading time for the current paragraph at 180 words/minute.
+    /// Returns elapsed seconds capped at the estimate, and the estimate.
+    pub fn reading_progress(&self) -> (u32, u32) {
+        let words = self
+            .current()
+            .map(|paragraph| tokenize(paragraph).into_iter().filter(|token| token.is_word()).count())
+            .unwrap_or(0);
+        let estimate = ((words as f64 / 3.0).ceil() as u32).max(1);
+        let elapsed = (chrono::Utc::now() - self.paragraph_started_at)
+            .num_seconds()
+            .max(0) as u32;
+        (elapsed.min(estimate), estimate)
+    }
+
     /// 当前段的所有可查词（去重，按出现顺序）。
     pub fn current_tokens(&self) -> Vec<Token> {
         let Some(paragraph) = self.current() else {
@@ -669,6 +687,7 @@ impl ReadingSession {
             return false;
         }
         self.paragraph += 1;
+        self.paragraph_started_at = chrono::Utc::now();
         self.cursor = None;
         self.clear_focus();
         true
@@ -679,6 +698,7 @@ impl ReadingSession {
             return false;
         }
         self.paragraph -= 1;
+        self.paragraph_started_at = chrono::Utc::now();
         self.cursor = None;
         self.clear_focus();
         true
@@ -689,6 +709,7 @@ impl ReadingSession {
             return false;
         }
         self.paragraph = index;
+        self.paragraph_started_at = chrono::Utc::now();
         self.cursor = None;
         self.clear_focus();
         true

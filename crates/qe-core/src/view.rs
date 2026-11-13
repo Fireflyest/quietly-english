@@ -334,9 +334,6 @@ impl ToolView {
             crate::reading::ReadMode::Full => {
                 // 全篇：连续输出，靠终端滚动阅读。段落之间空一行。
                 for (index, paragraph) in text.paragraphs().iter().enumerate() {
-                    if index > 0 {
-                        view = view.spacer();
-                    }
                     // 全篇模式没有「当前段」的独立画面，用一行暗色标记指出
                     // `next` / `goto` 把位置移到哪了，否则这两个键看不出效果。
                     // `Anchor` 让渲染层回报这一行的位置，滚动时据此把当前段带回视野。
@@ -356,11 +353,15 @@ impl ToolView {
                             focus_here,
                         ),
                         index: Some(index),
+                        active: index == session.paragraph,
                     });
                     if show_translation {
                         if let Some(translation) = session.translation_at(index) {
                             for line in translation.lines() {
-                                view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                                view = view.line(ToolLine::ReadingTranslation {
+                                    text: format!("  {}", line.trim()),
+                                    active: index == session.paragraph,
+                                });
                             }
                         }
                     }
@@ -370,6 +371,16 @@ impl ToolView {
                         if let Some((lemma, word)) = selection {
                             view = word_panel(view, session, lemma, word);
                         }
+                    }
+                    if index < text.paragraph_count().saturating_sub(1)
+                        && index == session.paragraph
+                    {
+                        let (value, max) = session.reading_progress();
+                        view = view.line(ToolLine::ReadingProgress {
+                            value,
+                            max,
+                            complete: value >= max,
+                        });
                     }
                 }
             }
@@ -383,13 +394,17 @@ impl ToolView {
                     view = view.line(ToolLine::Paragraph {
                         pieces: crate::reading::paragraph_pieces(paragraph, is_marked, focus_here),
                         index: None,
+                        active: true,
                     });
                 }
                 if show_translation {
                     if let Some(translation) = session.current_translation() {
                         for line in translation.lines() {
                             // 缩进与原文对齐，读起来像同一段的两种语言。
-                            view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
+                            view = view.line(ToolLine::ReadingTranslation {
+                                text: format!("  {}", line.trim()),
+                                active: true,
+                            });
                         }
                     }
                 }
@@ -872,7 +887,17 @@ pub enum ToolLine {
     Paragraph {
         pieces: Vec<crate::reading::Piece>,
         index: Option<usize>,
+        active: bool,
     },
+    /// A subtle separator between reading paragraphs, filled according to the
+    /// estimated time spent on the current paragraph.
+    ReadingProgress {
+        value: u32,
+        max: u32,
+        complete: bool,
+    },
+    /// A translated line belonging to a reading paragraph block.
+    ReadingTranslation { text: String, active: bool },
     /// 阅读时的当前段标记（`▸ 12/50`）。渲染层回报它的行号，滚动时用来把
     /// 当前段带回视野；它只是位置提示，没有别的含义。
     Anchor(String),

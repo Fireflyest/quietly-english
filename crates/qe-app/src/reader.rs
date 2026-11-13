@@ -923,9 +923,8 @@ impl App {
 
     /// 选中第 `paragraph` 段的第 `index` 个词。
     ///
-    /// 全篇模式下一屏里能看到好几段，点击落在哪一段都得选对：词序号只在段内
-    /// 有效，所以选中词要记住它所在的是哪一段。但阅读位置和进度**不动**——
-    /// 点一下词就把读者的进度挪走（连视野一起跳）是最烦人的那种行为。
+    /// 全篇模式下一屏里能看到好几段。点到下一段时先把它设为当前段，再选中词；
+    /// 这样鼠标阅读不需要额外按一次翻页键。
     pub fn select_word_in(&mut self, paragraph: Option<usize>, index: usize) -> Result<()> {
         let Some(session) = self.reading.as_mut() else {
             return Ok(());
@@ -933,6 +932,9 @@ impl App {
         let paragraph = paragraph.unwrap_or(session.paragraph);
         if paragraph >= session.total() {
             return Ok(());
+        }
+        if paragraph != session.paragraph {
+            session.go_to(paragraph);
         }
         if !session.focus_in(paragraph, index) {
             return Ok(());

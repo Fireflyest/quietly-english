@@ -84,10 +84,16 @@ pub fn focus() -> Style {
 
 /// 面板背景。像代码块：一整块底色把内容圈起来，不画边框。
 pub const PANEL_BG: Color = Color::Indexed(236);
+/// Very subtle background for the paragraph currently being read.
+pub const READING_BG: Color = Color::Indexed(237);
 
 /// 面板的空白填充，用来把底色铺满整行。
 pub fn panel_fill() -> Style {
     Style::default().bg(PANEL_BG)
+}
+
+pub fn reading_fill() -> Style {
+    Style::default().bg(READING_BG)
 }
 
 // ------------------------------------------------------------------ code theme
