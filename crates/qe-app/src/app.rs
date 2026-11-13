@@ -103,6 +103,8 @@ pub struct App {
     prev_anchor: Option<usize>,
     /// 上次为阅读进度条重绘的时间。
     reading_progress_tick: Instant,
+    /// Start time of the short progressive reveal when advancing to a card.
+    study_fade_started: Option<Instant>,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落结果)`。
@@ -160,6 +162,7 @@ impl App {
             pin_view: false,
             prev_anchor: None,
             reading_progress_tick: Instant::now(),
+            study_fade_started: None,
             news_fetch: None,
             translation_fetch: None,
             db_path: None,
@@ -320,6 +323,14 @@ impl App {
             self.poll_news_fetch();
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
+            if let Some(started) = self.study_fade_started {
+                if started.elapsed() >= Duration::from_millis(600) {
+                    self.study_fade_started = None;
+                    let _ = self.render_card();
+                } else {
+                    let _ = self.render_card();
+                }
+            }
             if self.reading.is_some()
                 && self.reading_progress_tick.elapsed() >= Duration::from_secs(1)
             {
@@ -1695,6 +1706,7 @@ impl App {
         if let Some(session) = self.session.as_mut() {
             session.set_current(card);
         }
+        self.study_fade_started = Some(Instant::now());
         self.render_card()?;
         self.scroll_back = 0;
         self.refresh_status();
@@ -1711,6 +1723,20 @@ impl App {
         let Some(card) = session.current.clone() else {
             return Ok(());
         };
+        let fade_stage = self.study_fade_started.map(|started| {
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_millis(120) {
+                0
+            } else if elapsed < Duration::from_millis(240) {
+                1
+            } else if elapsed < Duration::from_millis(360) {
+                2
+            } else if elapsed < Duration::from_millis(480) {
+                3
+            } else {
+                4
+            }
+        });
 
         // Rail colour encodes card state: red when the word was forgotten, yellow
         // while a hint is showing, green for a fresh word, blue for a review.
@@ -1723,6 +1749,9 @@ impl App {
         let mut state = CardState::new(card.word.clone(), session.badge())
             .hint(session.hint)
             .accent(accent);
+        if let Some(stage) = fade_stage {
+            state = state.fade_stage(stage);
+        }
         if session.revealed {
             state = state.revealed();
         }
@@ -1759,6 +1788,9 @@ impl App {
         if let Some(session) = self.session.as_mut() {
             session.revealed = true;
         }
+        // Revealing the answer is also a card transition: show the headword
+        // first, then let the full definition settle in.
+        self.study_fade_started = Some(Instant::now());
         self.render_card()?;
         self.scroll_back = 0;
         Ok(())
@@ -1804,6 +1836,9 @@ impl App {
             }
             session.hint = !session.hint;
         }
+        // Keep the feedback and the revealed card from appearing as one abrupt
+        // replacement after a 1-4 rating.
+        self.study_fade_started = Some(Instant::now());
         self.render_card()?;
         Ok(())
     }
@@ -1936,6 +1971,13 @@ impl App {
             }
         }
 
+        // Only the first rating reveals the answer. Re-rating an already
+        // expanded card updates its review state without replaying the reveal.
+        if first_time {
+            self.study_fade_started = Some(Instant::now());
+        } else {
+            self.study_fade_started = None;
+        }
         self.render_card()?;
         self.scroll_back = 0;
         self.refresh_status();
@@ -2292,6 +2334,25 @@ mod tests {
         let daily = app.store.daily(time::today()).unwrap();
         assert_eq!(daily.reviews, 1);
         assert_eq!(daily.new_learned, 1);
+    }
+
+    #[test]
+    fn regrading_an_expanded_card_does_not_replay_the_reveal() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+
+        app.grade(Rating::Good).unwrap();
+        assert!(app.study_fade_started.is_some());
+
+        app.grade(Rating::Easy).unwrap();
+        assert!(
+            app.study_fade_started.is_none(),
+            "changing an existing rating must not replay the reveal"
+        );
+        assert_eq!(
+            app.session.as_ref().and_then(|session| session.graded),
+            Some(Rating::Easy)
+        );
     }
 
     #[test]

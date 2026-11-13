@@ -554,6 +554,14 @@ impl ToolView {
             view.result_meta = Some(meta);
         }
 
+        let reveal_stage = state.fade_stage.unwrap_or(4);
+        if reveal_stage == 0 {
+            return view;
+        }
+        if reveal_stage == 1 {
+            return view.muted("…".to_string());
+        }
+
         if !state.revealed {
             for line in state.hint_lines() {
                 view = view.line(line);
@@ -575,14 +583,15 @@ impl ToolView {
             let (common, secondary): (Vec<&crate::text::Sense>, Vec<&crate::text::Sense>) =
                 parsed.senses.iter().partition(|sense| !sense.is_secondary());
 
-            for sense in common {
+            let common_limit = if reveal_stage == 2 { 1 } else { common.len() };
+            for sense in common.into_iter().take(common_limit) {
                 view = view.line(ToolLine::Sense {
                     label: sense.pos.clone(),
                     text: sense.text.clone(),
                 });
             }
 
-            if !secondary.is_empty() {
+            if reveal_stage >= 3 && !secondary.is_empty() {
                 view = view.muted("rare / technical".to_string());
                 for sense in &secondary {
                     view = view.line(ToolLine::Sense {
@@ -592,8 +601,10 @@ impl ToolView {
                 }
             }
 
-            if let Some(forms) = parsed.forms {
-                view = view.muted(forms);
+            if reveal_stage >= 3 {
+                if let Some(forms) = parsed.forms {
+                    view = view.muted(forms);
+                }
             }
         }
 
@@ -601,7 +612,7 @@ impl ToolView {
         // "Japanese rice wine" in the Chinese source, so it shows up here.
         // Folded by default — it is supporting detail, and up to six lines of it
         // would push the Chinese senses off the screen.
-        if !word.glosses.is_empty() {
+        if reveal_stage >= 3 && !word.glosses.is_empty() {
             if state.expand_glosses {
                 view = view.spacer().muted("more meanings".to_string());
                 for gloss in &word.glosses {
@@ -618,11 +629,13 @@ impl ToolView {
             }
         }
 
-        if let Some(definition) = &word.definition {
-            view = view.muted(definition.clone());
+        if reveal_stage >= 3 {
+            if let Some(definition) = &word.definition {
+                view = view.muted(definition.clone());
+            }
         }
 
-        if !word.collocations.is_empty() {
+        if reveal_stage >= 3 && !word.collocations.is_empty() {
             // No `phrases` label here: the table names its own columns, and a label
             // on top of a `phrase | meaning` header just says it twice.
             view = view.spacer();
@@ -635,7 +648,7 @@ impl ToolView {
         }
 
         let roots = word.roots();
-        if !roots.is_empty() {
+        if reveal_stage >= 4 && !roots.is_empty() {
             // Rendered like a function definition, because that is what a word's
             // morphology actually is: a name applied to typed parts.
             //
@@ -682,7 +695,7 @@ impl ToolView {
             }));
         }
 
-        if !word.examples.is_empty() {
+        if reveal_stage >= 4 && !word.examples.is_empty() {
             // Examples live in the right-hand column so the meaning and the
             // etymology keep the left, and the headword inside each sentence is
             // highlighted against its surroundings.
@@ -697,7 +710,7 @@ impl ToolView {
             }
         }
 
-        if state.show_ratings {
+        if reveal_stage >= 4 && state.show_ratings {
             view = view.spacer().line(ToolLine::Rating {
                 selected: state.graded,
             });
@@ -732,6 +745,8 @@ pub struct CardState {
     /// The English glosses are a nice-to-have next to the Chinese senses, so they
     /// stay folded until asked for; `m` flips this on every card at once.
     pub expand_glosses: bool,
+    /// Progressive reveal stage for a newly arrived study card.
+    pub fade_stage: Option<u8>,
 }
 
 impl CardState {
@@ -747,6 +762,7 @@ impl CardState {
             footer: None,
             accent: Accent::Neutral,
             expand_glosses: false,
+            fade_stage: None,
         }
     }
 
@@ -792,6 +808,11 @@ impl CardState {
 
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    pub fn fade_stage(mut self, stage: u8) -> Self {
+        self.fade_stage = Some(stage);
         self
     }
 
