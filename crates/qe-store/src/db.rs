@@ -223,6 +223,21 @@ CREATE TABLE IF NOT EXISTS text_translations (
 );
 "#;
 
+/// v9：为后续 FSRS 调度保留稳定度/难度，并把复习前后的关键数据写入流水。
+const SCHEMA_V9: &str = r#"
+ALTER TABLE cards ADD COLUMN stability REAL NOT NULL DEFAULT 0;
+ALTER TABLE cards ADD COLUMN difficulty REAL NOT NULL DEFAULT 5;
+ALTER TABLE cards ADD COLUMN desired_retention REAL NOT NULL DEFAULT 0.9;
+ALTER TABLE reviews ADD COLUMN phase_before TEXT;
+ALTER TABLE reviews ADD COLUMN interval_before INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reviews ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reviews ADD COLUMN overdue_seconds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reviews ADD COLUMN stability_before REAL NOT NULL DEFAULT 0;
+ALTER TABLE reviews ADD COLUMN stability_after REAL NOT NULL DEFAULT 0;
+ALTER TABLE reviews ADD COLUMN difficulty_before REAL NOT NULL DEFAULT 5;
+ALTER TABLE reviews ADD COLUMN difficulty_after REAL NOT NULL DEFAULT 5;
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -371,6 +386,11 @@ impl SqliteStore {
         if version < 6 {
             // 词书、卡片、复习流水从 `word_id` 换成 `lemma`。
             self.rekey_on_lemma()?;
+        }
+        if version < 9 {
+            // v5/v6 可能重建 cards/reviews，因此必须在 lemma 迁移完成后补列。
+            self.conn.execute_batch(SCHEMA_V9)?;
+            self.conn.execute_batch("PRAGMA user_version = 9")?;
         }
         Ok(())
     }
@@ -1085,6 +1105,9 @@ fn decode_card(row: &Row<'_>, offset: usize) -> rusqlite::Result<SrsCard> {
         lapses: row.get::<_, i64>(offset + 5)? as u32,
         due_at: due_raw.as_deref().and_then(time::parse_rfc).unwrap_or_else(Utc::now),
         last_review_at: last_raw.as_deref().and_then(time::parse_rfc),
+        stability: row.get(offset + 8)?,
+        difficulty: row.get(offset + 9)?,
+        desired_retention: row.get(offset + 10)?,
     })
 }
 
@@ -1099,6 +1122,21 @@ fn book_from_row(row: &Row<'_>) -> rusqlite::Result<Book> {
 
 fn parse_day(raw: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
+}
+
+fn elapsed_seconds(before: Option<&SrsCard>, now: DateTime<Utc>) -> i64 {
+    before
+        .and_then(|card| card.last_review_at)
+        .map(|last| (now - last).num_seconds().max(0))
+        .unwrap_or(0)
+}
+
+fn overdue_seconds(before: Option<&SrsCard>, now: DateTime<Utc>) -> i64 {
+    let elapsed = elapsed_seconds(before, now);
+    let scheduled = before
+        .map(|card| card.interval_days as i64 * 86_400)
+        .unwrap_or(0);
+    (elapsed - scheduled).max(0)
 }
 
 impl Store for SqliteStore {
@@ -1171,7 +1209,8 @@ impl Store for SqliteStore {
     fn due_cards(&self, book_id: i64, now: DateTime<Utc>, limit: usize) -> Result<Vec<StudyCard>> {
         let sql = format!(
             "SELECT {WORD_COLS},
-                    c.phase, c.step, c.ease, c.interval_days, c.reps, c.lapses, c.due_at, c.last_review_at
+                    c.phase, c.step, c.ease, c.interval_days, c.reps, c.lapses, c.due_at, c.last_review_at,
+                    c.stability, c.difficulty, c.desired_retention
              FROM cards c
              JOIN dict.words w ON w.lemma = c.lemma
              JOIN book_words bw ON bw.lemma = c.lemma AND bw.book_id = ?1
@@ -1211,7 +1250,7 @@ impl Store for SqliteStore {
         &mut self,
         lemma: &str,
         book_id: i64,
-        _before: Option<&SrsCard>,
+        before: Option<&SrsCard>,
         after: &SrsCard,
         rating: Rating,
         now: DateTime<Utc>,
@@ -1219,8 +1258,8 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at, stability, difficulty, desired_retention)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(lemma) DO UPDATE SET
                 book_id = excluded.book_id,
                 phase = excluded.phase,
@@ -1231,7 +1270,10 @@ impl Store for SqliteStore {
                 lapses = excluded.lapses,
                 due_at = excluded.due_at,
                 due_ts = excluded.due_ts,
-                last_review_at = excluded.last_review_at",
+                last_review_at = excluded.last_review_at,
+                stability = excluded.stability,
+                difficulty = excluded.difficulty,
+                desired_retention = excluded.desired_retention",
             params![
                 lemma,
                 book_id,
@@ -1244,18 +1286,31 @@ impl Store for SqliteStore {
                 after.due_at.to_rfc3339(),
                 after.due_at.timestamp(),
                 now.to_rfc3339(),
+                after.stability,
+                after.difficulty,
+                after.desired_retention,
             ],
         )?;
         tx.execute(
-            "INSERT INTO reviews(lemma, at, day, rating, phase_after, interval_after, is_new)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO reviews(lemma, at, day, rating, phase_before, phase_after, interval_before,
+                                interval_after, elapsed_seconds, overdue_seconds, stability_before,
+                                stability_after, difficulty_before, difficulty_after, is_new)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 lemma,
                 now.to_rfc3339(),
                 time::format_day(time::local_day(now)),
                 rating.as_str(),
+                before.map(|card| card.phase.as_str()),
                 after.phase.as_str(),
+                before.map(|card| card.interval_days as i64).unwrap_or(0),
                 after.interval_days as i64,
+                elapsed_seconds(before, now),
+                overdue_seconds(before, now),
+                before.map(|card| card.stability).unwrap_or(0.0),
+                after.stability,
+                before.map(|card| card.difficulty).unwrap_or(5.0),
+                after.difficulty,
                 if is_new { 1 } else { 0 },
             ],
         )?;
@@ -1274,8 +1329,8 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO cards(lemma, book_id, phase, step, ease, interval_days, reps, lapses, due_at, due_ts, last_review_at, stability, difficulty, desired_retention)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(lemma) DO UPDATE SET
                 book_id = excluded.book_id,
                 phase = excluded.phase,
@@ -1286,7 +1341,10 @@ impl Store for SqliteStore {
                 lapses = excluded.lapses,
                 due_at = excluded.due_at,
                 due_ts = excluded.due_ts,
-                last_review_at = excluded.last_review_at",
+                last_review_at = excluded.last_review_at,
+                stability = excluded.stability,
+                difficulty = excluded.difficulty,
+                desired_retention = excluded.desired_retention",
             params![
                 lemma,
                 book_id,
@@ -1299,6 +1357,9 @@ impl Store for SqliteStore {
                 after.due_at.to_rfc3339(),
                 after.due_at.timestamp(),
                 now.to_rfc3339(),
+                after.stability,
+                after.difficulty,
+                after.desired_retention,
             ],
         )?;
 
@@ -1314,13 +1375,16 @@ impl Store for SqliteStore {
             Some(id) => {
                 tx.execute(
                     "UPDATE reviews SET at = ?1, day = ?2, rating = ?3, phase_after = ?4,
-                        interval_after = ?5, is_new = ?6 WHERE id = ?7",
+                        interval_after = ?5, stability_after = ?6, difficulty_after = ?7,
+                        is_new = ?8 WHERE id = ?9",
                     params![
                         now.to_rfc3339(),
                         time::format_day(time::local_day(now)),
                         rating.as_str(),
                         after.phase.as_str(),
                         after.interval_days as i64,
+                        after.stability,
+                        after.difficulty,
                         if is_new { 1 } else { 0 },
                         id,
                     ],
@@ -1328,8 +1392,9 @@ impl Store for SqliteStore {
             }
             None => {
                 tx.execute(
-                    "INSERT INTO reviews(lemma, at, day, rating, phase_after, interval_after, is_new)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO reviews(lemma, at, day, rating, phase_after, interval_after,
+                                         stability_after, difficulty_after, is_new)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         lemma,
                         now.to_rfc3339(),
@@ -1337,6 +1402,8 @@ impl Store for SqliteStore {
                         rating.as_str(),
                         after.phase.as_str(),
                         after.interval_days as i64,
+                        after.stability,
+                        after.difficulty,
                         if is_new { 1 } else { 0 },
                     ],
                 )?;
@@ -2482,6 +2549,21 @@ mod tests {
         store
             .record_review(&word.lemma, book.id, None, &card, Rating::Good, Utc::now(), true)
             .unwrap();
+        let log: (Option<String>, i64, i64, f64, f64) = store
+            .conn
+            .query_row(
+                "SELECT phase_before, interval_before, overdue_seconds,
+                        stability_after, difficulty_after
+                 FROM reviews WHERE lemma = 'inspect' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(log.0, None);
+        assert_eq!(log.1, 0);
+        assert_eq!(log.2, 0);
+        assert!(log.3 > 0.0);
+        assert!(log.4 > 0.0);
 
         assert!(store.new_cards(book.id, 10).unwrap().is_empty());
         let daily = store.daily(time::today()).unwrap();

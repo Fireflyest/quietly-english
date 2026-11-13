@@ -293,6 +293,23 @@ pub struct SrsCard {
     pub due_at: DateTime<Utc>,
     #[serde(default)]
     pub last_review_at: Option<DateTime<Utc>>,
+    /// Long-term memory strength, reserved for the FSRS-style scheduler.
+    #[serde(default)]
+    pub stability: f64,
+    /// Difficulty on a 1..10 scale, reserved for the FSRS-style scheduler.
+    #[serde(default = "default_difficulty")]
+    pub difficulty: f64,
+    /// Desired probability of recall at the next review.
+    #[serde(default = "default_retention")]
+    pub desired_retention: f64,
+}
+
+fn default_difficulty() -> f64 {
+    5.0
+}
+
+fn default_retention() -> f64 {
+    0.9
 }
 
 impl SrsCard {
@@ -307,6 +324,9 @@ impl SrsCard {
             lapses: 0,
             due_at: now,
             last_review_at: None,
+            stability: 0.0,
+            difficulty: default_difficulty(),
+            desired_retention: default_retention(),
         }
     }
 }

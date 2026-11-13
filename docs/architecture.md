@@ -85,8 +85,11 @@ sequenceDiagram
 books(id, slug UNIQUE, name, description, builtin)
 book_words(book_id, lemma, rank)            -- 词书内容与顺序
 cards(lemma PK, book_id, phase, step, ease, interval_days,
-      reps, lapses, due_at, last_review_at) -- 每词一张卡
-reviews(id, lemma, at, day, rating, phase_after, interval_after, is_new)
+      reps, lapses, due_at, last_review_at, stability,
+      difficulty, desired_retention) -- 每词一张卡
+reviews(id, lemma, at, day, rating, phase_before, phase_after,
+        interval_before, interval_after, elapsed_seconds,
+        overdue_seconds, stability/difficulty before/after, is_new)
 sessions(id, day, started_at, ended_at, seconds, new_count, review_count)
 settings(key, value)
 texts(id, title UNIQUE, source, license, book_slug, rank, body, translation, created_at)
@@ -124,11 +127,13 @@ words(id, lemma UNIQUE NOCASE, phonetic, translation, definition,
 | 阶段 | 行为 |
 | --- | --- |
 | New | 认识 → 学习步骤 2（1 天）；简单 → 直接毕业 5 天；忘记/模糊 → 10 分钟后重来 |
-| Learning | 逐步走完 `10min → 1d`，走完即毕业 |
-| Review | 间隔 × ease；`Hard` 只 ×1.2 且降 ease，`Easy` 额外 ×1.3 |
-| Relearning | 遗忘后间隔减半，回到 10 分钟重学，`Good` 后回 Review |
+| Learning | 逐步走完 `10min → 1d → 3d`，走完即毕业 |
+| Review | 使用实际逾期时间作为增长下限；间隔 × ease；`Hard` 只 ×1.2 且降 ease，`Easy` 额外 ×1.3 |
+| Relearning | 遗忘后间隔保留约 70%，经过 `10min → 1d` 重学后回 Review |
 
-约束：`ease ∈ [1.3, 3.0]`，`interval ∈ [1, 365]` 天。
+约束：`ease ∈ [1.3, 3.0]`，`interval ∈ [1, 365]` 天。卡片同时记录
+`stability`、`difficulty` 和目标回忆率，当前用于积累数据，后续可迁移到 FSRS
+风格调度。每条 `reviews` 流水还记录复习前后阶段、计划间隔、实际经过时间和逾期时间。
 
 ## 扩展阅读 / 翻译 / 写作
 
