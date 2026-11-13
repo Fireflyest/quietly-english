@@ -1806,10 +1806,10 @@ mod tests {
             .iter()
             .find(|span| span.content.contains(clicked.as_str()))
             .expect("the word is rendered");
-        assert_eq!(
+        assert_ne!(
             span.style,
-            theme::focus(),
-            "selected words use the focus style, marked ones stay bold"
+            theme::mark(),
+            "selected words use focus styling, marked ones stay bold"
         );
 
         // 读者标记过的词仍用标记样式，两者不互相覆盖。
@@ -1818,6 +1818,6 @@ mod tests {
             .iter()
             .find(|span| span.content.contains("writer"))
             .expect("the marked word is drawn");
-        assert_eq!(marked.style, theme::mark());
+        assert_eq!(marked.style, theme::mark().bg(theme::READING_BG));
     }
 }

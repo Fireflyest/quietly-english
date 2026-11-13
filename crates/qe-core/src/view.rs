@@ -8,6 +8,10 @@ use crate::model::{DailyStats, Example, Quiz, Rating, ReadingStats, Word};
 
 /// 选词说明块右栏最多列几条词组：再多会把卡片撑长，剩下的留给完整卡片。
 const MAX_PANEL_PHRASES: usize = 6;
+const MAX_CARD_SENSES: usize = 3;
+const MAX_CARD_GLOSSES: usize = 4;
+const MAX_CARD_COLLOCATIONS: usize = 4;
+const MAX_CARD_EXAMPLES: usize = 2;
 
 /// 一个可以按序号打开的候选词（精读模式下段落里的词）。
 #[derive(Debug, Clone, Default)]
@@ -309,6 +313,16 @@ impl ToolView {
         show_translation: bool,
         selection: Option<(&str, Option<&Word>)>,
     ) -> Self {
+        Self::reading_card_with_status(session, candidates, show_translation, None, selection)
+    }
+
+    pub fn reading_card_with_status(
+        session: &crate::reading::ReadingSession,
+        candidates: &[Candidate],
+        show_translation: bool,
+        translation_status: Option<&str>,
+        selection: Option<(&str, Option<&Word>)>,
+    ) -> Self {
         let text = &session.text;
         let mut badge = format!("{} · {}", session.mode.label(), session.progress());
         if session.total() > 1 {
@@ -382,6 +396,11 @@ impl ToolView {
                             complete: value >= max,
                         });
                     }
+                    if index == session.paragraph {
+                        if let Some(status) = translation_status {
+                            view = view.muted(status.to_string());
+                        }
+                    }
                 }
             }
             crate::reading::ReadMode::Intensive => {
@@ -406,6 +425,9 @@ impl ToolView {
                                 active: true,
                             });
                         }
+                    }
+                    if let Some(status) = translation_status {
+                        view = view.muted(status.to_string());
                     }
                 }
                 if let Some((lemma, word)) = selection {
@@ -583,7 +605,11 @@ impl ToolView {
             let (common, secondary): (Vec<&crate::text::Sense>, Vec<&crate::text::Sense>) =
                 parsed.senses.iter().partition(|sense| !sense.is_secondary());
 
-            let common_limit = if reveal_stage == 2 { 1 } else { common.len() };
+            let common_limit = if reveal_stage == 2 {
+                1
+            } else {
+                MAX_CARD_SENSES.min(common.len())
+            };
             for sense in common.into_iter().take(common_limit) {
                 view = view.line(ToolLine::Sense {
                     label: sense.pos.clone(),
@@ -615,7 +641,7 @@ impl ToolView {
         if reveal_stage >= 3 && !word.glosses.is_empty() {
             if state.expand_glosses {
                 view = view.spacer().muted("more meanings".to_string());
-                for gloss in &word.glosses {
+                for gloss in word.glosses.iter().take(MAX_CARD_GLOSSES) {
                     view = view.line(ToolLine::Gloss {
                         text: gloss.text.clone(),
                         tags: gloss.tags.clone(),
@@ -639,7 +665,7 @@ impl ToolView {
             // No `phrases` label here: the table names its own columns, and a label
             // on top of a `phrase | meaning` header just says it twice.
             view = view.spacer();
-            for collocation in &word.collocations {
+            for collocation in word.collocations.iter().take(MAX_CARD_COLLOCATIONS) {
                 view = view.line(ToolLine::Phrase {
                     phrase: collocation.phrase.clone(),
                     gloss: collocation.gloss.clone(),
@@ -700,7 +726,7 @@ impl ToolView {
             // etymology keep the left, and the headword inside each sentence is
             // highlighted against its surroundings.
             view = view.aside(ToolLine::Muted("examples".to_string()));
-            for (index, example) in word.examples.iter().take(3).enumerate() {
+            for (index, example) in word.examples.iter().take(MAX_CARD_EXAMPLES).enumerate() {
                 view = view.aside(ToolLine::Example {
                     index: index + 1,
                     en: example.en.clone(),
@@ -1032,6 +1058,7 @@ pub fn summary_tool(
     streak: u32,
     upcoming: &[(String, u32)],
     status: &SummaryStatus,
+    difficult_words: &[(String, u32)],
 ) -> ToolView {
     let day = daily
         .day
@@ -1070,6 +1097,7 @@ pub fn summary_tool(
                 daily.again, daily.hard, daily.good, daily.easy
             ),
         )
+        .kv("forget rate", format!("{}%", daily.forget_rate()))
         .kv("streak", format!("{streak} days"));
 
     if status.deck_total > 0 {
@@ -1085,6 +1113,12 @@ pub fn summary_tool(
                 value: *count,
                 max,
             });
+        }
+    }
+    if !difficult_words.is_empty() {
+        view = view.spacer().muted("hardest today");
+        for (lemma, again) in difficult_words {
+            view = view.kv(lemma.clone(), format!("{again} again"));
         }
     }
     view
@@ -1142,6 +1176,7 @@ mod tests {
                 due_left: 3,
                 deck_total: 40,
             },
+            &[],
         );
         assert_eq!(view.accent, Accent::Note, "summaries need their own colour");
 
@@ -1165,6 +1200,7 @@ mod tests {
                 due_left: 0,
                 deck_total: 0,
             },
+            &[],
         );
         let kvs = kv_lines(&view);
         assert!(kvs
@@ -1179,11 +1215,25 @@ mod tests {
 
     #[test]
     fn summary_headline_carries_counts() {
-        let view = summary_tool(&daily(8, 12), 4, &[], &SummaryStatus::default());
+        let view = summary_tool(&daily(8, 12), 4, &[], &SummaryStatus::default(), &[]);
         let headline = view.result.expect("headline");
         assert!(headline.contains("8 new"));
         assert!(headline.contains("12 reviews"));
         assert!(headline.contains("10 min"));
+    }
+
+    #[test]
+    fn summary_includes_forget_rate_and_difficult_words() {
+        let view = summary_tool(
+            &daily(2, 10),
+            1,
+            &[],
+            &SummaryStatus::default(),
+            &[("hard".to_string(), 3)],
+        );
+        let kvs = kv_lines(&view);
+        assert!(kvs.iter().any(|line| line == "forget rate=20%"));
+        assert!(kvs.iter().any(|line| line == "hard=3 again"));
     }
 
     #[test]

@@ -9,7 +9,8 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
     Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
-    Phase, Quiz, Rating, ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
+    Phase, Quiz, Rating, ReadingLog, ReadingStats, ReviewStats, SessionLog, SrsCard, StudyCard,
+    Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -1950,6 +1951,7 @@ impl Store for SqliteStore {
             let day = time::local_day(ts).max(from);
             *buckets.entry(day).or_insert(0) += 1;
         }
+
         Ok((0..days as i64)
             .map(|i| {
                 let day = from + ChronoDuration::days(i);
@@ -1957,6 +1959,24 @@ impl Store for SqliteStore {
                 (day, count)
             })
             .collect())
+    }
+
+    fn review_stats(&self, day: NaiveDate, limit: usize) -> Result<ReviewStats> {
+        let key = time::format_day(day);
+        let mut stmt = self.conn.prepare(
+            "SELECT lemma, COUNT(*) AS again_count
+             FROM reviews
+             WHERE day = ?1 AND rating = 'again'
+             GROUP BY lemma
+             ORDER BY again_count DESC, lemma
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![key, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+        })?;
+        Ok(ReviewStats {
+            difficult_words: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        })
     }
 
     fn learned_today(&self, book_id: i64) -> Result<u32> {

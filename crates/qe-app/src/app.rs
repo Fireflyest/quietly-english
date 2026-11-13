@@ -94,6 +94,8 @@ pub struct App {
     pub(crate) quiz_correct: u32,
     /// 阅读时是否显示译文（`/translate` 与 `tab` 切换，两种模式都生效）。
     pub(crate) show_translation: bool,
+    /// 当前段译文请求的状态，显示在阅读卡片中。
+    pub(crate) translation_status: Option<String>,
     /// 下一帧把当前段滚进视野（全篇模式下翻页、跳段后使用）。
     pub(crate) reveal_anchor: bool,
     /// 下一帧保持画面不动：内容在原位变长/变短（选词出说明块、切译文）时，
@@ -158,6 +160,7 @@ impl App {
             quiz_correct: 0,
             // 译文默认隐藏：先读原文，需要对照时再按 tab。
             show_translation: false,
+            translation_status: None,
             reveal_anchor: false,
             pin_view: false,
             prev_anchor: None,
@@ -202,6 +205,7 @@ impl App {
         let Some(db) = self.db_path.clone() else {
             return Ok(());
         };
+
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // 每个来源各抓一批；单个来源挂了不影响别的（TED 打不开也得把新华网抓回来）。
@@ -1236,6 +1240,7 @@ impl App {
             self.note("no deck yet · run quietly import <file>");
             return Ok(());
         };
+
         let word = match self.store.word(term)? {
             Some(word) => word,
             None => {
@@ -1334,6 +1339,18 @@ impl App {
         self.next_card()
     }
 
+    fn save_study_snapshot(&self) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        let raw = serde_json::to_string(&session.snapshot())?;
+        self.store.set_setting("study_snapshot", &raw)
+    }
+
+    fn clear_study_snapshot(&self) -> Result<()> {
+        self.store.set_setting("study_snapshot", "")
+    }
+
     /// `/undo` rolls back the most recent rating and returns to that card.
     fn undo_last(&mut self) -> Result<()> {
         let Some(entry) = self.undo.pop() else {
@@ -1386,6 +1403,7 @@ impl App {
         // Drop the trailing "rated" note the undo makes false.
         self.truncate_after(entry.message);
         self.render_card()?;
+        self.save_study_snapshot()?;
         self.push(Message::tool(
             ToolView::new("undo")
                 .accent(Accent::Info)
@@ -1636,6 +1654,37 @@ impl App {
             return Ok(());
         };
 
+        if self.reading.is_some() {
+            self.finish_reading()?;
+            self.note("reading closed before study");
+        }
+
+        if limit.is_none() {
+            if let Some(raw) = self.store.setting("study_snapshot")? {
+                match serde_json::from_str::<crate::session::StudySnapshot>(&raw)
+                    .ok()
+                    .and_then(|snapshot| StudySession::from_snapshot(book.clone(), snapshot))
+                {
+                    Some(session) if session.current.is_some() || !session.queue.is_empty() => {
+                        let remaining = session.queue.len() + usize::from(session.current.is_some());
+                        self.session = Some(session);
+                        self.push(Message::tool(
+                            ToolView::new("study")
+                                .badge(book.name.clone())
+                                .result(format!("resumed · {remaining} cards left"))
+                                .muted("1-4 grade · esc end · session saved automatically"),
+                        ));
+                        self.render_card()?;
+                        self.refresh_status();
+                        return Ok(());
+                    }
+                    _ => {
+                        self.store.set_setting("study_snapshot", "")?;
+                    }
+                }
+            }
+        }
+
         let now = Utc::now();
         let daily_limit = limit.unwrap_or(self.daily_new_limit).max(1);
         let learned_today = self.store.learned_today(book.id)?;
@@ -1678,11 +1727,6 @@ impl App {
 
         // 阅读与学习互斥：`start_reading` 已经会收尾学习会话，反方向也要收尾，
         // 否则阅读队列会和学习队列抢同一批数字键（按 1-4 变成查词）。
-        if self.reading.is_some() {
-            self.finish_reading()?;
-            self.note("reading closed before study");
-        }
-
         self.session = Some(StudySession::new(book.clone(), queue, new_total, review_total));
         self.push(Message::tool(
             ToolView::new("study")
@@ -1708,6 +1752,7 @@ impl App {
         }
         self.study_fade_started = Some(Instant::now());
         self.render_card()?;
+        self.save_study_snapshot()?;
         self.scroll_back = 0;
         self.refresh_status();
         Ok(())
@@ -1792,6 +1837,7 @@ impl App {
         // first, then let the full definition settle in.
         self.study_fade_started = Some(Instant::now());
         self.render_card()?;
+        self.save_study_snapshot()?;
         self.scroll_back = 0;
         Ok(())
     }
@@ -1840,6 +1886,7 @@ impl App {
         // replacement after a 1-4 rating.
         self.study_fade_started = Some(Instant::now());
         self.render_card()?;
+        self.save_study_snapshot()?;
         Ok(())
     }
 
@@ -1979,6 +2026,7 @@ impl App {
             self.study_fade_started = None;
         }
         self.render_card()?;
+        self.save_study_snapshot()?;
         self.scroll_back = 0;
         self.refresh_status();
         Ok(())
@@ -1996,6 +2044,7 @@ impl App {
             .unwrap_or(0);
         if done == 0 {
             self.session = None;
+            self.clear_study_snapshot()?;
             self.note("session closed · nothing graded");
             self.refresh_status();
             return Ok(());
@@ -2007,6 +2056,7 @@ impl App {
         let Some(session) = self.session.take() else {
             return Ok(());
         };
+        self.clear_study_snapshot()?;
         let now = Utc::now();
         let seconds = (now - session.started_at)
             .num_seconds()
@@ -2027,6 +2077,7 @@ impl App {
 
     fn push_summary(&mut self) -> Result<()> {
         let daily = self.store.daily(time::today())?;
+        let review_stats = self.store.review_stats(time::today(), 5)?;
         let streak = self.store.streak()?;
         let upcoming = self
             .store
@@ -2055,7 +2106,11 @@ impl App {
         };
 
         self.push(Message::tool(summary_tool(
-            &daily, streak, &upcoming, &status,
+            &daily,
+            streak,
+            &upcoming,
+            &status,
+            &review_stats.difficult_words,
         )));
         Ok(())
     }
@@ -2334,6 +2389,46 @@ mod tests {
         let daily = app.store.daily(time::today()).unwrap();
         assert_eq!(daily.reviews, 1);
         assert_eq!(daily.new_learned, 1);
+    }
+
+    #[test]
+    fn study_session_resume_restores_current_card_and_queue_order() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        let first = app
+            .session
+            .as_ref()
+            .and_then(|session| session.current.as_ref())
+            .map(|card| card.word.lemma.clone())
+            .unwrap();
+        let snapshot = app
+            .store
+            .setting("study_snapshot")
+            .unwrap()
+            .expect("study session is persisted");
+        assert!(snapshot.contains(&first));
+
+        app.session = None;
+        app.execute(Command::Study(None)).unwrap();
+
+        let resumed = app.session.as_ref().unwrap();
+        assert_eq!(
+            resumed.current.as_ref().unwrap().word.lemma,
+            first,
+            "resume keeps the current card"
+        );
+        assert_eq!(
+            resumed.queue.iter().map(|card| card.word.lemma.clone()).collect::<Vec<_>>(),
+            serde_json::from_str::<crate::session::StudySnapshot>(
+                &app.store.setting("study_snapshot").unwrap().unwrap()
+            )
+            .unwrap()
+            .queue
+            .into_iter()
+            .map(|card| card.word.lemma)
+            .collect::<Vec<_>>(),
+            "resume keeps the remaining queue order"
+        );
     }
 
     #[test]
@@ -2769,8 +2864,8 @@ mod tests {
                 .reading_progress(app.store.text_by_title("flow").unwrap().unwrap().id)
                 .unwrap()
                 .map(|(p, _)| p),
-            Some(0),
-            "the new position is persisted when reading is closed"
+            Some(1),
+            "clicking a paragraph persists the new position immediately"
         );
     }
 

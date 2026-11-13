@@ -175,10 +175,11 @@ impl App {
         let selection = focused
             .as_ref()
             .map(|(lemma, word)| (lemma.as_str(), word.as_ref()));
-        let view = ToolView::reading_card(
+        let view = ToolView::reading_card_with_status(
             session,
             &candidates,
             self.show_translation,
+            self.translation_status.as_deref(),
             selection,
         );
         let message = Message::tool(view);
@@ -323,12 +324,14 @@ impl App {
         // 已经显示着：关掉就好，不发任何请求。
         if self.show_translation {
             self.show_translation = false;
+            self.translation_status = None;
             return self.render_reading();
         }
         self.show_translation = true;
 
         // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
         if session.translation_at(paragraph).is_some() {
+            self.translation_status = Some("translation: available".to_string());
             return self.render_reading();
         }
         // 以前翻过的段落，不再花第二次额度。
@@ -336,6 +339,7 @@ impl App {
             if let Some(session) = self.reading.as_mut() {
                 session.add_translation(paragraph, &cached);
             }
+            self.translation_status = Some("translation: cached".to_string());
             return self.render_reading();
         }
         self.spawn_translation(text_id, paragraph)
@@ -345,10 +349,13 @@ impl App {
     fn spawn_translation(&mut self, text_id: i64, paragraph: usize) -> Result<()> {
         let Some(settings) = crate::translator::settings() else {
             self.show_translation = false;
+            self.translation_status = None;
             self.note("machine translation is off · unset QUIETLY_TRANSLATE to use it");
             return Ok(());
         };
         if self.translation_fetch.is_some() {
+            self.translation_status =
+                Some("translation: another paragraph is still loading".to_string());
             self.note("translating another paragraph · one moment");
             return Ok(());
         }
@@ -359,6 +366,7 @@ impl App {
             .map(str::to_string)
         else {
             self.show_translation = false;
+            self.translation_status = None;
             self.note("nothing to translate here");
             return Ok(());
         };
@@ -370,6 +378,7 @@ impl App {
             let _ = sender.send((paragraph, outcome));
         });
         self.translation_fetch = Some((text_id, receiver));
+        self.translation_status = Some("translation: translating...".to_string());
         self.note(format!("translating paragraph {} · {detail}", paragraph + 1));
         Ok(())
     }
@@ -394,18 +403,24 @@ impl App {
                         session.add_translation(paragraph, &translation.text);
                     }
                 }
+                self.translation_status =
+                    Some(format!("translation: cached · {}", translation.provider));
                 let _ = self.render_reading();
             }
             Ok((_, Err(error))) => {
                 self.translation_fetch = None;
                 // 没译出来就别留一个「已开启但没有译文」的状态。
                 self.show_translation = false;
+                self.translation_status = Some(format!("translation failed · {error}"));
                 self.note(format!("translation failed · {error}"));
                 let _ = self.render_reading();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.translation_fetch = None;
+                self.show_translation = false;
+                self.translation_status =
+                    Some("translation failed · worker stopped · retry /translate".to_string());
             }
         }
     }
@@ -558,6 +573,7 @@ impl App {
         let mut session = ReadingSession::new(text, mode, paragraph);
         // 翻译显示是当前文章的阅读偏好，不应延续到下一篇。
         self.show_translation = false;
+        self.translation_status = None;
         self.translation_fetch = None;
         for lemma in self.store.reading_marks(session.text.id)? {
             // 只恢复字符串标记；卡片正文按需再查。
@@ -935,6 +951,8 @@ impl App {
         }
         if paragraph != session.paragraph {
             session.go_to(paragraph);
+            self.store
+                .save_reading_progress(session.text.id, paragraph, session.mode)?;
         }
         if !session.focus_in(paragraph, index) {
             return Ok(());

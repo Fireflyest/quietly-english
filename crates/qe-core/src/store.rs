@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
-    Book, BookProgress, DailyStats, DictReport, Example, ImportPlan, ImportReport, Quiz, Rating,
+    Book, BookProgress,     DailyStats, DictReport, Example, ImportPlan, ImportReport, Quiz, Rating, ReviewStats,
     ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
 };
 
@@ -133,6 +133,7 @@ pub trait Store {
     fn daily(&self, day: NaiveDate) -> Result<DailyStats>;
     fn streak(&self) -> Result<u32>;
     fn upcoming(&self, from: NaiveDate, days: usize) -> Result<Vec<(NaiveDate, u32)>>;
+    fn review_stats(&self, day: NaiveDate, limit: usize) -> Result<ReviewStats>;
     fn learned_today(&self, book_id: i64) -> Result<u32>;
 
     // ---- 设置 ----

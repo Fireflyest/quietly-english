@@ -4,6 +4,26 @@ use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
 use qe_core::model::{Book, Rating, SrsCard, StudyCard};
+use serde::{Deserialize, Serialize};
+
+const STUDY_SNAPSHOT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudySnapshot {
+    pub version: u8,
+    pub book_id: i64,
+    pub queue: Vec<StudyCard>,
+    pub current: Option<StudyCard>,
+    pub revealed: bool,
+    pub hint: bool,
+    pub graded: Option<Rating>,
+    pub last_after: Option<SrsCard>,
+    pub new_done: u32,
+    pub review_done: u32,
+    pub started_at: DateTime<Utc>,
+    pub new_total: u32,
+    pub review_total: u32,
+}
 
 pub struct StudySession {
     pub book: Book,
@@ -73,5 +93,44 @@ impl StudySession {
         self.graded = None;
         self.last_after = None;
         self.card_msg = None;
+    }
+
+    pub fn snapshot(&self) -> StudySnapshot {
+        StudySnapshot {
+            version: STUDY_SNAPSHOT_VERSION,
+            book_id: self.book.id,
+            queue: self.queue.iter().cloned().collect(),
+            current: self.current.clone(),
+            revealed: self.revealed,
+            hint: self.hint,
+            graded: self.graded,
+            last_after: self.last_after.clone(),
+            new_done: self.new_done,
+            review_done: self.review_done,
+            started_at: self.started_at,
+            new_total: self.new_total,
+            review_total: self.review_total,
+        }
+    }
+
+    pub fn from_snapshot(book: Book, snapshot: StudySnapshot) -> Option<Self> {
+        if snapshot.version != STUDY_SNAPSHOT_VERSION || snapshot.book_id != book.id {
+            return None;
+        }
+        Some(Self {
+            book,
+            queue: snapshot.queue.into_iter().collect(),
+            current: snapshot.current,
+            revealed: snapshot.revealed,
+            hint: snapshot.hint,
+            graded: snapshot.graded,
+            last_after: snapshot.last_after,
+            new_done: snapshot.new_done,
+            review_done: snapshot.review_done,
+            started_at: snapshot.started_at,
+            new_total: snapshot.new_total,
+            review_total: snapshot.review_total,
+            card_msg: None,
+        })
     }
 }

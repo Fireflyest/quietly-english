@@ -810,6 +810,7 @@ dependencies = [
  "qe-store",
  "qe-tui",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "zip",

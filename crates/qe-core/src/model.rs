@@ -312,7 +312,7 @@ impl SrsCard {
 }
 
 /// 学习队列里的一张卡：单词 + 可选的历史状态。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudyCard {
     pub word: Word,
     pub card: Option<SrsCard>,
@@ -358,6 +358,20 @@ impl DailyStats {
     pub fn total_graded(&self) -> u32 {
         self.again + self.hard + self.good + self.easy
     }
+
+    pub fn forget_rate(&self) -> u32 {
+        let total = self.total_graded();
+        if total == 0 {
+            0
+        } else {
+            (self.again * 100 + total / 2) / total
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReviewStats {
+    pub difficult_words: Vec<(String, u32)>,
 }
 
 /// 一次阅读的记录。
