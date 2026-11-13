@@ -14,6 +14,7 @@ mod news;
 mod reader;
 mod session;
 mod ted;
+mod translator;
 mod xinhua;
 
 use std::path::PathBuf;
@@ -453,6 +454,93 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some("translate") => {
+            // `quietly translate <标题> [--para N]`：按段机翻并落库缓存。
+            //
+            // 不整篇一次提交：免费额度按字符算，长文一篇就够把一天的额度花光。
+            // 不给 `--para` 就翻「第一段还没译文的」，一次一段，额度花在要读的地方。
+            let flag = |names: &[&str]| -> Option<String> {
+                rest.iter()
+                    .position(|arg| names.contains(&arg.as_str()))
+                    .and_then(|index| rest.get(index + 1))
+                    .cloned()
+            };
+            let paragraph_arg = flag(&["--para", "-p"]);
+            let skip: Vec<&String> = ["--para", "-p"]
+                .iter()
+                .flat_map(|name| {
+                    let mut out = Vec::new();
+                    if let Some(index) = rest.iter().position(|arg| arg == name) {
+                        out.push(&rest[index]);
+                        if let Some(value) = rest.get(index + 1) {
+                            out.push(value);
+                        }
+                    }
+                    out
+                })
+                .collect();
+            let title = rest
+                .iter()
+                .find(|arg| !arg.starts_with('-') && !skip.contains(arg))
+                .cloned();
+            let text = match &title {
+                Some(title) => store
+                    .text_by_title(title)?
+                    .with_context(|| format!("没有这篇：{title}（quietly library 看列表）"))?,
+                None => store
+                    .texts()?
+                    .into_iter()
+                    .next()
+                    .context("库里还没有文本 · quietly read <file> 导入一篇")?,
+            };
+            let paragraphs = text.paragraphs();
+            let index = match paragraph_arg.as_deref().map(str::parse::<usize>) {
+                Some(Ok(number)) if number >= 1 && number <= paragraphs.len() => number - 1,
+                Some(Ok(_)) => bail!("段落号超出范围（1..={}）", paragraphs.len()),
+                Some(Err(_)) => bail!("--para 需要一个数字"),
+                None => {
+                    // 找第一段没有官方译文、也没缓存过的。
+                    let mut found = None;
+                    for index in 0..paragraphs.len() {
+                        if text.translation_at(index).is_some() {
+                            continue;
+                        }
+                        if store.text_translation(text.id, index)?.is_none() {
+                            found = Some(index);
+                            break;
+                        }
+                    }
+                    found.context("每一段都已经有译文了")?
+                }
+            };
+            println!(
+                "{}  paragraph {}/{}",
+                text.title,
+                index + 1,
+                paragraphs.len()
+            );
+            if let Some(cached) = store.text_translation(text.id, index)? {
+                println!("  {}", paragraphs[index]);
+                println!("  {cached}");
+                println!("(cached)");
+                return Ok(());
+            }
+            let Some(settings) = translator::settings() else {
+                bail!("机翻已关闭（QUIETLY_TRANSLATE=none）");
+            };
+            println!("  {}", paragraphs[index]);
+            eprintln!("translating · {} …", settings.detail());
+            let translation = translator::translate(&settings, paragraphs[index])?;
+            store.set_text_translation(
+                text.id,
+                index,
+                &translation.text,
+                translation.provider,
+            )?;
+            println!("  {}", translation.text);
+            println!("({})", translation.provider);
+            Ok(())
+        }
         Some("library") => {
             // `quietly library`：阅读书与进度。
             let books = store.text_books()?;
@@ -609,6 +697,7 @@ USAGE:
     quietly read [file] [--book <name>]  导入一篇文本或 EPUB（用 --book 归入同名的书）
     quietly library               阅读书与进度
     quietly news                   从 TED / BBC / 新华网 / Guardian 长读 / Aeon 各抓一批阅读材料
+    quietly translate [<标题>] [--para N]  按段机翻（默认第一段还没译文的），结果落库缓存
     quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度

@@ -235,7 +235,7 @@ pub const SPECS: &[Spec] = &[
         name: "/translate",
         alias: "tr",
         args: "",
-        help: "show or hide the translation",
+        help: "show or hide the translation (machine-translates this paragraph when the text has none)",
     },
     Spec {
         name: "/quiz",

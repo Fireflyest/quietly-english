@@ -586,6 +586,11 @@ pub struct ReadingSession {
     /// `paragraph`；否则点一下就把读者的进度和视野一起挪走了。
     pub focus_at: Option<usize>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// 机器翻译补上的段落译文：段落序号 → 译文。
+    ///
+    /// 单独放，不写进 `text.translation`：那个字段按空行对齐段落，中间插空段
+    /// 会让后面的段落整体错位。官方译文优先，这里只补没有的那些段。
+    pub machine: std::collections::BTreeMap<usize, String>,
     /// 打开过几个词条。
     pub opened: u32,
     /// 收进词书几个词。
@@ -605,6 +610,7 @@ impl ReadingSession {
             focus: None,
             focus_at: None,
             started_at: chrono::Utc::now(),
+            machine: std::collections::BTreeMap::new(),
             opened: 0,
             added: 0,
             message: None,
@@ -619,8 +625,23 @@ impl ReadingSession {
         self.text.paragraphs().get(self.paragraph).copied()
     }
 
+    /// 第 `index` 段的译文：官方译文优先，没有就用机器翻译补的那份。
+    pub fn translation_at(&self, index: usize) -> Option<&str> {
+        self.text
+            .translation_at(index)
+            .or_else(|| self.machine.get(&index).map(String::as_str))
+    }
+
+    /// 机器翻译补上一段译文。
+    pub fn add_translation(&mut self, index: usize, body: &str) {
+        let body = body.trim();
+        if !body.is_empty() {
+            self.machine.insert(index, body.to_string());
+        }
+    }
+
     pub fn current_translation(&self) -> Option<&str> {
-        self.text.translation_at(self.paragraph)
+        self.translation_at(self.paragraph)
     }
 
     /// 当前段的所有可查词（去重，按出现顺序）。

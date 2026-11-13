@@ -103,6 +103,11 @@ pub struct App {
     prev_anchor: Option<usize>,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
+    /// 后台机翻一段的结果通道：`(文本 id, 段落结果)`。
+    pub(crate) translation_fetch: Option<(
+        i64,
+        std::sync::mpsc::Receiver<(usize, Result<crate::translator::Translation, String>)>,
+    )>,
     /// 数据库路径：抓取线程要自己开一条连接，所以这里存一份。
     db_path: Option<std::path::PathBuf>,
 }
@@ -153,6 +158,7 @@ impl App {
             pin_view: false,
             prev_anchor: None,
             news_fetch: None,
+            translation_fetch: None,
             db_path: None,
         };
         app.load_history();
@@ -309,6 +315,8 @@ impl App {
 
             // 后台抓取跑在独立线程里，这里只收结果。
             self.poll_news_fetch();
+            // 机器翻译也一样：翻完再补进卡片，界面不卡。
+            self.poll_translation();
 
             if self.toggle_mouse {
                 self.toggle_mouse = false;
@@ -2376,6 +2384,59 @@ mod tests {
         assert!(has_translation(&card(&app)), "/translate must show it");
         app.execute(Command::Translate).unwrap();
         assert!(!has_translation(&card(&app)), "/translate hides it again");
+    }
+
+    #[test]
+    fn a_cached_machine_translation_is_shown_without_touching_the_network() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("english-only.txt");
+        std::fs::write(&path, "First paragraph only.\n\nSecond paragraph only.\n").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.execute(Command::Mode("intensive".into())).unwrap();
+
+        // 之前翻过这一段：结果在库里，切译文就不该再发请求。
+        let text = app.store.text_by_title("english-only").unwrap().unwrap();
+        app.store
+            .set_text_translation(text.id, 0, "只翻这一步。", "mymemory")
+            .unwrap();
+
+        app.execute(Command::Translate).unwrap();
+        assert!(app.show_translation);
+        assert!(
+            app.translation_fetch.is_none(),
+            "a cache hit must not spawn a request"
+        );
+        assert_eq!(
+            app.reading.as_ref().unwrap().translation_at(0),
+            Some("只翻这一步。")
+        );
+
+        // 关掉不需要通知任何人，也不该留下任务在跑。
+        app.execute(Command::Translate).unwrap();
+        assert!(!app.show_translation);
+        assert!(app.translation_fetch.is_none());
+    }
+
+    #[test]
+    fn an_official_translation_is_preferred_over_machine_output() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("bilingual.txt");
+        std::fs::write(&path, "English line.\n\n---\n\n官方译文。\n").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        let text = app.store.text_by_title("bilingual").unwrap().unwrap();
+        // 库里还留着一段旧的机翻，但官方译文必须优先。
+        app.store
+            .set_text_translation(text.id, 0, "机器译文。", "mymemory")
+            .unwrap();
+
+        app.execute(Command::Translate).unwrap();
+        assert!(app.translation_fetch.is_none(), "no request when text has its own");
+        assert_eq!(
+            app.reading.as_ref().unwrap().translation_at(0),
+            Some("官方译文。")
+        );
     }
 
     #[test]

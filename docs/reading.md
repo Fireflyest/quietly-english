@@ -37,7 +37,7 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 | TED Talks | `ted-talks` | 3 篇 | ✅ 官方中文字幕，逐段对照 | ✅ | ~1,300 词 |
 | BBC 媒体英语 | `bbc-media-english` | 3 期 | ✅ 英段紧跟中段 | ⚠️ 国内需代理 | ~110 词 |
 | 新华网英文 | `xinhua-english` | 3 篇 | ❌ 只有英文 | ✅ | ~800 词 |
-| Guardian 长读 | `guardian-long-read` | 1 篇 | ❌ 只有英文 | ✅ | **~4,000 词** |
+| Guardian 长读 | `guardian-long-read` | 1 篇 | ❌ 只有英文 | ⚠️ 国内需代理 | **~4,000 词** |
 | Aeon 随笔 | `aeon-essays` | 1 篇 | ❌ 只有英文 | ✅ | **~3,000–6,000 词** |
 
 - 抓取在后台线程里跑（自己开一条 SQLite 连接），界面不冻结；
@@ -45,8 +45,9 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 - 抓过就把日期记进 `settings.news_fetched_on`，同一天不会再抓；
 - `/fetch` 可以随时手动再抓一次，不受「今天抓过」限制；
 - 抓到的文章只进本地库，**不写仓库**；
-- **默认直连**：只有环境里配了 `HTTPS_PROXY`/`HTTP_PROXY` 才走代理。BBC 在国内直连
-  不通，没配代理时这一行会显示 `unavailable`，其余来源照常抓；配了代理它就自动可用。
+- **默认直连**：只有环境里配了 `HTTPS_PROXY`/`HTTP_PROXY` 才走代理。**BBC 和 Guardian
+  长读在国内直连不通**（实测 curl 直连 20 秒超时），没配代理时这两行会显示
+  `unavailable`，其余来源照常抓；配了代理它们就自动可用。
 - 一个来源挂了不影响别人：TED 打不开也得把新华网抓回来。
 
 > 为什么不是中国日报？「英语点津」的双语新闻栏目 2024-09-05 之后就没再更新（列表页
@@ -213,7 +214,7 @@ pub const SOURCE: Source = Source {
 | `,` / `.` | 选中上一个 / 下一个词 |
 | 鼠标点击 | 选中点到的词 |
 | `1`-`9` | 打开当前段第 n 个词的完整卡片 |
-| `tab` | 显示 / 隐藏译文（**默认隐藏**，先读原文） |
+| `tab` | 显示 / 隐藏译文（**默认隐藏**，先读原文；没有译文时按需机翻当前段） |
 | `esc` | 有选中词 → 取消选中；没有 → 结束阅读（写进度与统计） |
 
 字母键不拦截，所以想输入单词查词、或者敲 `/命令` 都不会被吞掉。
@@ -231,7 +232,7 @@ badge 也显示段号，所以定位结果看得见。译文同样受 `tab` 控�
 | `/fetch` · `/news` | 立刻从所有来源抓一批阅读材料（TED / BBC / 新华网 / Guardian 长读 / Aeon） |
 | `/drop <title>` | 删除一篇及其进度、标记、题目（不可撤销，需精确标题） |
 | `/mode` | 在全篇 / 精读之间切换 |
-| `/translate` | 显示 / 隐藏译文（`tab` 同效，默认隐藏，两种模式都生效） |
+| `/translate` | 显示 / 隐藏译文（`tab` 同效，默认隐藏）；文本本身没有译文时按需机翻**当前段**，见下文 |
 | `/mark <word>` | 标记 / 取消标记一个词 |
 | `/mark` | 标记选中的词（没有选中时标当前段第一个未标记的词） |
 | `/mark all` | 标记当前段**全部**词（不受数字键 9 个上限影响） |
@@ -281,7 +282,38 @@ I had the lonely child's habit.
 我有个孤独孩子的习惯。
 ```
 
-译文可以只写前几段，没译的段落不显示 `translation` 区块。
+译文可以只写前几段，没译的段落不显示译文块。
+
+## 机翻：免费额度按段用
+
+内建来源里只有 TED（官方字幕）和 BBC（双语栏目）带译文；新华网、Guardian 长读、
+Aeon 都只有英文。按 `tab` 或 `/translate` 时，程序会把**当前这一段**送去翻译，
+结果显示在原文下面，并写进库里——同一段只花一次额度。
+
+| 服务 | 额度 | 要什么 | 直连 |
+|---|---|---|---|
+| MyMemory（默认） | 5000 字符/天 | 什么都不用 | ✅ |
+| MyMemory + 邮箱 | 50000 字符/天 | 填 `MYMEMORY_EMAIL`，**不用注册** | ✅ |
+| DeepL API Free | 50 万字符/月 | 要注册，设 `DEEPL_API_KEY`（[免费注册](https://www.deepl.com/pro-api)） | ✅ |
+
+```bash
+export MYMEMORY_EMAIL=you@example.com    # 额度翻十倍，不用注册、不用验证
+export DEEPL_API_KEY=xxxxxxxx:fx         # 有 key 就优先用 DeepL，译文明显更顺
+export QUIETLY_TRANSLATE=none            # 整个关掉，不联网
+```
+
+MyMemory 的邮箱只是请求里的 `de` 参数（[官方说明](https://mymemory.translated.net/doc/usagelimits.php)：
+「填一个能联系到你的地址，额度从 5000 涨到 50000」），随便填一个真实邮箱即可，
+**没有注册页、没有确认邮件、没有 API key**。额度按 IP 记，不是按邮箱记。
+
+- **只翻当前段**，不整篇提交：一篇 Guardian 长读四五千词，一次性提交就把一个月的
+  免费额度花光了；按段翻，额度花在你真正读的那几段上。
+- 免费接口单次有上限（MyMemory 500 字节），长段自动按句号切开再拼回去。
+- 译文缓存进 `text_translations`，换机器前不用重翻；`/drop` 删篇时一起清掉。
+- 额度用完会明确说一句，不会静默留一个空白的译文区。
+- 命令行也能翻：`quietly translate <标题> --para 3`（不给段落号就翻第一段还没译的）。
+
+官方译文优先：TED / BBC 的对照译文不会被机翻覆盖。
 
 文件头的 `# title:` / `# source:` / `# license:` / `# book:` 会被读进元数据。`license`
 尤其重要——导入有版权的文本时自己要清楚来源。`# book:` 决定它归到哪本书；没写时用
@@ -316,7 +348,8 @@ TSV 五列，`#` 开头是注释：
 
 ## 数据从哪来
 
-**中文对照是这个模块的硬约束**：程序不会翻译，译文必须随文本一起提供。
+**中文对照不是硬性前提**：文本自带译文时用自带的（TED / BBC / 你导入的双语文件），
+没有就按 `tab` 走机翻，一段一段来（见上文「机翻」）。
 
 | 来源 | 授权 | 有中文对照 | 适合当什么 |
 | --- | --- | --- | --- |
@@ -331,11 +364,12 @@ TSV 五列，`#` 开头是注释：
 | [LibriVox 文本对照](https://librivox.org/) | 公有领域 | ❌ | 只用来找书，正文还是 Gutenberg |
 | [The Guardian 长读](https://www.theguardian.com/news/series/the-long-read) | 版权归媒体 | ❌ | **已内建**（`guardian-long-read`），一篇 4,000 词，个人学习用，不转发 |
 | [Aeon 随笔](https://aeon.co/essays) | 版权归 Aeon | ❌ | **已内建**（`aeon-essays`），一篇 3,000–6,000 词 |
+| [MyMemory](https://mymemory.translated.net/) / [DeepL Free](https://www.deepl.com/pro-api) | 服务条款 | ✅ 机翻 | **已内建**：没有译文的文章按段机翻，免费额度 |
 
 内建的五个来源（`/fetch`）就是按这张表挑的：TED（有译文、直连）、BBC 媒体英语
 （有译文、需代理）、[新华网英文](https://english.news.cn/)（无译文、直连、每日更新）、
-Guardian 长读与 Aeon（无译文、直连、**长篇**）。抓下来的文本存进本地库并标
-`personal study only`，只供自己读，不随项目分发。
+Guardian 长读（无译文、需代理、**长篇**）、Aeon（无译文、直连、**长篇**）。
+抓下来的文本存进本地库并标 `personal study only`，只供自己读，不随项目分发。
 
 **推荐路径**：
 
@@ -344,8 +378,8 @@ Guardian 长读与 Aeon（无译文、直连、**长篇**）。抓下来的文�
    自动成为一篇，`dc:title` 当书名，`dc:creator` 当来源，扉页/版权页/colophon 按
    `epub:type` 跳过。
 2. **Gutenberg**：只提供 `.txt` / `.html`，一章一个文件导入并写 `# book: 书名`。
-3. 需要译文时找公有领域旧译（民国时期译本多已进入公有领域，但各家出版社的
-   **新译**有版权，注意区分），按 `---` 分段粘进同一个文件。
+3. 需要更好的译文时找公有领域旧译（民国时期译本多已进入公有领域，但各家出版社的
+   **新译**有版权，注意区分），按 `---` 分段粘进同一个文件；不想找就按 `tab` 机翻。
 4. `quietly library` 看进度，`/read <slug>` 按书推进。
 
 `packs/texts/` 里已经放了一篇带 `# source:` 的示例（`orwell.txt`），可以照它的头部格式写。
@@ -361,6 +395,7 @@ reading_progress(text_id PK, paragraph, mode, updated_at)
 reading_log(id, text_id, day, started_at, ended_at, seconds,
             paragraphs, words_opened, words_added)
 reading_marks(text_id, lemma, paragraph, created_at)   -- 读者标记的词
+text_translations(text_id, paragraph, lang, body, provider, created_at)  -- 机翻缓存
 quizzes(id, text_id, paragraph, prompt, answer, choices, source, created_at)
 quiz_attempts(id, quiz_id, day, at, correct)
 ```

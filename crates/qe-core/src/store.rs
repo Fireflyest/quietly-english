@@ -98,6 +98,22 @@ pub trait Store {
     ) -> Result<()>;
     /// 用户标记过哪些词（`text_id = 0` 表示不限文章）。
     fn reading_marks(&self, text_id: i64) -> Result<Vec<String>>;
+    /// 某段缓存过的机器译文；没有返回 `None`。
+    fn text_translation(&self, text_id: i64, paragraph: usize) -> Result<Option<String>> {
+        let _ = (text_id, paragraph);
+        Ok(None)
+    }
+    /// 存一段机器译文，供下次直接取用（省掉重复的免费额度）。
+    fn set_text_translation(
+        &mut self,
+        text_id: i64,
+        paragraph: usize,
+        body: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let _ = (text_id, paragraph, body, provider);
+        Ok(())
+    }
     /// 标记一个词；已存在返回 `false`。
     fn add_reading_mark(&mut self, text_id: i64, lemma: &str, paragraph: usize) -> Result<bool>;
     /// 取消标记；不存在返回 `false`。

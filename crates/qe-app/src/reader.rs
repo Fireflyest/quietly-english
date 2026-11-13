@@ -308,19 +308,106 @@ impl App {
         Ok(())
     }
 
-    /// 显示 / 隐藏译文。
+    /// 显示 / 隐藏译文；没有译文时按需机翻**当前段**。
+    ///
+    /// 按段翻而不是整篇：免费额度按字符算（MyMemory 匿名 5000 字符/天），
+    /// 一篇 Guardian 长读四五千词，一次性提交就把一个月的额度花光了。
     pub fn toggle_translation(&mut self) -> Result<()> {
         let Some(session) = self.reading.as_ref() else {
             self.note("not reading · /read to start");
             return Ok(());
         };
-        // 有些来源只有英文（新华网英文），切译文什么也不会变，说清楚比默默无反应好。
-        if session.text.translations().is_empty() {
-            self.note("this text has no translation · dictionary lookup still works");
+        let paragraph = session.paragraph;
+        let text_id = session.text.id;
+
+        // 已经显示着：关掉就好，不发任何请求。
+        if self.show_translation {
+            self.show_translation = false;
+            return self.render_reading();
+        }
+        self.show_translation = true;
+
+        // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
+        if session.translation_at(paragraph).is_some() {
+            return self.render_reading();
+        }
+        // 以前翻过的段落，不再花第二次额度。
+        if let Some(cached) = self.store.text_translation(text_id, paragraph)? {
+            if let Some(session) = self.reading.as_mut() {
+                session.add_translation(paragraph, &cached);
+            }
+            return self.render_reading();
+        }
+        self.spawn_translation(text_id, paragraph)
+    }
+
+    /// 后台翻一段。网络请求不能卡在界面线程里（一段要请求一到几次）。
+    fn spawn_translation(&mut self, text_id: i64, paragraph: usize) -> Result<()> {
+        let Some(settings) = crate::translator::settings() else {
+            self.show_translation = false;
+            self.note("machine translation is off · unset QUIETLY_TRANSLATE to use it");
+            return Ok(());
+        };
+        if self.translation_fetch.is_some() {
+            self.note("translating another paragraph · one moment");
             return Ok(());
         }
-        self.show_translation = !self.show_translation;
-        self.render_reading()
+        let Some(body) = self
+            .reading
+            .as_ref()
+            .and_then(|session| session.text.paragraphs().get(paragraph).copied())
+            .map(str::to_string)
+        else {
+            self.show_translation = false;
+            self.note("nothing to translate here");
+            return Ok(());
+        };
+        let detail = settings.detail();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = crate::translator::translate(&settings, &body)
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send((paragraph, outcome));
+        });
+        self.translation_fetch = Some((text_id, receiver));
+        self.note(format!("translating paragraph {} · {detail}", paragraph + 1));
+        Ok(())
+    }
+
+    /// 翻译线程有结果了就补进当前会话；每帧调一次。
+    pub fn poll_translation(&mut self) {
+        let Some((text_id, receiver)) = self.translation_fetch.as_ref() else {
+            return;
+        };
+        let text_id = *text_id;
+        match receiver.try_recv() {
+            Ok((paragraph, Ok(translation))) => {
+                self.translation_fetch = None;
+                let _ = self.store.set_text_translation(
+                    text_id,
+                    paragraph,
+                    &translation.text,
+                    translation.provider,
+                );
+                if let Some(session) = self.reading.as_mut() {
+                    if session.text.id == text_id {
+                        session.add_translation(paragraph, &translation.text);
+                    }
+                }
+                let _ = self.render_reading();
+            }
+            Ok((_, Err(error))) => {
+                self.translation_fetch = None;
+                // 没译出来就别留一个「已开启但没有译文」的状态。
+                self.show_translation = false;
+                self.note(format!("translation failed · {error}"));
+                let _ = self.render_reading();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.translation_fetch = None;
+            }
+        }
     }
 
     /// 把当前段的**全部**候选词标为已标记（批量）。

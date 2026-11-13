@@ -205,6 +205,23 @@ CREATE TABLE IF NOT EXISTS text_books (
 );
 "#;
 
+/// v8：机器翻译缓存。
+///
+/// 免费额度按字符算（MyMemory 匿名 5000 字符/天），同一段译过就不该再花一次。
+/// 单独一张表而不是塞进 `texts.translation`：那个字段按空行对齐段落，中间插空段
+/// 会让后面的段落整体错位，而且官方译文和第二遍机器译文混在一起就分不清来源了。
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS text_translations (
+    text_id    INTEGER NOT NULL,
+    paragraph  INTEGER NOT NULL,
+    lang       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    provider   TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (text_id, paragraph, lang)
+);
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -326,6 +343,11 @@ impl SqliteStore {
             self.conn.execute_batch(SCHEMA_V7)?;
             self.migrate_text_books()?;
             self.conn.execute_batch("PRAGMA user_version = 7")?;
+        }
+        if version < 8 {
+            // 机器翻译缓存：同一段只花一次免费额度。
+            self.conn.execute_batch(SCHEMA_V8)?;
+            self.conn.execute_batch("PRAGMA user_version = 8")?;
         }
         // 词典库的列不跟主库版本号走：老库和新库都要补齐这两列，补之前先看
         // 实际列名，所以重复执行也不会出错。
@@ -1498,6 +1520,7 @@ impl Store for SqliteStore {
         tx.execute("DELETE FROM reading_marks WHERE text_id = ?1", [id])?;
         tx.execute("DELETE FROM reading_log WHERE text_id = ?1", [id])?;
         tx.execute("DELETE FROM reading_progress WHERE text_id = ?1", [id])?;
+        tx.execute("DELETE FROM text_translations WHERE text_id = ?1", [id])?;
         tx.execute("DELETE FROM texts WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(())
@@ -1570,6 +1593,43 @@ impl Store for SqliteStore {
             params![text_id, lemma.trim()],
         )?;
         Ok(changed > 0)
+    }
+
+    fn text_translation(&self, text_id: i64, paragraph: usize) -> Result<Option<String>> {
+        let body = self
+            .conn
+            .query_row(
+                "SELECT body FROM text_translations
+                 WHERE text_id = ?1 AND paragraph = ?2 AND lang = 'zh'",
+                params![text_id, paragraph as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(body.filter(|body| !body.trim().is_empty()))
+    }
+
+    fn set_text_translation(
+        &mut self,
+        text_id: i64,
+        paragraph: usize,
+        body: &str,
+        provider: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO text_translations(text_id, paragraph, lang, body, provider, created_at)
+             VALUES (?1, ?2, 'zh', ?3, ?4, ?5)
+             ON CONFLICT(text_id, paragraph, lang) DO UPDATE SET
+                body = excluded.body,
+                provider = excluded.provider",
+            params![
+                text_id,
+                paragraph as i64,
+                body.trim(),
+                provider,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
     }
 
     fn record_reading(&mut self, log: &ReadingLog) -> Result<()> {

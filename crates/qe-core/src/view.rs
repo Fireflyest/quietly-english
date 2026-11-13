@@ -358,7 +358,7 @@ impl ToolView {
                         index: Some(index),
                     });
                     if show_translation {
-                        if let Some(translation) = text.translation_at(index) {
+                        if let Some(translation) = session.translation_at(index) {
                             for line in translation.lines() {
                                 view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
                             }
