@@ -2599,6 +2599,34 @@ mod tests {
     }
 
     #[test]
+    fn first_tab_on_a_new_paragraph_keeps_translation_enabled() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("two-paragraphs.txt");
+        std::fs::write(&path, "First paragraph.\n\nSecond paragraph.").unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.execute(Command::Mode("intensive".into())).unwrap();
+
+        let text = app.store.text_by_title("two-paragraphs").unwrap().unwrap();
+        app.store
+            .set_text_translation(text.id, 1, "第二段。", "mymemory")
+            .unwrap();
+        app.show_translation = true;
+        app.reading_next().unwrap();
+        assert!(app.show_translation);
+
+        app.execute(Command::Translate).unwrap();
+        assert!(
+            app.show_translation,
+            "requesting a new paragraph must not first disable translation"
+        );
+        assert_eq!(
+            app.reading.as_ref().unwrap().translation_at(1),
+            Some("第二段。")
+        );
+    }
+
+    #[test]
     fn an_official_translation_is_preferred_over_machine_output() {
         let Harness { mut app, _dir } = harness();
         let path = _dir.path().join("bilingual.txt");

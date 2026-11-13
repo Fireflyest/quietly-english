@@ -344,14 +344,17 @@ impl App {
         let paragraph = session.paragraph;
         let text_id = session.text.id;
 
-        // 已经显示着：关掉就好，不发任何请求。
-        if self.show_translation {
+        // 已经显示着且当前段已有译文：关掉就好。新段落没有译文时，
+        // 第一次 Tab 应该请求当前段，而不是先把全文翻译开关关掉。
+        if self.show_translation && session.current_translation().is_some() {
             self.show_translation = false;
             self.translation_status = None;
             self.translation_provider = None;
             return self.render_reading();
         }
         self.show_translation = true;
+        self.translation_status = None;
+        self.translation_provider = None;
 
         // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
         if session.translation_at(paragraph).is_some() {
