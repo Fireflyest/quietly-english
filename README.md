@@ -138,7 +138,7 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | --- | --- | --- |
 | 单词 | ✅ 可用 | [docs/vocabulary.md](docs/vocabulary.md) |
 | 阅读 | ✅ 可用 | [docs/reading.md](docs/reading.md) |
-| 翻译 | ✅ 阅读内机翻 | 按段机翻，免费额度（MyMemory / DeepL Free），见 [docs/reading.md](docs/reading.md#机翻免费额度按段用) |
+| 翻译 | 🚧 阅读内机翻 + 练习记录 | 按段机翻；翻译练习支持题目、答案和历史提交，见 [docs/reading.md](docs/reading.md#机翻免费额度按段用) |
 | 写作 | ⏳ 待规划 | — |
 
 阅读分两种模式：**全篇**连续读完，**精读**一段一段。生词由你选——标记的词在原文里
@@ -243,7 +243,7 @@ cargo test                       # 领域、存储、排版、命令解析
 | 模块 | 计划 |
 | --- | --- |
 | 阅读 | `/read <article>`：分级短文，点击生词入词书，长难句拆解 |
-| 翻译 | `/translate <sentence>`：本地句库 + 可选 LLM，记录练习与批改 |
+| 翻译 | `translate-practice`：保存题目、答案、评分与历史提交；后续接入 AI 批改，见 [docs/translation.md](docs/translation.md) |
 | 写作 | `/write <topic>`：写作提示、字数统计、句法检查、历史版本对比 |
 
 ## License

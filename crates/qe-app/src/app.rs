@@ -96,6 +96,8 @@ pub struct App {
     pub(crate) show_translation: bool,
     /// 当前段译文请求的状态，显示在阅读卡片中。
     pub(crate) translation_status: Option<String>,
+    /// 当前段译文来源，显示在全篇阅读的段落锚点后。
+    pub(crate) translation_provider: Option<String>,
     /// 下一帧把当前段滚进视野（全篇模式下翻页、跳段后使用）。
     pub(crate) reveal_anchor: bool,
     /// 下一帧保持画面不动：内容在原位变长/变短（选词出说明块、切译文）时，
@@ -161,6 +163,7 @@ impl App {
             // 译文默认隐藏：先读原文，需要对照时再按 tab。
             show_translation: false,
             translation_status: None,
+            translation_provider: None,
             reveal_anchor: false,
             pin_view: false,
             prev_anchor: None,
@@ -544,6 +547,10 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.toggle_translation()?;
+                    return Ok(());
+                }
+                KeyCode::Char('m') => {
+                    self.mark_word("")?;
                     return Ok(());
                 }
                 KeyCode::Esc => {
@@ -2579,6 +2586,10 @@ mod tests {
         assert_eq!(
             app.reading.as_ref().unwrap().translation_at(0),
             Some("只翻这一步。")
+        );
+        assert!(
+            app.translation_status.is_none(),
+            "cached translations should be silent in the reading view"
         );
 
         // 关掉不需要通知任何人，也不该留下任务在跑。

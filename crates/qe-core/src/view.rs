@@ -313,7 +313,7 @@ impl ToolView {
         show_translation: bool,
         selection: Option<(&str, Option<&Word>)>,
     ) -> Self {
-        Self::reading_card_with_status(session, candidates, show_translation, None, selection)
+        Self::reading_card_with_status(session, candidates, show_translation, None, None, selection)
     }
 
     pub fn reading_card_with_status(
@@ -321,6 +321,7 @@ impl ToolView {
         candidates: &[Candidate],
         show_translation: bool,
         translation_status: Option<&str>,
+        translation_provider: Option<&str>,
         selection: Option<(&str, Option<&Word>)>,
     ) -> Self {
         let text = &session.text;
@@ -352,11 +353,21 @@ impl ToolView {
                     // `next` / `goto` 把位置移到哪了，否则这两个键看不出效果。
                     // `Anchor` 让渲染层回报这一行的位置，滚动时据此把当前段带回视野。
                     if index == session.paragraph && text.paragraph_count() > 1 {
-                        view = view.line(ToolLine::Anchor(format!(
+                        let mut anchor = format!(
                             "▸ {}/{}",
                             session.paragraph + 1,
                             text.paragraph_count()
-                        )));
+                        );
+                        if show_translation {
+                            if let Some(status) = translation_status {
+                                anchor.push_str(" · ");
+                                anchor.push_str(status);
+                            } else if let Some(provider) = translation_provider {
+                                anchor.push_str(" · translation: ");
+                                anchor.push_str(provider);
+                            }
+                        }
+                        view = view.line(ToolLine::Anchor(anchor));
                     }
                     // 每段都标上段号：词序号只在段内有效，点击时要用段号定位。
                     let focus_here = if Some(index) == focused_in { focus } else { None };
@@ -395,11 +406,6 @@ impl ToolView {
                             max,
                             complete: value >= max,
                         });
-                    }
-                    if index == session.paragraph {
-                        if let Some(status) = translation_status {
-                            view = view.muted(status.to_string());
-                        }
                     }
                 }
             }

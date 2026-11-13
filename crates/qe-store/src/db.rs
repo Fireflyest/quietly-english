@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
     Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
     Phase, Quiz, Rating, ReadingLog, ReadingStats, ReviewStats, SessionLog, SrsCard, StudyCard,
-    Word,
+    TranslationAttempt, TranslationExercise, Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -238,6 +238,32 @@ ALTER TABLE reviews ADD COLUMN difficulty_before REAL NOT NULL DEFAULT 5;
 ALTER TABLE reviews ADD COLUMN difficulty_after REAL NOT NULL DEFAULT 5;
 "#;
 
+/// v10：翻译学习练习与提交记录。
+const SCHEMA_V10: &str = r#"
+CREATE TABLE IF NOT EXISTS translation_exercises (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source      TEXT NOT NULL,
+    reference   TEXT NOT NULL,
+    direction   TEXT NOT NULL DEFAULT 'zh-en',
+    source_type TEXT NOT NULL DEFAULT 'manual',
+    difficulty  TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS translation_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    exercise_id INTEGER NOT NULL REFERENCES translation_exercises(id) ON DELETE CASCADE,
+    answer      TEXT NOT NULL,
+    score       INTEGER,
+    feedback    TEXT,
+    provider    TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_translation_attempts_exercise
+    ON translation_attempts(exercise_id, id);
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -391,6 +417,10 @@ impl SqliteStore {
             // v5/v6 可能重建 cards/reviews，因此必须在 lemma 迁移完成后补列。
             self.conn.execute_batch(SCHEMA_V9)?;
             self.conn.execute_batch("PRAGMA user_version = 9")?;
+        }
+        if version < 10 {
+            self.conn.execute_batch(SCHEMA_V10)?;
+            self.conn.execute_batch("PRAGMA user_version = 10")?;
         }
         Ok(())
     }
@@ -1676,6 +1706,19 @@ impl Store for SqliteStore {
         Ok(body.filter(|body| !body.trim().is_empty()))
     }
 
+    fn text_translation_provider(&self, text_id: i64, paragraph: usize) -> Result<Option<String>> {
+        let provider = self
+            .conn
+            .query_row(
+                "SELECT provider FROM text_translations
+                 WHERE text_id = ?1 AND paragraph = ?2 AND lang = 'zh'",
+                params![text_id, paragraph as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(provider.filter(|provider| !provider.trim().is_empty()))
+    }
+
     fn set_text_translation(
         &mut self,
         text_id: i64,
@@ -2056,6 +2099,105 @@ impl Store for SqliteStore {
             |row| row.get(0),
         )?;
         Ok(count as u32)
+    }
+
+    fn create_translation_exercise(
+        &mut self,
+        source: &str,
+        reference: &str,
+        direction: &str,
+        source_type: &str,
+        difficulty: Option<&str>,
+    ) -> Result<i64> {
+        anyhow::ensure!(!source.trim().is_empty(), "翻译题目不能为空");
+        anyhow::ensure!(!reference.trim().is_empty(), "参考译文不能为空");
+        self.conn.execute(
+            "INSERT INTO translation_exercises
+                (source, reference, direction, source_type, difficulty, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                source.trim(),
+                reference.trim(),
+                direction,
+                source_type,
+                difficulty,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn translation_exercise(&self, id: i64) -> Result<Option<TranslationExercise>> {
+        let exercise = self
+            .conn
+            .query_row(
+                "SELECT id, source, reference, direction, source_type, difficulty
+                 FROM translation_exercises WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(TranslationExercise {
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        reference: row.get(2)?,
+                        direction: row.get(3)?,
+                        source_type: row.get(4)?,
+                        difficulty: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(exercise)
+    }
+
+    fn record_translation_attempt(
+        &mut self,
+        exercise_id: i64,
+        answer: &str,
+        score: Option<u32>,
+        feedback: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<i64> {
+        anyhow::ensure!(!answer.trim().is_empty(), "翻译答案不能为空");
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM translation_exercises WHERE id = ?1)",
+            [exercise_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(exists, "翻译练习不存在: {exercise_id}");
+        self.conn.execute(
+            "INSERT INTO translation_attempts
+                (exercise_id, answer, score, feedback, provider, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                exercise_id,
+                answer.trim(),
+                score.map(|value| value.min(100) as i64),
+                feedback,
+                provider,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn translation_attempts(&self, exercise_id: i64) -> Result<Vec<TranslationAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, exercise_id, answer, score, feedback, provider, created_at
+             FROM translation_attempts WHERE exercise_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([exercise_id], |row| {
+            let created: String = row.get(6)?;
+            Ok(TranslationAttempt {
+                id: row.get(0)?,
+                exercise_id: row.get(1)?,
+                answer: row.get(2)?,
+                score: row.get::<_, Option<i64>>(3)?.map(|value| value as u32),
+                feedback: row.get(4)?,
+                provider: row.get(5)?,
+                created_at: time::parse_rfc(&created).unwrap_or_else(Utc::now),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -2574,6 +2716,40 @@ mod tests {
         let loaded = store.word("INSPECT").unwrap().unwrap();
         assert_eq!(loaded.roots.len(), 2);
         assert_eq!(loaded.examples.len(), 1);
+    }
+
+    #[test]
+    fn translation_practice_keeps_attempt_history() {
+        let (mut store, _dir) = temp_store();
+        let id = store
+            .create_translation_exercise(
+                "尽管下雨，他们还是来了。",
+                "Although it rained, they still came.",
+                "zh-en",
+                "manual",
+                Some("intermediate"),
+            )
+            .unwrap();
+        store
+            .record_translation_attempt(
+                id,
+                "Although it was raining, they came.",
+                Some(85),
+                Some("meaning is accurate"),
+                Some("manual"),
+            )
+            .unwrap();
+        store
+            .record_translation_attempt(id, "They came despite the rain.", Some(92), None, None)
+            .unwrap();
+
+        let exercise = store.translation_exercise(id).unwrap().unwrap();
+        assert_eq!(exercise.direction, "zh-en");
+        assert_eq!(exercise.difficulty.as_deref(), Some("intermediate"));
+        let attempts = store.translation_attempts(id).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].score, Some(85));
+        assert_eq!(attempts[1].answer, "They came despite the rain.");
     }
 
     #[test]

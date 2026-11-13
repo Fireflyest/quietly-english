@@ -541,6 +541,9 @@ fn run() -> Result<()> {
             println!("({})", translation.provider);
             Ok(())
         }
+        Some("translate-practice") | Some("translation-practice") => {
+            run_translation_practice(&mut store, &rest)
+        }
         Some("library") => {
             // `quietly library`：阅读书与进度。
             let books = store.text_books()?;
@@ -681,6 +684,108 @@ fn run() -> Result<()> {
     }
 }
 
+fn run_translation_practice(store: &mut SqliteStore, args: &[String]) -> Result<()> {
+    let action = args.first().map(String::as_str).unwrap_or("help");
+    match action {
+        "create" => {
+            let source = args.get(1).context(
+                "用法：quietly translate-practice create <原文> --reference <参考译文>",
+            )?;
+            let reference_index = args
+                .iter()
+                .position(|arg| arg == "--reference" || arg == "-r")
+                .context("缺少 --reference <参考译文>")?;
+            let reference = args
+                .get(reference_index + 1)
+                .context("--reference 需要一个值")?;
+            let direction = args
+                .iter()
+                .position(|arg| arg == "--direction" || arg == "-d")
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+                .unwrap_or("zh-en");
+            let difficulty = args
+                .iter()
+                .position(|arg| arg == "--difficulty")
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str);
+            let id = store.create_translation_exercise(
+                source,
+                reference,
+                direction,
+                "manual",
+                difficulty,
+            )?;
+            println!("translation exercise #{id}");
+            println!("source: {source}");
+            Ok(())
+        }
+        "submit" => {
+            let id = args
+                .get(1)
+                .context("用法：quietly translate-practice submit <id> <答案>")?
+                .parse::<i64>()
+                .context("练习 id 必须是数字")?;
+            let answer = args.get(2).context("缺少翻译答案")?;
+            let score = args
+                .iter()
+                .position(|arg| arg == "--score")
+                .and_then(|index| args.get(index + 1))
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .context("--score 必须是数字")?;
+            let feedback = args
+                .iter()
+                .position(|arg| arg == "--feedback")
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str);
+            let attempt = store.record_translation_attempt(
+                id,
+                answer,
+                score,
+                feedback,
+                Some("manual"),
+            )?;
+            println!("translation attempt #{attempt} saved for exercise #{id}");
+            Ok(())
+        }
+        "history" => {
+            let id = args
+                .get(1)
+                .context("用法：quietly translate-practice history <id>")?
+                .parse::<i64>()
+                .context("练习 id 必须是数字")?;
+            let exercise = store
+                .translation_exercise(id)?
+                .with_context(|| format!("翻译练习不存在: {id}"))?;
+            println!("source: {}", exercise.source);
+            println!("reference: {}", exercise.reference);
+            let attempts = store.translation_attempts(id)?;
+            if attempts.is_empty() {
+                println!("attempts: none");
+            } else {
+                for attempt in attempts {
+                    let score = attempt
+                        .score
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!("#{} · score {} · {}", attempt.id, score, attempt.answer);
+                    if let Some(feedback) = attempt.feedback {
+                        println!("  feedback: {feedback}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => bail!(
+            "用法：translate-practice create|submit|history\n\
+             create <原文> --reference <参考译文>\n\
+             submit <id> <答案> [--score N] [--feedback 文本]\n\
+             history <id>"
+        ),
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -698,6 +803,9 @@ USAGE:
     quietly library               阅读书与进度
     quietly news                   从 TED / BBC / 新华网 / Guardian 长读 / Aeon 各抓一批阅读材料
     quietly translate [<标题>] [--para N]  按段机翻（默认第一段还没译文的），结果落库缓存
+    quietly translate-practice create <原文> --reference <参考译文>
+    quietly translate-practice submit <练习 id> <答案> [--score N] [--feedback 文本]
+    quietly translate-practice history <练习 id>  查看翻译提交历史
     quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
@@ -722,7 +830,7 @@ TUI 命令：
     /read [file|title|book]  开始阅读   /texts  已导入的文本
     /library            阅读书与进度   /news   立即抓取新的阅读材料
     /drop <title>       删除文本   /mode [full|intensive]  切换模式
-    /mark <word> · /mark all      标记 / 取消标记生词
+    m / /mark <word> · /mark all 标记 / 取消标记生词
     /take <n>                     收第 n 个词进词书
     /next · /prev · /goto <n>     翻页
     /translate                    显示 / 隐藏译文

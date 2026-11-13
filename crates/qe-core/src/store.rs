@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::model::{
     Book, BookProgress,     DailyStats, DictReport, Example, ImportPlan, ImportReport, Quiz, Rating, ReviewStats,
     ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
+    TranslationAttempt, TranslationExercise,
 };
 
 pub trait Store {
@@ -103,6 +104,11 @@ pub trait Store {
         let _ = (text_id, paragraph);
         Ok(None)
     }
+    /// 某段缓存译文实际使用的翻译服务。
+    fn text_translation_provider(&self, text_id: i64, paragraph: usize) -> Result<Option<String>> {
+        let _ = (text_id, paragraph);
+        Ok(None)
+    }
     /// 存一段机器译文，供下次直接取用（省掉重复的免费额度）。
     fn set_text_translation(
         &mut self,
@@ -135,6 +141,26 @@ pub trait Store {
     fn upcoming(&self, from: NaiveDate, days: usize) -> Result<Vec<(NaiveDate, u32)>>;
     fn review_stats(&self, day: NaiveDate, limit: usize) -> Result<ReviewStats>;
     fn learned_today(&self, book_id: i64) -> Result<u32>;
+
+    // ---- 翻译学习 ----
+    fn create_translation_exercise(
+        &mut self,
+        source: &str,
+        reference: &str,
+        direction: &str,
+        source_type: &str,
+        difficulty: Option<&str>,
+    ) -> Result<i64>;
+    fn translation_exercise(&self, id: i64) -> Result<Option<TranslationExercise>>;
+    fn record_translation_attempt(
+        &mut self,
+        exercise_id: i64,
+        answer: &str,
+        score: Option<u32>,
+        feedback: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<i64>;
+    fn translation_attempts(&self, exercise_id: i64) -> Result<Vec<TranslationAttempt>>;
 
     // ---- 设置 ----
     fn setting(&self, key: &str) -> Result<Option<String>>;

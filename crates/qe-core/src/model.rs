@@ -394,6 +394,29 @@ pub struct ReviewStats {
     pub difficult_words: Vec<(String, u32)>,
 }
 
+/// A sentence used by the translation-learning module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranslationExercise {
+    pub id: i64,
+    pub source: String,
+    pub reference: String,
+    pub direction: String,
+    pub source_type: String,
+    pub difficulty: Option<String>,
+}
+
+/// One submitted answer for a translation exercise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranslationAttempt {
+    pub id: i64,
+    pub exercise_id: i64,
+    pub answer: String,
+    pub score: Option<u32>,
+    pub feedback: Option<String>,
+    pub provider: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// 一次阅读的记录。
 #[derive(Debug, Clone)]
 pub struct ReadingLog {

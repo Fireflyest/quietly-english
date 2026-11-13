@@ -175,11 +175,34 @@ impl App {
         let selection = focused
             .as_ref()
             .map(|(lemma, word)| (lemma.as_str(), word.as_ref()));
+        let translation_provider = if self.show_translation {
+            let (text_id, paragraph, has_translation) = (
+                session.text.id,
+                session.paragraph,
+                session.current_translation().is_some(),
+            );
+            if has_translation {
+                self.store
+                    .text_translation_provider(text_id, paragraph)?
+                    .or_else(|| Some("official".to_string()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let translation_status = self.translation_status.as_deref().or_else(|| {
+            self.translation_fetch
+                .as_ref()
+                .filter(|(text_id, _)| *text_id == session.text.id)
+                .map(|_| "translation: translating...")
+        });
         let view = ToolView::reading_card_with_status(
             session,
             &candidates,
             self.show_translation,
-            self.translation_status.as_deref(),
+            translation_status,
+            translation_provider.as_deref(),
             selection,
         );
         let message = Message::tool(view);
@@ -325,21 +348,26 @@ impl App {
         if self.show_translation {
             self.show_translation = false;
             self.translation_status = None;
+            self.translation_provider = None;
             return self.render_reading();
         }
         self.show_translation = true;
 
         // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
         if session.translation_at(paragraph).is_some() {
-            self.translation_status = Some("translation: available".to_string());
+            self.translation_provider = Some("official".to_string());
             return self.render_reading();
         }
         // 以前翻过的段落，不再花第二次额度。
         if let Some(cached) = self.store.text_translation(text_id, paragraph)? {
+            self.translation_provider = self
+                .store
+                .text_translation_provider(text_id, paragraph)?
+                .or_else(|| Some("cached".to_string()));
             if let Some(session) = self.reading.as_mut() {
                 session.add_translation(paragraph, &cached);
             }
-            self.translation_status = Some("translation: cached".to_string());
+            self.translation_status = None;
             return self.render_reading();
         }
         self.spawn_translation(text_id, paragraph)
@@ -350,6 +378,7 @@ impl App {
         let Some(settings) = crate::translator::settings() else {
             self.show_translation = false;
             self.translation_status = None;
+            self.translation_provider = None;
             self.note("machine translation is off · unset QUIETLY_TRANSLATE to use it");
             return Ok(());
         };
@@ -367,6 +396,7 @@ impl App {
         else {
             self.show_translation = false;
             self.translation_status = None;
+            self.translation_provider = None;
             self.note("nothing to translate here");
             return Ok(());
         };
@@ -379,8 +409,11 @@ impl App {
         });
         self.translation_fetch = Some((text_id, receiver));
         self.translation_status = Some("translation: translating...".to_string());
+        self.translation_provider = None;
         self.note(format!("translating paragraph {} · {detail}", paragraph + 1));
-        Ok(())
+        // Re-render immediately so the first Tab press visibly starts the
+        // loading state; do not make the user press Tab a second time.
+        self.render_reading()
     }
 
     /// 翻译线程有结果了就补进当前会话；每帧调一次。
@@ -403,14 +436,15 @@ impl App {
                         session.add_translation(paragraph, &translation.text);
                     }
                 }
-                self.translation_status =
-                    Some(format!("translation: cached · {}", translation.provider));
+                self.translation_status = None;
+                self.translation_provider = Some(translation.provider.to_string());
                 let _ = self.render_reading();
             }
             Ok((_, Err(error))) => {
                 self.translation_fetch = None;
                 // 没译出来就别留一个「已开启但没有译文」的状态。
                 self.show_translation = false;
+                self.translation_provider = None;
                 self.translation_status = Some(format!("translation failed · {error}"));
                 self.note(format!("translation failed · {error}"));
                 let _ = self.render_reading();
@@ -421,6 +455,8 @@ impl App {
                 self.show_translation = false;
                 self.translation_status =
                     Some("translation failed · worker stopped · retry /translate".to_string());
+                self.translation_provider = None;
+                let _ = self.render_reading();
             }
         }
     }
@@ -442,7 +478,6 @@ impl App {
             .filter(|token| token.is_word())
             .map(|token| token.lower)
             .collect();
-        let mut count = 0u32;
         for lemma in lemmas {
             let already = self
                 .reading
@@ -457,14 +492,7 @@ impl App {
             if let Some(session) = self.reading.as_mut() {
                 session.mark(&lemma, word);
             }
-            count += 1;
         }
-        let marked = self
-            .reading
-            .as_ref()
-            .map(|session| session.marked.len())
-            .unwrap_or(0);
-        self.note(format!("marked {count} words · {marked} in this text"));
         self.render_reading()
     }
 
@@ -574,6 +602,7 @@ impl App {
         // 翻译显示是当前文章的阅读偏好，不应延续到下一篇。
         self.show_translation = false;
         self.translation_status = None;
+        self.translation_provider = None;
         self.translation_fetch = None;
         for lemma in self.store.reading_marks(session.text.id)? {
             // 只恢复字符串标记；卡片正文按需再查。
@@ -790,11 +819,6 @@ impl App {
                 session.mark(&lemma, word);
             }
         }
-        self.note(if already {
-            format!("unmarked {lemma}")
-        } else {
-            format!("marked {lemma}")
-        });
         self.render_reading()
     }
 

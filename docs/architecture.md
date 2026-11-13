@@ -99,6 +99,8 @@ reading_log(id, text_id, day, started_at, ended_at, seconds, paragraphs, ...)
 reading_marks(text_id, lemma, paragraph, created_at)
 quizzes(id, text_id, paragraph, prompt, answer, choices, source, created_at)
 quiz_attempts(id, quiz_id, day, at, correct)
+translation_exercises(id, source, reference, direction, source_type, difficulty, created_at)
+translation_attempts(id, exercise_id, answer, score, feedback, provider, created_at)
 ```
 
 **`quietly-words.db`**（词典，500 MB+，随时重建）
@@ -143,6 +145,10 @@ words(id, lemma UNIQUE NOCASE, phonetic, translation, definition,
 2. `qe-store`：新增表或复用 `words`，实现新的查询方法；
 3. `qe-app`：加一个 `Command` 变体和 `App::<action>`；
 4. `qe-tui`：只有在需要新的排版元素时才改（例如内联高亮、输入多行）。
+
+翻译学习先与阅读机翻分开：阅读译文写入 `text_translations`，用于理解文章；
+练习题和用户答案写入 `translation_exercises` / `translation_attempts`，保留每次提交，
+后续才能做批改、版本对比和错误复习。
 
 命令解析与执行已经分离，界面层也只认识 `Message`，所以三个后续模块可以和单词模块并行开发。
 

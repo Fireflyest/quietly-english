@@ -943,7 +943,10 @@ fn paragraph_rows(
 ) -> (Vec<Vec<Span<'static>>>, Vec<WordBox>) {
     const INDENT: usize = 2;
 
-    let laid_out = qe_core::reading::layout_pieces(pieces, width);
+    // The paragraph content starts after the two-character indent. Layout
+    // against the remaining width so the last word is never clipped by the
+    // rail/indent area.
+    let laid_out = qe_core::reading::layout_pieces(pieces, width.saturating_sub(INDENT));
     let mut out: Vec<Vec<Span<'static>>> = Vec::with_capacity(laid_out.len());
     let mut hits: Vec<WordBox> = Vec::new();
 
