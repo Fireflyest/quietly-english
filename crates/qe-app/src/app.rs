@@ -111,9 +111,10 @@ pub struct App {
     study_fade_started: Option<Instant>,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
-    /// 后台机翻一段的结果通道：`(文本 id, 段落结果)`。
+    /// 后台机翻一段的结果通道：`(文本 id, 段落, 段落结果)`。
     pub(crate) translation_fetch: Option<(
         i64,
+        usize,
         std::sync::mpsc::Receiver<(usize, Result<crate::translator::Translation, String>)>,
     )>,
     /// 数据库路径：抓取线程要自己开一条连接，所以这里存一份。

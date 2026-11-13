@@ -194,8 +194,10 @@ impl App {
         let translation_status = self.translation_status.as_deref().or_else(|| {
             self.translation_fetch
                 .as_ref()
-                .filter(|(text_id, _)| *text_id == session.text.id)
-                .map(|_| "translation: translating...")
+            .filter(|(text_id, paragraph, _)| {
+                *text_id == session.text.id && *paragraph == session.paragraph
+            })
+            .map(|_| "translation: translating...")
         });
         let view = ToolView::reading_card_with_status(
             session,
@@ -385,11 +387,15 @@ impl App {
             self.note("machine translation is off · unset QUIETLY_TRANSLATE to use it");
             return Ok(());
         };
-        if self.translation_fetch.is_some() {
-            self.translation_status =
-                Some("translation: another paragraph is still loading".to_string());
-            self.note("translating another paragraph · one moment");
-            return Ok(());
+        if let Some((loading_text_id, loading_paragraph, _)) = self.translation_fetch.as_ref() {
+            if *loading_text_id == text_id && *loading_paragraph == paragraph {
+                self.translation_status = Some("translation: translating...".to_string());
+                return self.render_reading();
+            }
+            // A previous paragraph may still be translating. Drop its receiver
+            // and let its worker finish in the background; its result is now
+            // intentionally ignored so the new paragraph can start at once.
+            self.translation_fetch = None;
         }
         let Some(body) = self
             .reading
@@ -410,7 +416,7 @@ impl App {
                 .map_err(|err| format!("{err:#}"));
             let _ = sender.send((paragraph, outcome));
         });
-        self.translation_fetch = Some((text_id, receiver));
+        self.translation_fetch = Some((text_id, paragraph, receiver));
         self.translation_status = Some("translation: translating...".to_string());
         self.translation_provider = None;
         self.note(format!("translating paragraph {} · {detail}", paragraph + 1));
@@ -421,13 +427,25 @@ impl App {
 
     /// 翻译线程有结果了就补进当前会话；每帧调一次。
     pub fn poll_translation(&mut self) {
-        let Some((text_id, receiver)) = self.translation_fetch.as_ref() else {
+        let Some((text_id, requested_paragraph, receiver)) = self.translation_fetch.as_ref() else {
             return;
         };
         let text_id = *text_id;
+        let requested_paragraph = *requested_paragraph;
         match receiver.try_recv() {
             Ok((paragraph, Ok(translation))) => {
                 self.translation_fetch = None;
+                if paragraph != requested_paragraph
+                    || self
+                        .reading
+                        .as_ref()
+                        .map(|session| {
+                            session.text.id != text_id || session.paragraph != paragraph
+                        })
+                        .unwrap_or(true)
+                {
+                    return;
+                }
                 let _ = self.store.set_text_translation(
                     text_id,
                     paragraph,
@@ -445,17 +463,27 @@ impl App {
             }
             Ok((_, Err(error))) => {
                 self.translation_fetch = None;
-                // 没译出来就别留一个「已开启但没有译文」的状态。
-                self.show_translation = false;
+                if self
+                    .reading
+                    .as_ref()
+                    .map(|session| {
+                        session.text.id != text_id || session.paragraph != requested_paragraph
+                    })
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+                // Keep the reading view open so the failure stays beside the
+                // current paragraph anchor instead of being lost at the end.
+                self.show_translation = true;
                 self.translation_provider = None;
                 self.translation_status = Some(format!("translation failed · {error}"));
-                self.note(format!("translation failed · {error}"));
                 let _ = self.render_reading();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.translation_fetch = None;
-                self.show_translation = false;
+                self.show_translation = true;
                 self.translation_status =
                     Some("translation failed · worker stopped · retry /translate".to_string());
                 self.translation_provider = None;
@@ -474,7 +502,7 @@ impl App {
             return Ok(());
         };
         let text_id = session.text.id;
-        let paragraph = session.paragraph;
+        let paragraph = session.focus_paragraph().unwrap_or(session.paragraph);
         let lemmas: Vec<String> = session
             .current_tokens()
             .into_iter()
@@ -966,8 +994,8 @@ impl App {
 
     /// 选中第 `paragraph` 段的第 `index` 个词。
     ///
-    /// 全篇模式下一屏里能看到好几段。点到下一段时先把它设为当前段，再选中词；
-    /// 这样鼠标阅读不需要额外按一次翻页键。
+    /// 全篇模式下一屏里能看到好几段。点击其它段会把它设为当前段，
+    /// 并在下一帧把该段滚入视野，方便继续阅读和翻译。
     pub fn select_word_in(&mut self, paragraph: Option<usize>, index: usize) -> Result<()> {
         let Some(session) = self.reading.as_mut() else {
             return Ok(());
@@ -976,13 +1004,19 @@ impl App {
         if paragraph >= session.total() {
             return Ok(());
         }
-        if paragraph != session.paragraph {
+        let moved = paragraph != session.paragraph;
+        if moved {
             session.go_to(paragraph);
             self.store
                 .save_reading_progress(session.text.id, paragraph, session.mode)?;
+            self.translation_status = None;
+            self.translation_provider = None;
         }
         if !session.focus_in(paragraph, index) {
             return Ok(());
+        }
+        if moved {
+            self.reveal_anchor = true;
         }
         self.render_reading()
     }
