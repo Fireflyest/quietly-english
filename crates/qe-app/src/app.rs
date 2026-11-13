@@ -3009,6 +3009,24 @@ mod tests {
     }
 
     #[test]
+    fn next_chapter_hides_translation_by_default() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+
+        app.execute(Command::Read("animal-farm".into())).unwrap();
+        app.show_translation = true;
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+
+        assert_eq!(
+            app.reading.as_ref().map(|session| session.text.title.as_str()),
+            Some("Chapter Two")
+        );
+        assert!(!app.show_translation);
+    }
+
+    #[test]
     fn a_finished_chapter_is_marked_done_in_the_book() {
         let Harness { mut app, _dir } = harness();
         import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");

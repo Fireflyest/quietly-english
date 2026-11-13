@@ -556,6 +556,9 @@ impl App {
             .unwrap_or((0, ReadMode::default()));
         let paragraph = paragraph.min(text.paragraph_count().saturating_sub(1));
         let mut session = ReadingSession::new(text, mode, paragraph);
+        // 翻译显示是当前文章的阅读偏好，不应延续到下一篇。
+        self.show_translation = false;
+        self.translation_fetch = None;
         for lemma in self.store.reading_marks(session.text.id)? {
             // 只恢复字符串标记；卡片正文按需再查。
             session.mark(&lemma, None);
