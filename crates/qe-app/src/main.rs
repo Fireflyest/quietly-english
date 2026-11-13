@@ -1,12 +1,20 @@
 //! 命令行入口：默认进入 TUI，另外提供导入、路径查询等一次性命令。
 
+mod aeon;
 mod app;
+mod bbc;
 mod cli;
 mod command;
 mod editor;
 mod epub;
+mod fetch;
+mod guardian;
+mod html;
+mod news;
 mod reader;
 mod session;
+mod ted;
+mod xinhua;
 
 use std::path::PathBuf;
 
@@ -69,7 +77,11 @@ fn run() -> Result<()> {
         None => {
             cli::install_panic_hook();
             let mut terminal = cli::TerminalSession::new()?;
-            let app = app::App::new(Box::new(store))?;
+            let db_path = store.path().to_path_buf();
+            let mut app = app::App::new(Box::new(store))?;
+            // 每天第一次打开时抓一批双语新闻当阅读材料；抓取在后台线程里跑，
+            // 界面不阻塞，失败只提示一次。
+            app.enable_daily_news(db_path)?;
             app.run(&mut terminal)
         }
         Some("db") => {
@@ -429,6 +441,18 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Some("news") => {
+            // `quietly news`：从所有来源各抓一批（TUI 里用 /news）。
+            let path = store.path().to_path_buf();
+            drop(store);
+            println!("fetching from {} source(s) ...", news::SOURCES.len());
+            let report = news::fetch_all(&path)?;
+            println!("{}", report.summary());
+            for (name, detail) in report.lines() {
+                println!("  {name:<20} {detail}");
+            }
+            Ok(())
+        }
         Some("library") => {
             // `quietly library`：阅读书与进度。
             let books = store.text_books()?;
@@ -582,8 +606,9 @@ USAGE:
     quietly phrases <file>        批量导入常用词组（lemma,phrase,gloss）
     quietly phrase <词> <搭配> = <释义>   单条补录词组
     quietly word <lemma>          查看词条（含义项、搭配、词根、例句）
-    quietly read [file] [--book <name>]  导入一篇文本（用 --book 归入同名的书）
+    quietly read [file] [--book <name>]  导入一篇文本或 EPUB（用 --book 归入同名的书）
     quietly library               阅读书与进度
+    quietly news                   从 TED / BBC / 新华网 / Guardian 长读 / Aeon 各抓一批阅读材料
     quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目
     quietly books                 列出词书与进度
@@ -606,7 +631,8 @@ TUI 命令：
 
 阅读：
     /read [file|title|book]  开始阅读   /texts  已导入的文本
-    /library            阅读书与进度   /drop <title>  删除文本
+    /library            阅读书与进度   /news   立即抓取新的阅读材料
+    /drop <title>       删除文本   /mode [full|intensive]  切换模式
     /mark <word> · /mark all      标记 / 取消标记生词
     /take <n>                     收第 n 个词进词书
     /next · /prev · /goto <n>     翻页

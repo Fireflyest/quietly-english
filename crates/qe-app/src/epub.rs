@@ -302,9 +302,9 @@ fn finish_paragraphs(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// 常见的 HTML 实体。EPUB 里的排版断字（`&nbsp;`、`&mdash;`）比正式文本多，
-/// 这里只处理出现频率高的那些；数字实体一并支持。
-fn decode_entities(text: &str) -> String {
+/// 常见的 HTML 实体。EPUB 与网页里的排版断字（`&nbsp;`、`&mdash;`）出现频率很高，
+/// 这里只处理常见的那几个；数字实体一并支持。抓取模块也复用它。
+pub(crate) fn decode_entities(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(amp) = rest.find('&') {
@@ -330,6 +330,22 @@ fn decode_entities(text: &str) -> String {
             "rsquo" => Some('’'),
             "ldquo" => Some('“'),
             "rdquo" => Some('”'),
+            "pound" => Some('£'),
+            "euro" => Some('€'),
+            "middot" => Some('·'),
+            "bull" => Some('•'),
+            "copy" => Some('©'),
+            "reg" => Some('®'),
+            "trade" => Some('™'),
+            "deg" => Some('°'),
+            "times" => Some('×'),
+            "divide" => Some('÷'),
+            "frac12" => Some('½'),
+            "sect" => Some('§'),
+            "laquo" => Some('«'),
+            "raquo" => Some('»'),
+            "ensp" | "emsp" | "thinsp" => Some(' '),
+            "shy" | "zwnj" | "zwj" => Some('\u{200b}'),
             _ => entity
                 .strip_prefix("#x")
                 .or_else(|| entity.strip_prefix("#X"))

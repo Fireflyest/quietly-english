@@ -94,13 +94,21 @@ pub struct App {
     pub(crate) quiz_correct: u32,
     /// 阅读时是否显示译文（`/translate` 与 `tab` 切换，两种模式都生效）。
     pub(crate) show_translation: bool,
-    /// 下一帧把当前段滚进视野（全篇模式下翻页、选词后使用）。
+    /// 下一帧把当前段滚进视野（全篇模式下翻页、跳段后使用）。
     pub(crate) reveal_anchor: bool,
+    /// 下一帧保持画面不动：内容在原位变长/变短（选词出说明块、切译文）时，
+    /// 按锚点行的位移补回滚动量，读者看到的行不会整体滑动。
+    pub(crate) pin_view: bool,
+    /// 上一帧段落锚点的行号，用来算 `pin_view` 要补的位移。
+    prev_anchor: Option<usize>,
+    /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
+    news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
+    /// 数据库路径：抓取线程要自己开一条连接，所以这里存一份。
+    db_path: Option<std::path::PathBuf>,
 }
 
 impl App {
-    pub fn new(store: Box<dyn Store>) -> Result<Self> {
-        let book = store.current_book()?;
+    pub fn new(store: Box<dyn Store>) -> Result<Self> {        let book = store.current_book()?;
         let daily_new_limit = store
             .setting("daily_new_limit")?
             .and_then(|value| value.parse::<u32>().ok())
@@ -142,10 +150,93 @@ impl App {
             // 译文默认隐藏：先读原文，需要对照时再按 tab。
             show_translation: false,
             reveal_anchor: false,
+            pin_view: false,
+            prev_anchor: None,
+            news_fetch: None,
+            db_path: None,
         };
         app.load_history();
         app.greet()?;
         Ok(app)
+    }
+
+    /// 启用「每天首次启动抓一批双语新闻」。
+    ///
+    /// 记一个 `news_fetched_on = 2026-11-12` 的设置，同一天只抓一次；抓取放在
+    /// 后台线程里（自己开一条 SQLite 连接），主界面不阻塞。
+    pub fn enable_daily_news(&mut self, db_path: std::path::PathBuf) -> Result<()> {
+        self.db_path = Some(db_path);
+        let today = qe_core::time::format_day(qe_core::time::today());
+        if self.store.setting("news_fetched_on")?.as_deref() == Some(today.as_str()) {
+            return Ok(());
+        }
+        self.spawn_news_fetch()
+    }
+
+    /// 立刻抓一次（`/news`），不受「今天已抓过」限制。
+    pub fn fetch_news_now(&mut self) -> Result<()> {
+        if self.news_fetch.is_some() {
+            self.note("already fetching news · one moment");
+            return Ok(());
+        }
+        if self.db_path.is_none() {
+            self.note("news fetching is only wired up in the TUI binary");
+            return Ok(());
+        }
+        self.spawn_news_fetch()
+    }
+
+    fn spawn_news_fetch(&mut self) -> Result<()> {
+        let Some(db) = self.db_path.clone() else {
+            return Ok(());
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // 每个来源各抓一批；单个来源挂了不影响别的（TED 打不开也得把新华网抓回来）。
+            let outcome = crate::news::fetch_all(&db).map_err(|err| format!("{err:#}"));
+            let _ = sender.send(outcome);
+        });
+        self.news_fetch = Some(receiver);
+        self.note("fetching reading material in the background …");
+        Ok(())
+    }
+
+    /// 抓取线程有结果了就报到对话里；每帧调一次。
+    fn poll_news_fetch(&mut self) {
+        let Some(receiver) = self.news_fetch.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.news_fetch = None;
+                let _ = self.store.set_setting(
+                    "news_fetched_on",
+                    &qe_core::time::format_day(qe_core::time::today()),
+                );
+                if report.saved() > 0 {
+                    let mut view = ToolView::new("news")
+                        .accent(Accent::Note)
+                        .result(report.summary());
+                    for (name, detail) in report.lines() {
+                        view = view.kv(name, detail);
+                    }
+                    self.push(Message::tool(
+                        view.muted("/library shows the books · /read <slug> starts one"),
+                    ));
+                } else {
+                    self.note(format!("news: nothing new · {}", report.summary()));
+                }
+            }
+            Ok(Err(error)) => {
+                self.news_fetch = None;
+                // 网络不通不该打断阅读：给一行提示，下次启动再试。
+                self.note(format!("news fetch failed · {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.news_fetch = None;
+            }
+        }
     }
 
     /// Main loop. Polls at 120ms so resizes and mouse drags feel responsive.
@@ -199,11 +290,15 @@ impl App {
             self.draw_info = info;
 
             // 全篇模式下整篇文章一起渲染，当前段可能落在视野外（长文尤甚）。
-            // 翻页或选词后请求一次「把当前段带回来」，只在这一帧真滚动——
-            // 读者自己滚到别处再触发重画时，不会因为已经在视野内而被拽走。
+            // 翻页或跳段后请求一次「把当前段带回来」，只在这一帧真滚动——
+            // 读者自己滚到别处时不会被拽走；选词、切译文请求的是「保持画面不动」。
             if std::mem::take(&mut self.reveal_anchor) {
                 self.scroll_to_anchor();
+                self.pin_view = false;
+            } else if std::mem::take(&mut self.pin_view) {
+                self.pin_view_on_screen();
             }
+            self.prev_anchor = self.draw_info.anchor_line;
 
             // Imports read a whole dictionary file; run them only once the frame is
             // on screen so the "importing" line is visible while it works.
@@ -211,6 +306,9 @@ impl App {
                 self.run_pending_import(&path)?;
                 continue;
             }
+
+            // 后台抓取跑在独立线程里，这里只收结果。
+            self.poll_news_fetch();
 
             if self.toggle_mouse {
                 self.toggle_mouse = false;
@@ -561,8 +659,8 @@ impl App {
                 .map(|message| message == hit.message)
                 .unwrap_or(false);
             if self.reading.is_some() && on_card {
-                // 词序号只在段内有效：点到别的段时先跳到那段，否则会选中当前段
-                // 里同序号的另一个词。
+                // 词序号只在段内有效：要记住点的是哪一段，否则会选中当前段里
+                // 同序号的另一个词。阅读位置不动，读者不会因为点了个词就跳走。
                 let _ = self.select_word_in(hit.paragraph, hit.token);
                 return;
             }
@@ -635,7 +733,22 @@ impl App {
         self.unread = 0;
     }
 
-    fn scroll_by(&mut self, delta: i32) {        let next = self.scroll_back as i32 + delta;
+    /// 内容在原位变长/变短时保持画面不动：锚点行下移了几行，就把滚动量补几行，
+    /// 视野里的文字因而停在原地（选词弹出说明块不会让整篇往上跑）。
+    fn pin_view_on_screen(&mut self) {
+        let (Some(before), Some(after)) = (self.prev_anchor, self.draw_info.anchor_line) else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        let delta = after as i32 - before as i32;
+        let next = self.scroll_back as i32 + delta;
+        self.scroll_back = next.clamp(0, self.draw_info.max_back as i32) as u16;
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        let next = self.scroll_back as i32 + delta;
         self.scroll_back = next.clamp(0, self.draw_info.max_back as i32) as u16;
         if self.scroll_back == 0 {
             self.unread = 0;
@@ -943,6 +1056,7 @@ impl App {
             Command::Read(query) => self.start_reading(&query),
             Command::Texts => self.list_texts(),
             Command::Library => self.list_library(),
+            Command::News => self.fetch_news_now(),
             Command::Mode(arg) => self.set_reading_mode(&arg),
             Command::Mark(word) => self.mark_word(&word),
             Command::Words => self.list_reading_words(),
@@ -2104,7 +2218,7 @@ fn hits_table(words: &[Word], query: &str) -> TableView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qe_core::view::Body;
+    use qe_core::view::{Body, ToolLine};
     use qe_store::SqliteStore;
 
     struct Harness {
@@ -2497,8 +2611,9 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_word_below_the_current_paragraph_jumps_there_first() {
-        // 词序号只在段内有效：点第二段的第 3 个词，不能拿这个序号去第一段选词。
+    fn clicking_a_word_in_another_paragraph_keeps_the_reading_position() {
+        // 词序号只在段内有效：点第二段的第 3 个词，不能拿这个序号去第一段选词；
+        // 但顺手把阅读位置和进度挪过去就成了「点一下词全文乱跳」。
         let Harness { mut app, _dir } = harness();
         reading_fixture(&mut app, &_dir);
         app.execute(Command::Mode("full".into())).unwrap();
@@ -2507,23 +2622,23 @@ mod tests {
         // 第二段是 "Second paragraph here."：token 2 = here。
         let clicked = click_word(&mut app, |hit| hit.paragraph == Some(1) && hit.token == 2);
         assert_eq!(clicked, "here", "the clicked word, not the first paragraph's");
+        let session = app.reading.as_ref().unwrap();
+        assert_eq!(session.paragraph, 0, "the reading position stays put");
         assert_eq!(
-            app.reading.as_ref().unwrap().paragraph,
-            1,
-            "the reading position follows the click"
-        );
-        assert_eq!(
-            app.store
-                .reading_progress(app.store.text_by_title("flow").unwrap().unwrap().id)
-                .unwrap()
-                .map(|(paragraph, _)| paragraph),
+            session.focus_paragraph(),
             Some(1),
-            "progress is persisted"
+            "the selection is remembered with its own paragraph"
+        );
+        let id = app.store.text_by_title("flow").unwrap().unwrap().id;
+        assert_eq!(
+            app.store.reading_progress(id).unwrap().map(|(p, _)| p),
+            Some(0),
+            "a click is not progress: /mode saved paragraph 0, the click did not move it"
         );
     }
 
     #[test]
-    fn closing_reading_keeps_the_paragraph_reached_by_a_click() {
+    fn closing_reading_keeps_the_position_reached_by_navigation() {
         let Harness { mut app, _dir } = harness();
         reading_fixture(&mut app, &_dir);
         app.execute(Command::Mode("full".into())).unwrap();
@@ -2533,8 +2648,8 @@ mod tests {
         let id = app.store.texts().unwrap()[0].id;
         assert_eq!(
             app.store.reading_progress(id).unwrap().map(|(p, _)| p),
-            Some(1),
-            "resuming lands on the paragraph the reader clicked"
+            Some(0),
+            "a click does not move the paragraph that closing persists"
         );
     }
 
@@ -2580,17 +2695,39 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_growing_above_the_anchor_keeps_the_picture_still() {
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.draw_info.transcript = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.draw_info.max_back = 30;
+        app.scroll_back = 10; // 内容 40 行时，视野顶停在第 20 行
+
+        // 说明块插在锚点上方：整篇长了 5 行，锚点也跟着下移 5 行。
+        app.prev_anchor = Some(12);
+        app.draw_info.max_back = 35;
+        app.draw_info.anchor_line = Some(17);
+        app.pin_view_on_screen();
+
+        assert_eq!(app.scroll_back, 15, "视野顶仍停在第 20 行，画面不动");
+    }
+
+    #[test]
     fn selecting_a_word_keeps_the_reader_in_place_in_full_mode() {
         let Harness { mut app, _dir } = harness();
         reading_fixture(&mut app, &_dir);
         app.execute(Command::Mode("full".into())).unwrap();
+        app.reveal_anchor = false; // /mode 自己请求过一次
         // 读者已经滚到文章中间。
         app.scroll_back = 12;
         app.handle_key(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::NONE))
             .unwrap();
         assert!(
-            app.reveal_anchor,
-            "the next frame should check whether the paragraph is on screen"
+            !app.reveal_anchor,
+            "selection must not drag the paragraph back into view"
+        );
+        assert!(
+            app.pin_view,
+            "the panel grows in place, so the frame keeps the picture still"
         );
         assert_eq!(app.scroll_back, 12, "selection must not jump to the end");
     }
@@ -2862,6 +2999,99 @@ mod tests {
         assert!(
             !values.iter().any(|value| value.starts_with("Chapter")),
             "chapters are reached through the book"
+        );
+    }
+
+    #[test]
+    fn the_daily_fetch_runs_at_most_once_a_day() {
+        let Harness { mut app, _dir } = harness();
+        // 今天已经抓过：不应该再起线程。
+        app.store
+            .set_setting(
+                "news_fetched_on",
+                &qe_core::time::format_day(qe_core::time::today()),
+            )
+            .unwrap();
+        app.enable_daily_news(_dir.path().join("quietly.db")).unwrap();
+        assert!(
+            app.news_fetch.is_none(),
+            "a second launch on the same day must not fetch again"
+        );
+    }
+
+    #[test]
+    fn a_finished_fetch_reports_what_it_saved() {
+        let Harness { mut app, _dir } = harness();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.news_fetch = Some(receiver);
+        sender
+            .send(Ok(crate::news::FetchReport {
+                sources: vec![
+                    crate::news::SourceReport {
+                        name: "TED Talks".to_string(),
+                        book: "TED Talks".to_string(),
+                        translated: true,
+                        saved: 3,
+                        skipped: 1,
+                        failed: 0,
+                        error: None,
+                    },
+                    crate::news::SourceReport {
+                        name: "Xinhua English".to_string(),
+                        book: "Xinhua English".to_string(),
+                        translated: false,
+                        saved: 1,
+                        skipped: 0,
+                        failed: 0,
+                        error: None,
+                    },
+                ],
+            }))
+            .unwrap();
+
+        app.poll_news_fetch();
+        assert!(app.news_fetch.is_none(), "the channel is cleared");
+        let block = app
+            .messages
+            .iter()
+            .find_map(|message| match &message.body {
+                Body::Tool(view) if view.name == "news" => Some(view),
+                _ => None,
+            })
+            .expect("a news block reports the result");
+        assert_eq!(block.result.as_deref(), Some("4 new · 1 skipped"));
+        assert!(
+            block.lines.iter().any(|line| matches!(
+                line,
+                ToolLine::Kv { key, .. } if key == "Xinhua English"
+            )),
+            "every source that saved something gets a line"
+        );
+        assert_eq!(
+            app.store.setting("news_fetched_on").unwrap().as_deref(),
+            Some(qe_core::time::format_day(qe_core::time::today()).as_str()),
+            "the day is recorded only after a successful fetch"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_a_note_not_an_error_block() {
+        let Harness { mut app, _dir } = harness();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.news_fetch = Some(receiver);
+        sender.send(Err("offline".to_string())).unwrap();
+
+        app.poll_news_fetch();
+        assert!(app.news_fetch.is_none());
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| matches!(&message.body, Body::Text(text) if text.contains("offline"))),
+            "the failure is visible"
+        );
+        assert!(
+            app.store.setting("news_fetched_on").unwrap().is_none(),
+            "a failure does not mark the day as done"
         );
     }
 

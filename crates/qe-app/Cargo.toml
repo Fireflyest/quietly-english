@@ -15,7 +15,9 @@ qe-tui = { path = "../qe-tui" }
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
+minreq.workspace = true
 ratatui.workspace = true
+serde_json.workspace = true
 zip.workspace = true
 
 [dev-dependencies]

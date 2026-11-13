@@ -1514,14 +1514,13 @@ mod tests {
         ));
         let joined = text.join("\n");
         assert!(joined.contains("writer"), "marked word is in the paragraph");
-        assert!(joined.contains("translation"), "translation header");
         assert!(joined.contains("从很小的时候"), "translation body");
         assert!(joined.contains("1 writer"), "numbered picks: {joined}");
         assert!(joined.contains("●"), "marked picks carry a dot");
     }
 
     #[test]
-    fn hiding_the_translation_leaves_a_hint_instead() {
+    fn hiding_the_translation_leaves_the_paragraph_alone() {
         let session = reading_session(qe_core::reading::ReadMode::Intensive);
         let text = flat(&message_lines(
             &Message::tool(ToolView::reading_card(&session, &[], false, None)),
@@ -1529,7 +1528,7 @@ mod tests {
         ));
         let joined = text.join("\n");
         assert!(!joined.contains("从很小的时候"), "translation is hidden");
-        assert!(joined.contains("translation hidden"), "{joined}");
+        assert!(joined.contains("writer"), "the paragraph is still there");
     }
 
     #[test]

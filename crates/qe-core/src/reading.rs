@@ -582,6 +582,9 @@ pub struct ReadingSession {
     pub cursor: Option<usize>,
     /// 当前段里选中的词序号（按出现顺序，只数词），`, .` 与鼠标点击都改它。
     pub focus: Option<usize>,
+    /// 选中词所在的段。点击别段的词只换选中，不移动阅读位置，所以它未必等于
+    /// `paragraph`；否则点一下就把读者的进度和视野一起挪走了。
+    pub focus_at: Option<usize>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// 打开过几个词条。
     pub opened: u32,
@@ -600,6 +603,7 @@ impl ReadingSession {
             marked: Vec::new(),
             cursor: None,
             focus: None,
+            focus_at: None,
             started_at: chrono::Utc::now(),
             opened: 0,
             added: 0,
@@ -645,7 +649,7 @@ impl ReadingSession {
         }
         self.paragraph += 1;
         self.cursor = None;
-        self.focus = None;
+        self.clear_focus();
         true
     }
 
@@ -655,7 +659,7 @@ impl ReadingSession {
         }
         self.paragraph -= 1;
         self.cursor = None;
-        self.focus = None;
+        self.clear_focus();
         true
     }
 
@@ -665,15 +669,17 @@ impl ReadingSession {
         }
         self.paragraph = index;
         self.cursor = None;
-        self.focus = None;
+        self.clear_focus();
         true
     }
 
-    /// 当前段里能选中的词（按出现顺序，含重复）。
-    pub fn current_words(&self) -> Vec<Token> {
-        self.current()
-            .map(|paragraph| {
-                tokenize(paragraph)
+    /// 第 `paragraph` 段里能选中的词（按出现顺序，含重复）。
+    pub fn words_at(&self, paragraph: usize) -> Vec<Token> {
+        self.text
+            .paragraphs()
+            .get(paragraph)
+            .map(|text| {
+                tokenize(text)
                     .into_iter()
                     .filter(|token| token.is_word())
                     .collect()
@@ -681,18 +687,42 @@ impl ReadingSession {
             .unwrap_or_default()
     }
 
-    /// 选中第 `index` 个词。
+    /// 当前段里能选中的词（按出现顺序，含重复）。
+    pub fn current_words(&self) -> Vec<Token> {
+        self.words_at(self.paragraph)
+    }
+
+    /// 选中词所在的段；没选词时为 `None`。
+    pub fn focus_paragraph(&self) -> Option<usize> {
+        let paragraph = self.focus_at.unwrap_or(self.paragraph);
+        (self.focus.is_some() && paragraph < self.total()).then_some(paragraph)
+    }
+
+    /// 选中词所在段的原文。词组的匹配要在这段里做，而不是「当前段」。
+    pub fn focus_text(&self) -> Option<&str> {
+        let paragraph = self.focus_paragraph()?;
+        self.text.paragraphs().get(paragraph).copied()
+    }
+
+    /// 选中当前段第 `index` 个词。
     pub fn focus_on(&mut self, index: usize) -> bool {
-        if index >= self.current_words().len() {
+        self.focus_in(self.paragraph, index)
+    }
+
+    /// 选中第 `paragraph` 段的第 `index` 个词，不动阅读位置。
+    pub fn focus_in(&mut self, paragraph: usize, index: usize) -> bool {
+        if index >= self.words_at(paragraph).len() {
             return false;
         }
         self.focus = Some(index);
+        self.focus_at = Some(paragraph);
         true
     }
 
     /// `,` / `←` 那样按词移动。返回是否真的移动了。
     pub fn focus_move(&mut self, delta: isize) -> bool {
-        let count = self.current_words().len();
+        let paragraph = self.focus_paragraph().unwrap_or(self.paragraph);
+        let count = self.words_at(paragraph).len();
         if count == 0 {
             return false;
         }
@@ -703,23 +733,29 @@ impl ReadingSession {
         };
         let changed = self.focus != Some(next);
         self.focus = Some(next);
+        self.focus_at = Some(paragraph);
         changed
     }
 
     pub fn clear_focus(&mut self) -> bool {
+        self.focus_at = None;
         self.focus.take().is_some()
     }
 
     /// 选中的词条（小写）。用于查词与标记。
     pub fn focused_lemma(&self) -> Option<String> {
         let index = self.focus?;
-        self.current_words().get(index).map(|token| token.lower.clone())
+        let paragraph = self.focus_paragraph()?;
+        self.words_at(paragraph)
+            .get(index)
+            .map(|token| token.lower.clone())
     }
 
-    /// 选中的词在当前段里的字节区间，用来判断它落在哪个词组里。
+    /// 选中的词在其所在段里的字节区间，用来判断它落在哪个词组里。
     pub fn focused_span(&self) -> Option<(usize, usize)> {
         let index = self.focus?;
-        self.current_words()
+        let paragraph = self.focus_paragraph()?;
+        self.words_at(paragraph)
             .get(index)
             .map(|token| (token.start, token.end))
     }

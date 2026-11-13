@@ -194,10 +194,10 @@ impl App {
             }
         }
         if full_mode {
-            // 全篇模式把整篇画成一条消息：保持当前滚动位置，交给下一帧的
-            // `scroll_to_anchor` 判断当前段是否需要被带回视野，避免先跳到全文
-            // 末尾再跳回来。
-            self.reveal_anchor = true;
+            // 全篇模式把整篇画成一条消息，重画时保持当前滚动位置：选词、切译文
+            // 只换内容不换位置。真的换了段落（翻页、跳段）由那几个入口自己请求
+            // `reveal_anchor`，所以这里只要求视野别因为内容变长/变短而滑动。
+            self.pin_view = true;
         } else {
             self.scroll_back = 0;
         }
@@ -310,16 +310,16 @@ impl App {
 
     /// 显示 / 隐藏译文。
     pub fn toggle_translation(&mut self) -> Result<()> {
-        if self.reading.is_none() {
+        let Some(session) = self.reading.as_ref() else {
             self.note("not reading · /read to start");
+            return Ok(());
+        };
+        // 有些来源只有英文（新华网英文），切译文什么也不会变，说清楚比默默无反应好。
+        if session.text.translations().is_empty() {
+            self.note("this text has no translation · dictionary lookup still works");
             return Ok(());
         }
         self.show_translation = !self.show_translation;
-        self.note(if self.show_translation {
-            "translation: shown"
-        } else {
-            "translation: hidden"
-        });
         self.render_reading()
     }
 
@@ -475,6 +475,7 @@ impl App {
         }
         self.store.set_setting("last_text", &session.text.title)?;
         self.reading = Some(session);
+        self.reveal_anchor = true;
         self.render_reading()
     }
 
@@ -568,6 +569,7 @@ impl App {
             (session.text.id, session.paragraph, session.mode)
         };
         self.store.save_reading_progress(id, paragraph, mode)?;
+        self.reveal_anchor = true;
         self.render_reading()
     }
 
@@ -585,6 +587,7 @@ impl App {
         };
         if let Some((id, paragraph, mode)) = advanced {
             self.store.save_reading_progress(id, paragraph, mode)?;
+            self.reveal_anchor = true;
             return self.render_reading();
         }
 
@@ -616,6 +619,7 @@ impl App {
         }
         let (id, paragraph, mode) = (session.text.id, session.paragraph, session.mode);
         self.store.save_reading_progress(id, paragraph, mode)?;
+        self.reveal_anchor = true;
         self.render_reading()
     }
 
@@ -631,6 +635,7 @@ impl App {
         }
         let (id, paragraph, mode) = (session.text.id, session.paragraph, session.mode);
         self.store.save_reading_progress(id, paragraph, mode)?;
+        self.reveal_anchor = true;
         self.render_reading()
     }
 
@@ -826,40 +831,23 @@ impl App {
         Ok(())
     }
 
-    /// 选中当前段第 `index` 个词（0 基），并重画卡片。
-    pub fn select_word(&mut self, index: usize) -> Result<()> {
-        let Some(session) = self.reading.as_mut() else {
-            return Ok(());
-        };
-        if !session.focus_on(index) {
-            return Ok(());
-        }
-        self.render_reading()
-    }
-
     /// 选中第 `paragraph` 段的第 `index` 个词。
     ///
     /// 全篇模式下一屏里能看到好几段，点击落在哪一段都得选对：词序号只在段内
-    /// 有效，所以点到别的段时先把阅读位置移过去（并落库），再选词。
+    /// 有效，所以选中词要记住它所在的是哪一段。但阅读位置和进度**不动**——
+    /// 点一下词就把读者的进度挪走（连视野一起跳）是最烦人的那种行为。
     pub fn select_word_in(&mut self, paragraph: Option<usize>, index: usize) -> Result<()> {
         let Some(session) = self.reading.as_mut() else {
             return Ok(());
         };
-        let Some(paragraph) = paragraph.filter(|&paragraph| paragraph != session.paragraph) else {
-            return self.select_word(index);
-        };
+        let paragraph = paragraph.unwrap_or(session.paragraph);
         if paragraph >= session.total() {
             return Ok(());
         }
-        session.paragraph = paragraph;
-        session.cursor = None;
-        if !session.focus_on(index) {
+        if !session.focus_in(paragraph, index) {
             return Ok(());
         }
-        let (id, paragraph, mode) = (session.text.id, session.paragraph, session.mode);
-        self.store.save_reading_progress(id, paragraph, mode)?;
-        self.render_reading()?;
-        Ok(())
+        self.render_reading()
     }
 
     /// `,` / `.`：按词移动选中位置。`delta` 为 −1 时向前。

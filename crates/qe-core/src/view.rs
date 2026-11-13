@@ -188,7 +188,7 @@ fn word_panel(
 
     // 只提示**本段里真的写着**的词组：词条里登记但这段没用到的搭配不列出来，
     // 否则每个多义词都会拖出一长串与当前阅读无关的短语。
-    let matched = match (session.current(), session.focused_span()) {
+    let matched = match (session.focus_text(), session.focused_span()) {
         (Some(paragraph), Some(span)) => {
             crate::reading::phrases_covering(paragraph, span, &word.collocations)
         }
@@ -327,6 +327,8 @@ impl ToolView {
         let marked: Vec<String> = session.marked.iter().map(|m| m.lemma.clone()).collect();
         let is_marked = |word: &str| marked.iter().any(|lemma| lemma == word);
         let focus = session.focus;
+        // 选中词可以在别的段里（点击不移动阅读位置），高亮与说明块都跟着它走。
+        let focused_in = session.focus_paragraph();
 
         match session.mode {
             crate::reading::ReadMode::Full => {
@@ -346,7 +348,7 @@ impl ToolView {
                         )));
                     }
                     // 每段都标上段号：词序号只在段内有效，点击时要用段号定位。
-                    let focus_here = if index == session.paragraph { focus } else { None };
+                    let focus_here = if Some(index) == focused_in { focus } else { None };
                     view = view.line(ToolLine::Paragraph {
                         pieces: crate::reading::paragraph_pieces(
                             paragraph,
@@ -362,9 +364,9 @@ impl ToolView {
                             }
                         }
                     }
-                    // 选中词的说明块紧跟**当前段**，不是整篇末尾：长文里否则要滚到底
-                    // 才能看到释义，等于没看到。
-                    if index == session.paragraph {
+                    // 选中词的说明块紧跟**选中词所在段**，不是整篇末尾：长文里否则
+                    // 要滚到底才能看到释义，等于没看到。
+                    if Some(index) == focused_in {
                         if let Some((lemma, word)) = selection {
                             view = word_panel(view, session, lemma, word);
                         }
@@ -373,20 +375,22 @@ impl ToolView {
             }
             crate::reading::ReadMode::Intensive => {
                 if let Some(paragraph) = session.current() {
+                    let focus_here = if focused_in == Some(session.paragraph) {
+                        focus
+                    } else {
+                        None
+                    };
                     view = view.line(ToolLine::Paragraph {
-                        pieces: crate::reading::paragraph_pieces(paragraph, is_marked, focus),
+                        pieces: crate::reading::paragraph_pieces(paragraph, is_marked, focus_here),
                         index: None,
                     });
                 }
-                if let Some(translation) = session.current_translation() {
-                    if show_translation {
-                        view = view.spacer().muted("translation".to_string());
+                if show_translation {
+                    if let Some(translation) = session.current_translation() {
                         for line in translation.lines() {
                             // 缩进与原文对齐，读起来像同一段的两种语言。
                             view = view.line(ToolLine::Muted(format!("  {}", line.trim())));
                         }
-                    } else {
-                        view = view.spacer().muted("translation hidden · tab to show".to_string());
                     }
                 }
                 if let Some((lemma, word)) = selection {

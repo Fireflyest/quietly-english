@@ -11,6 +11,7 @@ quietly read article.txt              # 导入纯文本（可双语）
 quietly read ch1.txt --book "Animal Farm"   # 归入指定的书
 quietly read                          # 列出阅读书与散篇进度
 quietly library                       # 只看书与进度
+quietly news                          # 从 TED / BBC / 新华网 / Guardian 长读 / Aeon 各抓一批
 quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 ```
 
@@ -23,8 +24,60 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 /read Why I Write        按标题打开
 /read animal-farm        接着读这本书里下一篇没读完的
 /library                 列出书与每本进度
+/fetch（/news 同义）      立刻从所有来源抓一批
 /texts                   列出所有文本与进度
 ```
+
+## 每天自动抓阅读材料
+
+**每天第一次启动时**，程序会在后台从五个来源各抓一批，每个来源归成自己的一本书：
+
+| 来源 | 书（slug） | 每次 | 译文 | 直连 | 长度 |
+|---|---|---|---|---|---|
+| TED Talks | `ted-talks` | 3 篇 | ✅ 官方中文字幕，逐段对照 | ✅ | ~1,300 词 |
+| BBC 媒体英语 | `bbc-media-english` | 3 期 | ✅ 英段紧跟中段 | ⚠️ 国内需代理 | ~110 词 |
+| 新华网英文 | `xinhua-english` | 3 篇 | ❌ 只有英文 | ✅ | ~800 词 |
+| Guardian 长读 | `guardian-long-read` | 1 篇 | ❌ 只有英文 | ✅ | **~4,000 词** |
+| Aeon 随笔 | `aeon-essays` | 1 篇 | ❌ 只有英文 | ✅ | **~3,000–6,000 词** |
+
+- 抓取在后台线程里跑（自己开一条 SQLite 连接），界面不冻结；
+- 完成后在对话里列出每个来源抓了多少：`TED Talks 3 new · en + 中文`，失败只提示一次；
+- 抓过就把日期记进 `settings.news_fetched_on`，同一天不会再抓；
+- `/fetch` 可以随时手动再抓一次，不受「今天抓过」限制；
+- 抓到的文章只进本地库，**不写仓库**；
+- **默认直连**：只有环境里配了 `HTTPS_PROXY`/`HTTP_PROXY` 才走代理。BBC 在国内直连
+  不通，没配代理时这一行会显示 `unavailable`，其余来源照常抓；配了代理它就自动可用。
+- 一个来源挂了不影响别人：TED 打不开也得把新华网抓回来。
+
+> 为什么不是中国日报？「英语点津」的双语新闻栏目 2024-09-05 之后就没再更新（列表页
+> 最新一条就是那天），21 世纪英文报的双语栏目停在 2024-03，所以在国内**还在更新、
+> 又带中文译文、又能直连**的源基本没有了。于是拆成三类：TED 给带官方译文的精读，
+> 新华网英文给每日新鲜的英文原文，Guardian 长读和 Aeon 给**真正够长的**文章
+> （3,000–6,000 词，没有译文，靠词条和上下文读）。
+>
+> 双语长篇这条路实测走不通：联合国教科文组织《信使》杂志英文版和中文版是两个
+> 不同的 slug，取中文首页 8 篇只有 1 篇段落数对得上；联合国新闻的中英文是不同的
+> node id，页面里没有互指链接；FT 中文网限流（429），纽约时报中文网要登录。
+
+每条想多抓几篇：改各来源模块里的 `limit`（如 `crates/qe-app/src/ted.rs`）。配对不上的段落会被
+丢掉而不是错位——宁可少一段，也不让译文串段。
+
+### 加一个新来源
+
+在 `crates/qe-app/src/` 里加一个模块，实现两个函数，然后登记到 `news.rs` 的 `SOURCES`：
+
+```rust
+pub const SOURCE: Source = Source {
+    name: "某站",
+    book: "某站",          // 归到哪本书
+    translated: true,      // 有没有译文
+    limit: 3,              // 每次最多抓几篇新的
+    listing,               // fn() -> Result<Vec<String>>，候选 URL，最新的在前
+    article,               // fn(&str) -> Result<Option<Article>>，解析不出就 Ok(None)
+};
+```
+
+去重、限量、写库、失败隔离都由 `news.rs` 统一处理。
 
 ## 阅读书：同源归一本
 
@@ -33,6 +86,7 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 | 来源 | 归到哪本书 |
 |---|---|
 | EPUB 文件 | 用 `dc:title` 当书名，spine 里每一章自动成为一篇 |
+| 自动抓取的新闻 | 每个来源一本书：`TED Talks`（`ted-talks`）、`BBC Media English`（`bbc-media-english`）、`Xinhua English`（`xinhua-english`）、`Guardian Long Read`（`guardian-long-read`）、`Aeon Essays`（`aeon-essays`）；旧的存档在 `China Daily Bilingual` |
 | 文件头 `# book: Animal Farm` | `animal-farm` |
 | `quietly read x.txt --book "Animal Farm"` | 同上，批量导入时不用改文件头 |
 | 只有文件头 `# source: Project Gutenberg` | 用来源作书名（`project-gutenberg`） |
@@ -87,8 +141,6 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 ⎿ Why I Write
   From a very early age I knew I should be a writer.
 
-  translation hidden · tab to show
-
   words · 2 marked · /mark <word> to mark any
     1 writer  n. 作家 ●
     2 lonely  a. 孤独的
@@ -98,9 +150,11 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 按 `tab` 后同一张卡片变成：
 
 ```
-  translation
+  From a very early age I knew I should be a writer.
     从很小的时候，我就知道我要当作家。
 ```
+
+译文直接跟在段落下面，没有标题行，也没有「隐藏」提示。
 
 `●` 表示已标记。标记的词在原文里用强调色显示。
 
@@ -113,8 +167,6 @@ quietly quiz "Why I Write" q.tsv      # 给某篇导入题目
 ⎿ Why I Write
   From a very early age I knew I should be a writer.
   ↑ 反显的就是当前选中的词
-
-  translation hidden · tab to show
 
   word
     early  /ˈɜːli/                        early age → 早年
@@ -176,6 +228,7 @@ badge 也显示段号，所以定位结果看得见。译文同样受 `tab` 控�
 | `/read <title|file|book>` | 打开一篇、导入文件，或接着读一本书的下一篇 |
 | `/texts` | 列出已导入的文本与进度 |
 | `/library` | 阅读书与每本进度（别名 `/shelf`） |
+| `/fetch` · `/news` | 立刻从所有来源抓一批阅读材料（TED / BBC / 新华网 / Guardian 长读 / Aeon） |
 | `/drop <title>` | 删除一篇及其进度、标记、题目（不可撤销，需精确标题） |
 | `/mode` | 在全篇 / 精读之间切换 |
 | `/translate` | 显示 / 隐藏译文（`tab` 同效，默认隐藏，两种模式都生效） |
@@ -272,11 +325,17 @@ TSV 五列，`#` 开头是注释：
 | [Standard Ebooks](https://standardebooks.org/) | 公有领域（重排版） | ❌ | **下载 Compatible epub**，`quietly read book.epub` 直接按章导入 |
 | [Wikisource 多语言版](https://zh.wikisource.org/) | CC BY-SA / 公有领域 | ✅ 部分作品有旧译 | 中英对照长篇：原文取 Gutenberg，旧译取这里 |
 | [Tatoeba 句对](https://tatoeba.org/en/downloads) | CC-BY 2.0 FR | ✅ 句子级 | 短句精读素材，不是成篇 |
-| [TED 演讲字幕](https://www.ted.com/participate/translate) | CC BY-NC-ND | ✅ 逐句对照 | 演讲/口语，一个演讲一篇 |
+| [TED 演讲字幕](https://www.ted.com/participate/translate) | CC BY-NC-ND | ✅ 逐句对照 | **已内建**（`ted-talks` 书），每天自动补，见上文 |
 | [VOA Learning English](https://learningenglish.voanews.com/) | 美国政府作品 | ❌ | 分级新闻，按栏目归书（`# book: VOA Science`） |
 | [Simple English Wikipedia](https://simple.wikipedia.org/) | CC BY-SA | ❌ | 主题短文，按主题归书 |
 | [LibriVox 文本对照](https://librivox.org/) | 公有领域 | ❌ | 只用来找书，正文还是 Gutenberg |
-| [The Guardian / BBC 等](https://www.theguardian.com/) | 版权归媒体 | ❌ | **不推荐**：正文有版权，且无译文 |
+| [The Guardian 长读](https://www.theguardian.com/news/series/the-long-read) | 版权归媒体 | ❌ | **已内建**（`guardian-long-read`），一篇 4,000 词，个人学习用，不转发 |
+| [Aeon 随笔](https://aeon.co/essays) | 版权归 Aeon | ❌ | **已内建**（`aeon-essays`），一篇 3,000–6,000 词 |
+
+内建的五个来源（`/fetch`）就是按这张表挑的：TED（有译文、直连）、BBC 媒体英语
+（有译文、需代理）、[新华网英文](https://english.news.cn/)（无译文、直连、每日更新）、
+Guardian 长读与 Aeon（无译文、直连、**长篇**）。抓下来的文本存进本地库并标
+`personal study only`，只供自己读，不随项目分发。
 
 **推荐路径**：
 

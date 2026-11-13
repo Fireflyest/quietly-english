@@ -25,6 +25,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 unicode-width = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 鍘熺敓 TLS锛圵indows 涓婄敤 schannel锛夛細涓嶅紩鍏?rustls/ring锛岀渷鎺変竴鍦?C 渚濊禆銆?
+minreq = { version = "3", default-features = false, features = ["https-native-tls", "proxy"] }
 
 [profile.release]
 lto = "thin"

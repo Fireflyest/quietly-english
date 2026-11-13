@@ -164,6 +164,7 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | `/phrase <w> <phrase> = <释义>` | 给一个词补一条固定搭配，如 `/phrase sake for the sake of = 为了` |
 | `/read [file\|title\|book]` | 开始阅读；不带参数续上次那篇，给书名则接着读下一章 |
 | `/texts` · `/library` | 列出文本 / 阅读书与进度 |
+| `/fetch` · `/news` | 立刻从所有来源抓一批阅读材料（每天首次启动也会自动抓） |
 | `/mode [full\|intensive]` | 切换全篇 / 精读 |
 | `/mark [word]` | 标记生词（`/mark all` 标全部） |
 | `/take <n>` | 把当前段第 n 个词收进词书 |

@@ -24,6 +24,8 @@ pub enum Command {
     Texts,
     /// `/library`：列出阅读书与每本书的进度。
     Library,
+    /// `/news`：立刻抓一批 BBC 媒体英语（每天首次启动也会自动抓）。
+    News,
     /// `/mode full|intensive`：切换阅读模式。
     Mode(String),
     /// `/mark <word>`：标记/取消标记当前段里的一个词。
@@ -176,6 +178,12 @@ pub const SPECS: &[Spec] = &[
         help: "reading books with their progress",
     },
     Spec {
+        name: "/fetch",
+        alias: "news",
+        args: "",
+        help: "fetch reading material from every source now",
+    },
+    Spec {
         name: "/drop",
         alias: "delete|forget",
         args: " <title>",
@@ -305,7 +313,7 @@ impl Command {
             "read" | "r" => Command::Read(arg),
             "texts" => Command::Texts,
             "library" | "shelf" => Command::Library,
-            "mode" => Command::Mode(arg),
+            "news" | "fetch" => Command::News,            "mode" => Command::Mode(arg),
             "mark" | "m" => Command::Mark(arg),
             "words" => Command::Words,
             "next" | "n" => Command::Next,

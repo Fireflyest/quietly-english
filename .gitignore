@@ -41,3 +41,7 @@ rustc-ice-*.txt
 packs/dict/
 packs/etymology/
 packs/examples/
+
+# 抓取的材料：版权归原媒体/作者，只留本地学习，不进仓库。
+packs/texts/chinadaily/
+packs/bulk/
