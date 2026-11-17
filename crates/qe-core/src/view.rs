@@ -304,22 +304,20 @@ impl ToolView {
     /// 阅读卡片：原文（标记词高亮、选中词反显）+ 可选译文 + 选中词的说明块。
     ///
     /// 全篇模式一次给出全部段落，译文跟随各自段落；精读模式只给当前段。
-    /// `show_translation` 由 `/translate` 与 `tab` 控制，两种模式都认。
-    /// `selection` 是选中的词：`(lemma, 词条)`；词条为 `None` 表示词典里没有，
-    /// 卡片仍会显示选中的是哪个词。
+    /// 显示哪几段的译文由 session 自己决定（`/translate` 与 `tab` 逐段切换），
+    /// 两种模式都认。`selection` 是选中的词：`(lemma, 词条)`；词条为 `None`
+    /// 表示词典里没有，卡片仍会显示选中的是哪个词。
     pub fn reading_card(
         session: &crate::reading::ReadingSession,
         candidates: &[Candidate],
-        show_translation: bool,
         selection: Option<(&str, Option<&Word>)>,
     ) -> Self {
-        Self::reading_card_with_status(session, candidates, show_translation, None, None, selection)
+        Self::reading_card_with_status(session, candidates, None, None, selection)
     }
 
     pub fn reading_card_with_status(
         session: &crate::reading::ReadingSession,
         candidates: &[Candidate],
-        show_translation: bool,
         translation_status: Option<&str>,
         translation_provider: Option<&str>,
         selection: Option<(&str, Option<&Word>)>,
@@ -358,7 +356,7 @@ impl ToolView {
                             session.paragraph + 1,
                             text.paragraph_count()
                         );
-                        if show_translation {
+                        if session.current_translation_shown() {
                             if let Some(status) = translation_status {
                                 anchor.push_str(" · ");
                                 anchor.push_str(status);
@@ -380,7 +378,7 @@ impl ToolView {
                         index: Some(index),
                         active: index == session.paragraph,
                     });
-                    if show_translation {
+                    if session.translation_shown(index) {
                         if let Some(translation) = session.translation_at(index) {
                             for line in translation.lines() {
                                 view = view.line(ToolLine::ReadingTranslation {
@@ -422,7 +420,7 @@ impl ToolView {
                         active: true,
                     });
                 }
-                if show_translation {
+                if session.current_translation_shown() {
                     if let Some(translation) = session.current_translation() {
                         for line in translation.lines() {
                             // 缩进与原文对齐，读起来像同一段的两种语言。

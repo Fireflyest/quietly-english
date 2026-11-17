@@ -593,6 +593,11 @@ pub struct ReadingSession {
     /// 单独放，不写进 `text.translation`：那个字段按空行对齐段落，中间插空段
     /// 会让后面的段落整体错位。官方译文优先，这里只补没有的那些段。
     pub machine: std::collections::BTreeMap<usize, String>,
+    /// 当前显示着译文的段号。
+    ///
+    /// 每段独立：`tab` 只切换你正看着的那一段，别的段保持原样——
+    /// 官方译文的全文不会一次全铺出来。
+    pub shown: std::collections::HashSet<usize>,
     /// 打开过几个词条。
     pub opened: u32,
     /// 收进词书几个词。
@@ -615,6 +620,7 @@ impl ReadingSession {
             started_at: now,
             paragraph_started_at: now,
             machine: std::collections::BTreeMap::new(),
+            shown: std::collections::HashSet::new(),
             opened: 0,
             added: 0,
             message: None,
@@ -646,6 +652,39 @@ impl ReadingSession {
 
     pub fn current_translation(&self) -> Option<&str> {
         self.translation_at(self.paragraph)
+    }
+
+    /// 切换**当前段**的译文显示，返回切换后是否显示。
+    ///
+    /// 只动这一段：读过的段落开着就开着，不会因为翻到别处或再按一次 tab
+    /// 把整篇的译文一起收走。
+    pub fn toggle_translation(&mut self) -> bool {
+        let paragraph = self.paragraph;
+        if self.shown.contains(&paragraph) {
+            self.shown.remove(&paragraph);
+        } else {
+            self.shown.insert(paragraph);
+        }
+        self.shown.contains(&paragraph)
+    }
+
+    /// 第 `index` 段的译文现在显示吗？
+    pub fn translation_shown(&self, index: usize) -> bool {
+        self.shown.contains(&index)
+    }
+
+    /// 当前段的译文现在显示吗？
+    pub fn current_translation_shown(&self) -> bool {
+        self.shown.contains(&self.paragraph)
+    }
+
+    /// 直接设定某段的译文显示状态（机翻失败时把提示钉在当前段上）。
+    pub fn set_translation_shown(&mut self, index: usize, shown: bool) {
+        if shown {
+            self.shown.insert(index);
+        } else {
+            self.shown.remove(&index);
+        }
     }
 
     /// Estimated reading time for the current paragraph at 180 words/minute.

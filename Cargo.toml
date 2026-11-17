@@ -19,10 +19,13 @@ chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.28"
 csv = "1.3"
 dirs = "5.0"
+hmac = "0.12"
+md-5 = "0.10"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 unicode-width = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 鍘熺敓 TLS锛圵indows 涓婄敤 schannel锛夛細涓嶅紩鍏?rustls/ring锛岀渷鎺変竴鍦?C 渚濊禆銆?

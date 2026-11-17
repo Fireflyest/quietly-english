@@ -387,6 +387,18 @@ fn rows_with_inner(
     inner: usize,
     palette: Palette,
 ) -> (Vec<Vec<Span<'static>>>, BlockHits) {
+    // Kv 的键列按本块里最长的键对齐，至少 14（老样子）、最多 24：
+    // 写死 14 会把 `tencent_secret_key`（19）截断，看不出完整的 key 名。
+    let kv_key_width = lines
+        .iter()
+        .filter_map(|line| match line {
+            ToolLine::Kv { key, .. } => Some(display_width(key)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(14)
+        .clamp(14, 24)
+        .min(inner.saturating_sub(4));
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut hits = BlockHits::default();
 
@@ -443,7 +455,7 @@ fn rows_with_inner(
             ToolLine::Kv { key, value } => {
                 // Values can be full sentences (Wiktionary glosses), so they wrap
                 // under the key column instead of running off the card.
-                let key_width = 14.min(inner.saturating_sub(4));
+                let key_width = kv_key_width;
                 let key_text = truncate(key, key_width);
                 let wrapped = wrap(value, inner.saturating_sub(key_width + 2).max(8));
                 for (i, piece) in wrapped.iter().enumerate() {
@@ -1403,6 +1415,33 @@ mod tests {
         assert_eq!(display_width(&cut), 5);
     }
 
+    #[test]
+    fn kv_key_column_widens_for_long_key_names() {
+        // 写死 14 会把 `tencent_secret_key` 截成 `tencent_secre`，
+        // 用户就认不出完整的 key 名了。
+        let lines = vec![
+            ToolLine::Kv {
+                key: "tencent_secret_key".into(),
+                value: "••••abcd  ·  keys.json".into(),
+            },
+            ToolLine::Kv {
+                key: "baidu_app_id".into(),
+                value: "••••6600  ·  env".into(),
+            },
+        ];
+        let text = flatten(detail_rows(&lines, 60));
+        assert!(
+            text[0].starts_with("tencent_secret_key"),
+            "完整 key 名不该被截断: {text:?}"
+        );
+        let value_col = text[0].find("••••").expect("value renders");
+        assert_eq!(
+            text[1].find("••••"),
+            Some(value_col),
+            "短 key 的值和长 key 的值对齐在同一列"
+        );
+    }
+
     fn flatten(rows: Vec<Vec<Span<'static>>>) -> Vec<String> {
         rows.into_iter()
             .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1564,7 +1603,8 @@ mod tests {
 
     #[test]
     fn intensive_mode_shows_the_translation_and_the_word_list() {
-        let session = reading_session(qe_core::reading::ReadMode::Intensive);
+        let mut session = reading_session(qe_core::reading::ReadMode::Intensive);
+        session.set_translation_shown(0, true);
         let candidates = vec![
             qe_core::view::Candidate {
                 lemma: "writer".into(),
@@ -1578,7 +1618,7 @@ mod tests {
             },
         ];
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &candidates, true, None)),
+            &Message::tool(ToolView::reading_card(&session, &candidates, None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1592,7 +1632,7 @@ mod tests {
     fn hiding_the_translation_leaves_the_paragraph_alone() {
         let session = reading_session(qe_core::reading::ReadMode::Intensive);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], false, None)),
+            &Message::tool(ToolView::reading_card(&session, &[], None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1604,7 +1644,7 @@ mod tests {
     fn full_mode_renders_every_paragraph_without_a_word_list() {
         let session = reading_session(qe_core::reading::ReadMode::Full);
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], false, None)),
+            &Message::tool(ToolView::reading_card(&session, &[], None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1623,9 +1663,12 @@ mod tests {
 
     #[test]
     fn full_mode_shows_translations_under_each_paragraph() {
-        let session = reading_session(qe_core::reading::ReadMode::Full);
+        let mut session = reading_session(qe_core::reading::ReadMode::Full);
+        for index in 0..session.total() {
+            session.set_translation_shown(index, true);
+        }
         let text = flat(&message_lines(
-            &Message::tool(ToolView::reading_card(&session, &[], true, None)),
+            &Message::tool(ToolView::reading_card(&session, &[], None)),
             80,
         ));
         let joined = text.join("\n");
@@ -1644,7 +1687,6 @@ mod tests {
         let message = Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             Some(("from", Some(&word))),
         ));
         let text = flat(&message_lines(&message, 80));
@@ -1667,7 +1709,7 @@ mod tests {
     fn paragraph_words_report_hit_boxes() {
         // 点击选词靠这些命中区间，所以列号必须与画出来的位置一致。
         let session = reading_session(qe_core::reading::ReadMode::Intensive);
-        let message = Message::tool(ToolView::reading_card(&session, &[], false, None));
+        let message = Message::tool(ToolView::reading_card(&session, &[], None));
         let (lines, hits) = message_lines_hits(&message, 80);
         assert!(!hits.words.is_empty(), "the paragraph must report word boxes");
 
@@ -1699,7 +1741,6 @@ mod tests {
         let message = Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             Some(("early", Some(&word))),
         ));
 
@@ -1755,7 +1796,6 @@ mod tests {
         let message = Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             Some(("early", Some(&word))),
         ));
         let text = flat(&message_lines(&message, 100));
@@ -1774,7 +1814,6 @@ mod tests {
         let message = Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             Some(("writer", Some(&word))),
         ));
         let text = flat(&message_lines(&message, 100));
@@ -1790,7 +1829,7 @@ mod tests {
         session.focus_on(3);
         let selected = session.focused_lemma().expect("a word is selected");
 
-        let message = Message::tool(ToolView::reading_card(&session, &[], false, None));
+        let message = Message::tool(ToolView::reading_card(&session, &[], None));
         let (lines, hits) = message_lines_hits(&message, 80);
         let focused = hits
             .words

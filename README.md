@@ -145,9 +145,12 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 高亮，按数字看完整卡片，`/take` 收进词书，然后照常走记忆曲线。双语文本用 `---`
 分隔原文与译文；读后测验的题目必须带出处，导入时无出处的条目会被跳过。
 
-没有译文的文章（新华网、Guardian 长读、Aeon）按 `tab` 会**按段机翻**当前段：默认
-MyMemory（免费、不用注册），配了 `DEEPL_API_KEY` 就改用 DeepL Free。译文落库缓存，
-同一段只花一次额度。
+没有译文的文章（新华网、Guardian 长读、Aeon）按 `tab` 会**按段机翻**当前段：配了
+`BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY` 就用百度翻译，
+`TENCENT_SECRET_ID` + `TENCENT_SECRET_KEY` 用腾讯云翻译（两家都国内直连），否则退回
+DeepL Free / MyMemory。key 可以在软件里配——`/apikey set gemini <key>`——存到数据目录的
+`keys.json`（不进 `quietly.db`、不进仓库），没写的字段继续读环境变量，文件里的值优先。
+译文落库缓存，同一段只花一次额度。
 
 文本按**来源**归成阅读书：文件头写 `# book: Animal Farm`（或 `quietly read x.txt --book …`），
 同一本书的多篇自动排好顺序；`/library` 看每本进度，`/read animal-farm` 接着读下一篇，
@@ -170,7 +173,8 @@ MyMemory（免费、不用注册），配了 `DEEPL_API_KEY` 就改用 DeepL Fre
 | `/texts` · `/library` | 列出文本 / 阅读书与进度 |
 | `/fetch` · `/news` | 立刻从所有来源抓一批阅读材料（每天首次启动也会自动抓） |
 | `/mode [full\|intensive]` | 切换全篇 / 精读 |
-| `/translate` · `tab` | 显示 / 隐藏译文；没有译文时按段机翻当前段 |
+| `/translate` · `tab` | 显示 / 隐藏**当前段**的译文（逐段切换，别的段保持原样，不会一次铺出全文）；没有译文时按段机翻当前段 |
+| `/apikey [set <name> <value>\|list\|clear]` | 配置翻译 API key（存数据目录的 `keys.json`，不进库） |
 | `/mark [word]` | 标记生词（`/mark all` 标全部） |
 | `/take <n>` | 把当前段第 n 个词收进词书 |
 | `/quiz [file]` | 读后测验 |

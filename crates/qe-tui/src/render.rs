@@ -572,7 +572,6 @@ mod tests {
         let messages = vec![Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             None,
         ))];
         let info = draw_info(&reading_view(&messages, 0), 60, 10);
@@ -596,7 +595,6 @@ mod tests {
         let messages = vec![Message::tool(ToolView::reading_card(
             &session,
             &[],
-            false,
             None,
         ))];
         let info = draw_info(&reading_view(&messages, 0), 60, 12);

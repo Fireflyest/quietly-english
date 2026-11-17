@@ -4,6 +4,7 @@ pub mod collocations;
 pub mod db;
 pub mod etymology;
 pub mod import;
+pub mod keys;
 pub mod merge;
 pub mod stardict;
 pub mod tatoeba;

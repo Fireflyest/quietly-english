@@ -311,15 +311,35 @@ I had the lonely child's habit.
 Aeon 都只有英文。按 `tab` 或 `/translate` 时，程序会把**当前这一段**送去翻译，
 结果显示在原文下面，并写进库里——同一段只花一次额度。
 
+译文的显示也是**逐段**的：`tab` 只切换你正看着的那一段，别的段保持原样——
+双语全文不会一次整篇铺出来，翻回前面读过的段落，它开着的译文也还在。
+
 | 服务 | 额度 | 要什么 | 直连 |
 |---|---|---|---|
-| MyMemory（默认） | 5000 字符/天 | 什么都不用 | ✅ |
+| 百度翻译（配了就排第一） | 按账号免费额度 | 注册[百度翻译开放平台](https://fanyi-api.baidu.com/)，设 `BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY` | ✅ |
+| 腾讯云翻译 TMT | 按账号免费额度 | 开通[机器翻译](https://console.cloud.tencent.com/tmt)，设 `TENCENT_SECRET_ID` + `TENCENT_SECRET_KEY` | ✅ |
+| MyMemory（都没配时默认） | 5000 字符/天 | 什么都不用 | ✅ |
 | MyMemory + 邮箱 | 50000 字符/天 | 填 `MYMEMORY_EMAIL`，**不用注册** | ✅ |
 | DeepL API Free | 50 万字符/月 | 要注册，设 `DEEPL_API_KEY`（[免费注册](https://www.deepl.com/pro-api)） | ✅ |
 
+按优先级取第一个配齐了的：**百度 > 腾讯 > Gemini（`GEMINI_API_KEY`，需代理） > DeepL > MyMemory**。
+任一家失败都会自动回退到 MyMemory，提示里标明实际用的是谁。
+
+key 有两种配法，**文件优先**（没写的字段才回落到环境变量）：
+
+- **软件内**（推荐）：`/apikey set baidu_app_id 2015066600`、`/apikey set baidu_secret_key xxx`，
+  `/apikey list` 看全部 key 的状态与当前生效的服务，`/apikey clear [name]` 删掉。
+  存在数据目录的 `keys.json`（`QUIETLY_HOME` 可改位置），**不进 `quietly.db`、不进仓库**；
+  名字认规范名、环境变量名和无歧义短写（`gemini` → `gemini_api_key`）。
+- **环境变量**：shell 里 export，适合 CI 或不想落盘的情况。
+
 ```bash
+export BAIDU_TRANSLATE_APP_ID=2015066600      # 百度翻译开放平台的 APP ID
+export BAIDU_TRANSLATE_SECRET_KEY=xxxxxxxx    # 签名用的 SecretKey，国内直连
+export TENCENT_SECRET_ID=AKIDxxxxxxxx         # 腾讯云 API 密钥 SecretId
+export TENCENT_SECRET_KEY=xxxxxxxx            # 对应的 SecretKey
 export MYMEMORY_EMAIL=you@example.com    # 额度翻十倍，不用注册、不用验证
-export DEEPL_API_KEY=xxxxxxxx:fx         # 有 key 就优先用 DeepL，译文明显更顺
+export DEEPL_API_KEY=xxxxxxxx:fx         # 有 key 就用 DeepL，译文明显更顺
 export QUIETLY_TRANSLATE=none            # 整个关掉，不联网
 ```
 
@@ -329,7 +349,7 @@ MyMemory 的邮箱只是请求里的 `de` 参数（[官方说明](https://mymemo
 
 - **只翻当前段**，不整篇提交：一篇 Guardian 长读四五千词，一次性提交就把一个月的
   免费额度花光了；按段翻，额度花在你真正读的那几段上。
-- 免费接口单次有上限（MyMemory 500 字节），长段自动按句号切开再拼回去。
+- 免费接口单次有上限（MyMemory 500 字节、百度 6000 字节），长段自动按句号切开再拼回去。
 - 译文缓存进 `text_translations`，换机器前不用重翻；`/drop` 删篇时一起清掉。
 - 额度用完会明确说一句，不会静默留一个空白的译文区。
 - 命令行也能翻：`quietly translate <标题> --para 3`（不给段落号就翻第一段还没译的）。

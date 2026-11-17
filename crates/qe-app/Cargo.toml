@@ -15,10 +15,13 @@ qe-tui = { path = "../qe-tui" }
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
+hmac.workspace = true
+md-5.workspace = true
 minreq.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 zip.workspace = true
 
 [dev-dependencies]

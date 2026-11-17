@@ -37,6 +37,8 @@ pub enum Command {
     Prev,
     /// `/translate`：显示/隐藏译文。
     Translate,
+    /// `/apikey [list|set <name> <value>|clear [name]]`：配置翻译 API key。
+    ApiKey(String),
     /// `/quiz [file]`：开始测验；给文件则先导入题目。
     Quiz(String),
     /// `/goto <n>`：跳到第 n 段。
@@ -244,6 +246,12 @@ pub const SPECS: &[Spec] = &[
         help: "answer the questions for this text, or import a quiz file",
     },
     Spec {
+        name: "/apikey",
+        alias: "key",
+        args: " <set|list|clear>",
+        help: "set or show the translation API keys (stored in keys.json)",
+    },
+    Spec {
         name: "/db",
         alias: "files|where",
         args: "",
@@ -319,6 +327,7 @@ impl Command {
             "next" | "n" => Command::Next,
             "prev" | "p" => Command::Prev,
             "translate" | "tr" => Command::Translate,
+            "apikey" | "key" => Command::ApiKey(arg),
             "quiz" | "test" => Command::Quiz(arg),
             "goto" | "g" => Command::Goto(arg),
             "take" | "keep" => Command::Take(arg),
@@ -407,11 +416,10 @@ pub fn arg_completion_target(input: &str) -> Option<(&'static str, &str)> {
         return None;
     }
     let mut parts = body.splitn(2, ' ');
-    let name = format!("/{}", parts.next()?);
+    let name = parts.next()?;
     let partial = parts.next().unwrap_or("");
-    let spec = SPECS
-        .iter()
-        .find(|spec| spec.name.eq_ignore_ascii_case(&name))?;
+    // 别名也要能补参数：`/key set ba` 和 `/apikey set ba` 是同一条命令。
+    let spec = spec(&format!("/{name}"))?;
     if spec.args.is_empty() {
         return None;
     }
@@ -434,6 +442,8 @@ pub enum ArgKind {
     TextOrPath,
     /// 固定取值（`/mode`）。
     Choice(&'static [&'static str]),
+    /// 子命令之后还有候选（`/apikey set <name>`）。
+    ApiKey,
     /// 纯数字（`/study`、`/limit`、`/goto`、`/take`）。
     Number,
     /// 没有候选，只能手输（`/search`、`/add`、`/phrase`、`/mark`、`/root`）。
@@ -448,6 +458,7 @@ pub const ARG_KINDS: &[(&str, ArgKind)] = &[
     ("/quiz", ArgKind::TextOrPath),
     ("/drop", ArgKind::Text),
     ("/mode", ArgKind::Choice(&["full", "intensive"])),
+    ("/apikey", ArgKind::ApiKey),
     ("/study", ArgKind::Number),
     ("/limit", ArgKind::Number),
     ("/goto", ArgKind::Number),
@@ -574,6 +585,9 @@ mod tests {
         assert_eq!(arg_completion_target("/book"), None);
         // Commands without arguments are ignored.
         assert_eq!(arg_completion_target("/books "), None);
+        // 别名照常补参数，回落到规范名。
+        assert_eq!(arg_completion_target("/key set b"), Some(("/apikey", "set b")));
+        assert_eq!(arg_completion_target("/use ce"), Some(("/book", "ce")));
     }
 
     #[test]
@@ -626,6 +640,21 @@ mod tests {
         assert_eq!(arg_hits(&decks, "ce"), vec!["cet4".to_string(), "cet6".to_string()]);
         assert_eq!(arg_hits(&decks, "CET"), vec!["cet4".to_string(), "cet6".to_string()]);
         assert!(arg_hits(&decks, "zz").is_empty());
+    }
+
+    #[test]
+    fn parses_apikey_subcommands() {
+        assert_eq!(Command::parse("/apikey"), Some(Command::ApiKey(String::new())));
+        assert_eq!(Command::parse("/key list"), Some(Command::ApiKey("list".into())));
+        assert_eq!(
+            Command::parse("/apikey set baidu_app_id 2015066600"),
+            Some(Command::ApiKey("set baidu_app_id 2015066600".into()))
+        );
+        assert_eq!(
+            arg_kind("/key"),
+            ArgKind::ApiKey,
+            "aliases resolve too"
+        );
     }
 
     #[test]

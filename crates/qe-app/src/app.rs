@@ -92,8 +92,6 @@ pub struct App {
     /// 填空题已揭示答案（不判对错，也不写库），再按一次翻下一题。
     pub(crate) quiz_revealed: bool,
     pub(crate) quiz_correct: u32,
-    /// 阅读时是否显示译文（`/translate` 与 `tab` 切换，两种模式都生效）。
-    pub(crate) show_translation: bool,
     /// 当前段译文请求的状态，显示在阅读卡片中。
     pub(crate) translation_status: Option<String>,
     /// 当前段译文来源，显示在全篇阅读的段落锚点后。
@@ -161,8 +159,7 @@ impl App {
             quiz_answered: None,
             quiz_revealed: false,
             quiz_correct: 0,
-            // 译文默认隐藏：先读原文，需要对照时再按 tab。
-            show_translation: false,
+            // 译文逐段显示、默认隐藏：先读原文，需要对照时再按 tab。
             translation_status: None,
             translation_provider: None,
             reveal_anchor: false,
@@ -921,8 +918,38 @@ impl App {
                     help: String::new(),
                 })
                 .collect(),
+            command::ArgKind::ApiKey => Self::apikey_candidates(partial),
             command::ArgKind::Number | command::ArgKind::Free => Vec::new(),
         }
+    }
+
+    /// `/apikey` 的候选。
+    ///
+    /// 打完子命令再 tab 才轮到 key 名，候选带上子命令前缀（`set baidu_app_id`），
+    /// 这样命中、公共前缀和回填走的都是通用逻辑，不用为第二段参数另开一条路。
+    fn apikey_candidates(partial: &str) -> Vec<Candidate> {
+        if !partial.contains(' ') {
+            // `set` 带尾随空格：tab 完直接停在等 key 名的位置。
+            return ["set ", "list", "clear"]
+                .iter()
+                .map(|value| Candidate {
+                    value: (*value).to_string(),
+                    help: String::new(),
+                })
+                .collect();
+        }
+        let sub = partial.split_whitespace().next().unwrap_or("");
+        if !matches!(sub, "set" | "clear") {
+            // `/apikey list ` 之后没有候选，提示走 usage。
+            return Vec::new();
+        }
+        qe_store::keys::KEYS
+            .iter()
+            .map(|key| Candidate {
+                value: format!("{sub} {}", key.name),
+                help: key.hint.to_string(),
+            })
+            .collect()
     }
 
     fn deck_candidates(&self) -> Vec<Candidate> {
@@ -1112,6 +1139,7 @@ impl App {
             }
             Command::Prev => self.reading_prev(),
             Command::Translate => self.toggle_translation(),
+            Command::ApiKey(arg) => self.api_key(&arg),
             Command::Quiz(arg) => {
                 if arg.trim().is_empty() {
                     self.start_quiz()
@@ -1210,6 +1238,95 @@ impl App {
             .set_setting("discreet", if self.discreet { "1" } else { "0" })?;
         let label = if self.discreet { "on" } else { "off" };
         self.note(format!("discreet mode {label} · deck name {label}"));
+        Ok(())
+    }
+
+    /// `/apikey`：翻译 API key 的增删查。
+    ///
+    /// 存 `keys.json`（数据目录），不进 `quietly.db`、不进仓库；
+    /// 环境变量继续有效，文件里的值优先。
+    fn api_key(&mut self, arg: &str) -> Result<()> {
+        let mut parts = arg.splitn(3, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        match sub.as_str() {
+            "" | "list" | "show" => {
+                let mut configured = 0;
+                let mut view = ToolView::new("apikey").accent(Accent::Note);
+                for status in qe_store::keys::status() {
+                    let shown = match &status.value {
+                        Some(value) => {
+                            configured += 1;
+                            // 邮箱是身份不是密钥，原样显示。
+                            if status.name == "mymemory_email" {
+                                value.clone()
+                            } else {
+                                qe_store::keys::mask(value)
+                            }
+                        }
+                        None => "—".to_string(),
+                    };
+                    let origin = match status.origin {
+                        "unset" => "not set".to_string(),
+                        other => format!("{other} · {}", status.hint),
+                    };
+                    view = view.kv(status.name, format!("{shown}  ·  {origin}"));
+                }
+                let active = crate::translator::settings()
+                    .map(|settings| settings.detail())
+                    .unwrap_or_else(|| "off (QUIETLY_TRANSLATE=none)".to_string());
+                view = view.result(format!("{configured}/{} set · {active}", qe_store::keys::KEYS.len()));
+                view = view.muted(format!(
+                    "/apikey set <name> <value> · /apikey clear [name] · {}",
+                    qe_store::keys::path().display()
+                ));
+                self.push(Message::tool(view));
+            }
+            "set" => {
+                let usage = "usage: /apikey set <name> <value> · names: /apikey list";
+                let Some(name) = parts.next().map(str::trim).filter(|name| !name.is_empty()) else {
+                    self.note(usage);
+                    return Ok(());
+                };
+                let Some(value) = parts.next().map(str::trim).filter(|value| !value.is_empty()) else {
+                    self.note(usage);
+                    return Ok(());
+                };
+                match qe_store::keys::set(name, value) {
+                    Ok(canonical) => {
+                        let shown = if canonical == "mymemory_email" {
+                            value.to_string()
+                        } else {
+                            qe_store::keys::mask(value)
+                        };
+                        let active = crate::translator::settings()
+                            .map(|settings| settings.detail())
+                            .unwrap_or_else(|| "off".to_string());
+                        self.note(format!(
+                            "saved {canonical} = {shown} · machine translation now: {active}"
+                        ));
+                    }
+                    Err(err) => self.fail(format!("{err:#}")),
+                }
+            }
+            "clear" => {
+                let target = parts.next().map(str::trim).filter(|name| !name.is_empty());
+                match qe_store::keys::clear(target) {
+                    Ok(removed) => {
+                        let detail = if removed.is_empty() {
+                            match target {
+                                Some(name) => format!("{name} was not in keys.json"),
+                                None => "keys.json is already empty".to_string(),
+                            }
+                        } else {
+                            format!("cleared {} from keys.json", removed.join(", "))
+                        };
+                        self.note(format!("{detail} · environment variables untouched"));
+                    }
+                    Err(err) => self.fail(format!("{err:#}")),
+                }
+            }
+            _ => self.note("usage: /apikey list · /apikey set <name> <value> · /apikey clear [name]"),
+        }
         Ok(())
     }
 
@@ -2564,6 +2681,62 @@ mod tests {
     }
 
     #[test]
+    fn full_mode_tab_reveals_only_the_current_paragraph() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("full-bilingual.txt");
+        std::fs::write(
+            &path,
+            "First paragraph.\n\nSecond paragraph.\n\n---\n\n第一段译文。\n\n第二段译文。\n",
+        )
+        .unwrap();
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        app.execute(Command::Mode("full".into())).unwrap();
+
+        // 当前卡片里显示着的译文行。
+        let shown = |app: &App| -> String {
+            app.messages
+                .iter()
+                .rev()
+                .find_map(|message| match &message.body {
+                    Body::Tool(view) if view.name == "read" => Some(view.clone()),
+                    _ => None,
+                })
+                .expect("reading card")
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    qe_core::view::ToolLine::ReadingTranslation { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // 官方译文的双语全文：tab 只开当前段，整篇不会一次铺出来。
+        app.execute(Command::Translate).unwrap();
+        let visible = shown(&app);
+        assert!(visible.contains("第一段译文。"), "{visible}");
+        assert!(!visible.contains("第二段译文。"), "第二段不该跟着出现: {visible}");
+
+        app.reading_next().unwrap();
+        let visible = shown(&app);
+        assert!(visible.contains("第一段译文。"), "上一段开着的还开着: {visible}");
+        assert!(!visible.contains("第二段译文。"), "新段默认不显示: {visible}");
+
+        app.execute(Command::Translate).unwrap();
+        let visible = shown(&app);
+        assert!(visible.contains("第二段译文。"), "tab 打开当前段: {visible}");
+        assert!(visible.contains("第一段译文。"), "上一段不受影响: {visible}");
+
+        // 再按一次只收起当前段。
+        app.execute(Command::Translate).unwrap();
+        let visible = shown(&app);
+        assert!(!visible.contains("第二段译文。"), "再按收起当前段: {visible}");
+        assert!(visible.contains("第一段译文。"), "别的段不动: {visible}");
+    }
+
+    #[test]
     fn a_cached_machine_translation_is_shown_without_touching_the_network() {
         let Harness { mut app, _dir } = harness();
         let path = _dir.path().join("english-only.txt");
@@ -2579,7 +2752,7 @@ mod tests {
             .unwrap();
 
         app.execute(Command::Translate).unwrap();
-        assert!(app.show_translation);
+        assert!(app.reading.as_ref().unwrap().current_translation_shown());
         assert!(
             app.translation_fetch.is_none(),
             "a cache hit must not spawn a request"
@@ -2595,12 +2768,12 @@ mod tests {
 
         // 关掉不需要通知任何人，也不该留下任务在跑。
         app.execute(Command::Translate).unwrap();
-        assert!(!app.show_translation);
+        assert!(!app.reading.as_ref().unwrap().current_translation_shown());
         assert!(app.translation_fetch.is_none());
     }
 
     #[test]
-    fn first_tab_on_a_new_paragraph_keeps_translation_enabled() {
+    fn a_new_paragraph_starts_hidden_and_tab_shows_only_it() {
         let Harness { mut app, _dir } = harness();
         let path = _dir.path().join("two-paragraphs.txt");
         std::fs::write(&path, "First paragraph.\n\nSecond paragraph.").unwrap();
@@ -2612,18 +2785,35 @@ mod tests {
         app.store
             .set_text_translation(text.id, 1, "第二段。", "mymemory")
             .unwrap();
-        app.show_translation = true;
+        // 第一段开着（直接标，避免为没有译文的段发请求）。
+        app.reading
+            .as_mut()
+            .unwrap()
+            .set_translation_shown(0, true);
         app.reading_next().unwrap();
-        assert!(app.show_translation);
+
+        // 每段独立：翻到新段不会把上一段的状态带过来。
+        assert!(
+            !app.reading.as_ref().unwrap().translation_shown(1),
+            "新段默认不显示译文"
+        );
+        assert!(
+            app.reading.as_ref().unwrap().translation_shown(0),
+            "上一段开着的还开着"
+        );
 
         app.execute(Command::Translate).unwrap();
         assert!(
-            app.show_translation,
-            "requesting a new paragraph must not first disable translation"
+            app.reading.as_ref().unwrap().translation_shown(1),
+            "tab 打开当前段的译文"
         );
         assert_eq!(
             app.reading.as_ref().unwrap().translation_at(1),
             Some("第二段。")
+        );
+        assert!(
+            app.translation_fetch.is_none(),
+            "缓存命中不该发请求"
         );
     }
 
@@ -3226,7 +3416,10 @@ mod tests {
         import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
 
         app.execute(Command::Read("animal-farm".into())).unwrap();
-        app.show_translation = true;
+        app.reading
+            .as_mut()
+            .unwrap()
+            .set_translation_shown(0, true);
         app.reading_next().unwrap();
         app.reading_next().unwrap();
 
@@ -3234,7 +3427,10 @@ mod tests {
             app.reading.as_ref().map(|session| session.text.title.as_str()),
             Some("Chapter Two")
         );
-        assert!(!app.show_translation);
+        assert!(
+            !app.reading.as_ref().unwrap().current_translation_shown(),
+            "换篇后译文显示状态从头开始"
+        );
     }
 
     #[test]
@@ -3383,6 +3579,67 @@ mod tests {
             app.store.setting("news_fetched_on").unwrap().is_none(),
             "a failure does not mark the day as done"
         );
+    }
+
+    #[test]
+    fn apikey_shows_usage_instead_of_guessing() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::ApiKey("wibble".into())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("/apikey set <name> <value>")
+            )),
+            "unknown subcommand spells out the usage"
+        );
+        app.execute(Command::ApiKey("set".into())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("usage: /apikey set")
+            )),
+            "set without a name and value does not write anything"
+        );
+    }
+
+    #[test]
+    fn apikey_set_confirms_what_was_stored() {
+        let _guard = crate::translator::tests::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("QUIETLY_HOME");
+        std::env::set_var("QUIETLY_HOME", dir.path());
+
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::ApiKey("set gemini AIzaTestKey123".into()))
+            .unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("saved gemini_api_key")
+            )),
+            "set confirms the stored name: {:?}",
+            app.messages
+                .iter()
+                .filter_map(|message| match &message.body {
+                    Body::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        app.execute(Command::ApiKey("list".into())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.name == "apikey"
+            )),
+            "list renders a tool block"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("QUIETLY_HOME", value),
+            None => std::env::remove_var("QUIETLY_HOME"),
+        }
     }
 
     #[test]
@@ -3615,6 +3872,43 @@ mod tests {
         app.suggestion_index = 1;
         app.tab_complete();
         assert_eq!(app.editor.text(), "/book cet6");
+    }
+
+    #[test]
+    fn apikey_tab_completes_the_subcommand_then_the_key_name() {
+        let Harness { mut app, _dir } = harness();
+
+        // 第一段：子命令；`set` 补完自带空格，停在等 key 名的位置。
+        let (rows, _) = app.suggestions_for("/apikey s");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["set "]);
+        app.editor.set_text("/apikey s");
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/apikey set ");
+
+        // 第二段：key 名。候选带子命令前缀，命中、公共前缀、回填走通用逻辑。
+        let (rows, _) = app.suggestions_for("/apikey set ba");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["set baidu_app_id", "set baidu_secret_key"]);
+        assert_eq!(rows[0].help, "百度翻译 APP ID", "面板要说明这个 key 是干嘛的");
+
+        app.editor.set_text("/apikey set ba");
+        app.suggestion_index = 0;
+        app.tab_complete();
+        assert_eq!(app.editor.text(), "/apikey set baidu_", "公共前缀直接补上");
+
+        // 灰字提示同样覆盖第二段参数（只剩一个命中时才显示）。
+        assert_eq!(
+            app.arg_ghost("/apikey set baidu_a").as_deref(),
+            Some("pp_id")
+        );
+        assert_eq!(app.arg_ghost("/apikey clear gemini").as_deref(), Some("_api_key"));
+
+        // 别名 `/key` 走同一条补全路径（arg_completion_target 回落到规范名）。
+        let (rows, _) = app.suggestions_for("/key set ba");
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["set baidu_app_id", "set baidu_secret_key"]);
+        assert_eq!(app.arg_ghost("/key set baidu_a").as_deref(), Some("pp_id"));
     }
 
     #[test]

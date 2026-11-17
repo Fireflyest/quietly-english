@@ -175,7 +175,7 @@ impl App {
         let selection = focused
             .as_ref()
             .map(|(lemma, word)| (lemma.as_str(), word.as_ref()));
-        let translation_provider = if self.show_translation {
+        let translation_provider = if session.current_translation_shown() {
             let (text_id, paragraph, has_translation) = (
                 session.text.id,
                 session.paragraph,
@@ -202,7 +202,6 @@ impl App {
         let view = ToolView::reading_card_with_status(
             session,
             &candidates,
-            self.show_translation,
             translation_status,
             translation_provider.as_deref(),
             selection,
@@ -345,21 +344,27 @@ impl App {
         };
         let paragraph = session.paragraph;
         let text_id = session.text.id;
+        let was_shown = session.current_translation_shown();
+        // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
+        let has_translation = session.translation_at(paragraph).is_some();
 
-        // 已经显示着且当前段已有译文：关掉就好。新段落没有译文时，
-        // 第一次 Tab 应该请求当前段，而不是先把全文翻译开关关掉。
-        if self.show_translation && session.current_translation().is_some() {
-            self.show_translation = false;
+        // 当前段开着就关掉——只动这一段，别的段该显示的还显示。
+        if was_shown {
+            if let Some(session) = self.reading.as_mut() {
+                session.set_translation_shown(paragraph, false);
+            }
             self.translation_status = None;
             self.translation_provider = None;
             return self.render_reading();
         }
-        self.show_translation = true;
+        // 打开当前段：有译文直接显示，没有才发请求。
+        if let Some(session) = self.reading.as_mut() {
+            session.set_translation_shown(paragraph, true);
+        }
         self.translation_status = None;
         self.translation_provider = None;
 
-        // 官方译文（TED / BBC）或这次会话里已经翻过的段，直接显示。
-        if session.translation_at(paragraph).is_some() {
+        if has_translation {
             self.translation_provider = Some("official".to_string());
             return self.render_reading();
         }
@@ -381,7 +386,9 @@ impl App {
     /// 后台翻一段。网络请求不能卡在界面线程里（一段要请求一到几次）。
     fn spawn_translation(&mut self, text_id: i64, paragraph: usize) -> Result<()> {
         let Some(settings) = crate::translator::settings() else {
-            self.show_translation = false;
+            if let Some(session) = self.reading.as_mut() {
+                session.set_translation_shown(paragraph, false);
+            }
             self.translation_status = None;
             self.translation_provider = None;
             self.note("machine translation is off · unset QUIETLY_TRANSLATE to use it");
@@ -403,7 +410,9 @@ impl App {
             .and_then(|session| session.text.paragraphs().get(paragraph).copied())
             .map(str::to_string)
         else {
-            self.show_translation = false;
+            if let Some(session) = self.reading.as_mut() {
+                session.set_translation_shown(paragraph, false);
+            }
             self.translation_status = None;
             self.translation_provider = None;
             self.note("nothing to translate here");
@@ -475,7 +484,9 @@ impl App {
                 }
                 // Keep the reading view open so the failure stays beside the
                 // current paragraph anchor instead of being lost at the end.
-                self.show_translation = true;
+                if let Some(session) = self.reading.as_mut() {
+                    session.set_translation_shown(requested_paragraph, true);
+                }
                 self.translation_provider = None;
                 self.translation_status = Some(format!("translation failed · {error}"));
                 let _ = self.render_reading();
@@ -483,7 +494,9 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.translation_fetch = None;
-                self.show_translation = true;
+                if let Some(session) = self.reading.as_mut() {
+                    session.set_translation_shown(requested_paragraph, true);
+                }
                 self.translation_status =
                     Some("translation failed · worker stopped · retry /translate".to_string());
                 self.translation_provider = None;
@@ -630,8 +643,7 @@ impl App {
             .unwrap_or((0, ReadMode::default()));
         let paragraph = paragraph.min(text.paragraph_count().saturating_sub(1));
         let mut session = ReadingSession::new(text, mode, paragraph);
-        // 翻译显示是当前文章的阅读偏好，不应延续到下一篇。
-        self.show_translation = false;
+        // 翻译显示是当前文章的阅读状态（存在 session 里），换篇自然从头开始。
         self.translation_status = None;
         self.translation_provider = None;
         self.translation_fetch = None;
