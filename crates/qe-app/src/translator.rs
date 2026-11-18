@@ -250,16 +250,24 @@ fn gemini(settings: &Settings, text: &str) -> Result<String> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         );
-        let response = match minreq::post(&url)
-            .with_header("x-goog-api-key", key)
-            .with_header("Content-Type", "application/json")
-            .with_timeout(45)
-            .with_body(payload.clone())
-            .send()
+        let response = match crate::fetch::with_proxy(
+            minreq::post(&url)
+                .with_header("x-goog-api-key", key)
+                .with_header("Content-Type", "application/json")
+                .with_timeout(45)
+                .with_body(payload.clone()),
+        )
+        .send()
         {
             Ok(response) => response,
-            // 连不上（国内没开代理）就到此为止。
-            Err(err) => anyhow::bail!("Gemini 连不上（国内需要代理）· {err}"),
+            // 连不上就到此为止；提示里带上代理状态，省得猜是 key 错还是网络错。
+            Err(err) => anyhow::bail!(
+                "Gemini 连不上（{}）· {err}",
+                match crate::fetch::proxy_address() {
+                    Some(address) => format!("经代理 {address}"),
+                    None => "没找到代理，国内需开系统代理或设 HTTPS_PROXY".to_string(),
+                }
+            ),
         };
         let raw = response.as_str().unwrap_or_default();
         if response.status_code == 200 {
@@ -345,13 +353,15 @@ fn mymemory_chunk(settings: &Settings, chunk: &str) -> Result<String> {
 fn deepl(settings: &Settings, text: &str) -> Result<String> {
     let key = settings.key.as_deref().context("DEEPL_API_KEY 没有配置")?;
     let body = format!("text={}&source_lang=EN&target_lang=ZH", encode(text));
-    let response = minreq::post("https://api-free.deepl.com/v2/translate")
-        .with_header("Authorization", format!("DeepL-Auth-Key {key}"))
-        .with_header("Content-Type", "application/x-www-form-urlencoded")
-        .with_timeout(40)
-        .with_body(body)
-        .send()
-        .context("DeepL 请求失败")?;
+    let response = crate::fetch::with_proxy(
+        minreq::post("https://api-free.deepl.com/v2/translate")
+            .with_header("Authorization", format!("DeepL-Auth-Key {key}"))
+            .with_header("Content-Type", "application/x-www-form-urlencoded")
+            .with_timeout(40)
+            .with_body(body),
+    )
+    .send()
+    .context("DeepL 请求失败")?;
     let raw = response.as_str().unwrap_or_default();
     anyhow::ensure!(
         (200..300).contains(&response.status_code),
@@ -402,15 +412,17 @@ fn baidu_chunk(app_id: &str, secret: &str, chunk: &str) -> Result<String> {
         salt,
         sign
     );
-    let response = minreq::post("https://fanyi-api.baidu.com/api/trans/vip/translate")
-        .with_header(
-            "Content-Type",
-            "application/x-www-form-urlencoded; charset=UTF-8",
-        )
-        .with_timeout(30)
-        .with_body(body)
-        .send()
-        .context("百度翻译请求失败")?;
+    let response = crate::fetch::with_proxy(
+        minreq::post("https://fanyi-api.baidu.com/api/trans/vip/translate")
+            .with_header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+            .with_timeout(30)
+            .with_body(body),
+    )
+    .send()
+    .context("百度翻译请求失败")?;
     let raw = response.as_str().unwrap_or_default();
     anyhow::ensure!(
         (200..300).contains(&response.status_code),
@@ -465,16 +477,18 @@ fn tencent(settings: &Settings, text: &str) -> Result<String> {
     .to_string();
     let timestamp = chrono::Utc::now().timestamp();
     let authorization = tencent_sign(secret_id, secret_key, &payload, timestamp);
-    let response = minreq::post("https://tmt.tencentcloudapi.com")
-        .with_header("Content-Type", "application/json; charset=utf-8")
-        .with_header("X-TC-Action", "TextTranslate")
-        .with_header("X-TC-Version", "2018-03-21")
-        .with_header("X-TC-Timestamp", timestamp.to_string())
-        .with_header("Authorization", authorization)
-        .with_timeout(30)
-        .with_body(payload)
-        .send()
-        .context("腾讯云翻译请求失败")?;
+    let response = crate::fetch::with_proxy(
+        minreq::post("https://tmt.tencentcloudapi.com")
+            .with_header("Content-Type", "application/json; charset=utf-8")
+            .with_header("X-TC-Action", "TextTranslate")
+            .with_header("X-TC-Version", "2018-03-21")
+            .with_header("X-TC-Timestamp", timestamp.to_string())
+            .with_header("Authorization", authorization)
+            .with_timeout(30)
+            .with_body(payload),
+    )
+    .send()
+    .context("腾讯云翻译请求失败")?;
     let raw = response.as_str().unwrap_or_default();
     // 出错时错误体也是 JSON（HTTP 常回 4xx），先认 Response.Error，
     // 拿到的是 `AuthFailure.SecretIdInvalid` 这种能照着修的码。

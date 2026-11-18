@@ -63,8 +63,10 @@ pub struct DrawInfo {
     pub row_offset: Vec<usize>,
     /// 阅读段落里每个词占的屏幕位置，供点击选词。
     pub word_hits: Vec<WordHit>,
-    /// 当前段锚点行（`▸ 12/50`）在渲染行里的绝对行号，滚动时用它把当前段带回视野。
-    pub anchor_line: Option<usize>,
+    /// 当前段锚点行（`▸ 12/50`）的位置：`(消息下标, 绝对行号)`。
+    /// 对话里可能同时留着上一篇的阅读卡片（也带锚点），滚动时 app 按当前
+    /// 阅读消息取自己那条——取第一处会被拽到上一篇的结尾去。
+    pub anchors: Vec<(usize, usize)>,
 }
 
 /// 一个词在屏幕上的矩形（列范围 + 行）：`(row, start, end, token, message)`。
@@ -151,8 +153,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
     let mut owners: Vec<(usize, usize)> = Vec::new();
     // Word boxes relative to the unpadded transcript, shifted to screen rows below.
     let mut word_boxes: Vec<(usize, u16, u16, usize, Option<usize>, usize)> = Vec::new();
-    // 锚点行（相对未填充的 transcript）。
-    let mut anchor_rows: Vec<usize> = Vec::new();
+    // 锚点行（相对未填充的 transcript），带所属消息下标。
+    let mut anchor_rows: Vec<(usize, usize)> = Vec::new();
 
     let mut previous_was_text = false;
     for (index, message) in view.messages.iter().enumerate() {
@@ -176,7 +178,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
             ));
         }
         for row in hits.anchors {
-            anchor_rows.push(base_row + row);
+            anchor_rows.push((index, base_row + row));
         }
         for (offset, line) in block.into_iter().enumerate() {
             rendered.push(line);
@@ -252,7 +254,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, view: &View) -> DrawInfo {
         row_message,
         row_offset,
         word_hits,
-        anchor_line: anchor_rows.first().copied(),
+        anchors: anchor_rows,
     }
 }
 
@@ -575,13 +577,17 @@ mod tests {
             None,
         ))];
         let info = draw_info(&reading_view(&messages, 0), 60, 10);
-        let line = info.anchor_line.expect("the anchor line is reported");
+        let line = info
+            .anchors
+            .first()
+            .expect("the anchor line is reported")
+            .1;
         assert!(line > info.transcript.height as usize, "anchor is off-screen: {line}");
 
         // 滚到它附近之后仍能报出来，app 据此判断「已经在视野内」。
         let offset = (line as u16).saturating_sub(2);
         let info = draw_info(&reading_view(&messages, info.max_back - offset), 60, 10);
-        assert_eq!(info.anchor_line, Some(line));
+        assert_eq!(info.anchors.first().map(|(_, line)| *line), Some(line));
     }
 
     #[test]
@@ -598,7 +604,7 @@ mod tests {
             None,
         ))];
         let info = draw_info(&reading_view(&messages, 0), 60, 12);
-        assert_eq!(info.anchor_line, None);
+        assert!(info.anchors.is_empty(), "no anchor to follow");
     }
 
     #[test]

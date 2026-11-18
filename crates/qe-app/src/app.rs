@@ -315,7 +315,7 @@ impl App {
             } else if std::mem::take(&mut self.pin_view) {
                 self.pin_view_on_screen();
             }
-            self.prev_anchor = self.draw_info.anchor_line;
+            self.prev_anchor = self.anchor_line();
 
             // Imports read a whole dictionary file; run them only once the frame is
             // on screen so the "importing" line is visible while it works.
@@ -745,15 +745,31 @@ impl App {
         }
     }
 
+    /// 当前阅读卡片里锚点行（`▸ 12/50`）的绝对行号。
+    ///
+    /// 对话里可能同时留着上一篇的卡片（也带锚点，`▸` 停在上一篇读到的位置），
+    /// 翻页时必须只认**当前这篇**的锚点；取第一处会把视野拽到上一篇的结尾去。
+    /// 还没在读、或当前卡片没有锚点（精读模式）时返回 `None`。
+    fn anchor_line(&self) -> Option<usize> {
+        // 没在读、或卡片还没挂上消息（`add word` 刚把 `message` 置空）时都不跟：
+        // 此时对话里的锚点属于某篇旧卡片，跟它走只会把视野拽到那篇去。
+        let message = self.reading.as_ref()?.message?;
+        self.draw_info
+            .anchors
+            .iter()
+            .find(|(owner, _)| *owner == message)
+            .map(|(_, line)| *line)
+    }
+
     /// 把当前段锚点滚到视野顶部附近；只在这一帧的几何信息里算，不需要知道宽度。
     ///
     /// 已经在视野内的锚点不动：读者自己滚到别处再触发重画（切译文、标记）时，
     /// 不该被强行拽回。
     fn scroll_to_anchor(&mut self) {
-        let info = &self.draw_info;
-        let Some(line) = info.anchor_line else {
+        let Some(line) = self.anchor_line() else {
             return;
         };
+        let info = &self.draw_info;
         if info.max_back == 0 {
             return;
         }
@@ -773,7 +789,7 @@ impl App {
     /// 内容在原位变长/变短时保持画面不动：锚点行下移了几行，就把滚动量补几行，
     /// 视野里的文字因而停在原地（选词弹出说明块不会让整篇往上跑）。
     fn pin_view_on_screen(&mut self) {
-        let (Some(before), Some(after)) = (self.prev_anchor, self.draw_info.anchor_line) else {
+        let (Some(before), Some(after)) = (self.prev_anchor, self.anchor_line()) else {
             return;
         };
         if before == after {
@@ -3137,23 +3153,46 @@ mod tests {
         app.execute(Command::Mode("full".into())).unwrap();
 
         // 模拟一帧：40 行内容、10 行视口、锚点在第 25 行，现在停在顶部。
+        let message = app.reading.as_ref().unwrap().message.unwrap();
         app.draw_info.transcript = ratatui::layout::Rect::new(0, 0, 80, 10);
         app.draw_info.max_back = 30;
-        app.draw_info.anchor_line = Some(25);
+        app.draw_info.anchors = vec![(message, 25)];
         app.scroll_back = 30; // offset = 0 → 锚点在第 25 行，视野外
         app.scroll_to_anchor();
         assert_eq!(app.scroll_back, 6, "anchor moves to the second visible line");
 
         // 已经在视野内就不动，免得读者刚滚到别处就被拽回来。
-        app.draw_info.anchor_line = Some(30); // offset 24 → 屏幕第 6 行
+        app.draw_info.anchors = vec![(message, 30)]; // offset 24 → 屏幕第 6 行
         let before = app.scroll_back;
         app.scroll_to_anchor();
         assert_eq!(app.scroll_back, before, "a visible anchor is left alone");
 
         // 锚点跑到视口上方（往回翻）时同样要滚回去。
-        app.draw_info.anchor_line = Some(10);
+        app.draw_info.anchors = vec![(message, 10)];
         app.scroll_to_anchor();
         assert_eq!(app.scroll_back, 21, "an anchor above the viewport scrolls up");
+    }
+
+    #[test]
+    fn a_previous_articles_anchor_is_not_followed() {
+        // 上一篇的卡片还留在对话里，它的锚点（`▸ 50/50`）停在上一篇读到的位置。
+        // 翻页必须只认当前这篇的锚点，否则视野会被拽到上一篇结尾和新文章
+        // 开头的交界处——那正是「跳到奇怪位置」的来源。
+        let Harness { mut app, _dir } = harness();
+        reading_fixture(&mut app, &_dir);
+        app.execute(Command::Mode("full".into())).unwrap();
+        let current = app.reading.as_ref().unwrap().message.unwrap();
+        app.draw_info.transcript = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.draw_info.max_back = 30;
+        // 渲染按消息顺序报锚点：上一篇的（别的下标）排在前面，行号 25 在视野外；
+        // 当前这篇的锚点在第 12 行。
+        app.draw_info.anchors = vec![(current + 7, 25), (current, 12)];
+        app.scroll_back = 30; // offset = 0
+        app.scroll_to_anchor();
+        assert_eq!(
+            app.scroll_back, 19,
+            "the current article's anchor (line 12) moves to the second visible row"
+        );
     }
 
     #[test]
@@ -3165,9 +3204,10 @@ mod tests {
         app.scroll_back = 10; // 内容 40 行时，视野顶停在第 20 行
 
         // 说明块插在锚点上方：整篇长了 5 行，锚点也跟着下移 5 行。
+        let message = app.reading.as_ref().unwrap().message.unwrap();
         app.prev_anchor = Some(12);
         app.draw_info.max_back = 35;
-        app.draw_info.anchor_line = Some(17);
+        app.draw_info.anchors = vec![(message, 17)];
         app.pin_view_on_screen();
 
         assert_eq!(app.scroll_back, 15, "视野顶仍停在第 20 行，画面不动");
