@@ -602,10 +602,11 @@ pub struct ReadingSession {
     pub opened: u32,
     /// 收进词书几个词。
     pub added: u32,
-    /// 过渡期间已经揭示的段数（`None` = 全部显示）。
+    /// 过渡的流式输出：已经吐出来的字符数（`None` = 全文直接显示）。
     ///
-    /// 新文章按段落顺序分批加载时由 app 每帧更新，读起来像学习卡的淡入。
-    pub revealed_paragraphs: Option<usize>,
+    /// 新文章打开时由 app 每帧推进，正文像打字机一样匀速流出；
+    /// 翻走（当前段不为 0）即中断。
+    pub stream_chars: Option<usize>,
     /// 消息在 `App::messages` 里的位置，用于原地刷新。
     pub message: Option<usize>,
 }
@@ -627,7 +628,7 @@ impl ReadingSession {
             shown: std::collections::HashSet::new(),
             opened: 0,
             added: 0,
-            revealed_paragraphs: None,
+            stream_chars: None,
             message: None,
         }
     }
@@ -638,6 +639,34 @@ impl ReadingSession {
 
     pub fn current(&self) -> Option<&str> {
         self.text.paragraphs().get(self.paragraph).copied()
+    }
+
+    /// 流式过渡下第 `index` 段该显示的部分：可能被截断，预算还没到返回空串。
+    ///
+    /// 预算按**全文字符**从第 0 段起累计（匀速吐）；没有过渡时原样返回。
+    pub fn streamed(&self, index: usize, paragraph: &str) -> String {
+        let Some(budget) = self.stream_chars else {
+            return paragraph.to_string();
+        };
+        let offset: usize = self
+            .text
+            .paragraphs()
+            .iter()
+            .take(index)
+            .map(|text| text.chars().count())
+            .sum();
+        if budget <= offset {
+            return String::new();
+        }
+        let take = budget - offset;
+        if paragraph.chars().count() <= take {
+            return paragraph.to_string();
+        }
+        paragraph
+            .char_indices()
+            .nth(take)
+            .map(|(at, _)| paragraph[..at].to_string())
+            .unwrap_or_else(|| paragraph.to_string())
     }
 
     /// 第 `index` 段的译文：官方译文优先，没有就用机器翻译补的那份。
@@ -897,6 +926,26 @@ mod tests {
         assert_eq!(paragraphs[0], "First paragraph.\nStill first.");
         assert_eq!(paragraphs[1], "Second one.");
         assert_eq!(paragraphs[2], "Third.");
+    }
+
+    #[test]
+    fn streaming_cuts_paragraphs_at_the_character_budget() {
+        let text = Text::new("T", "One two three.\n\nFour five six.");
+        let mut session = ReadingSession::new(text, ReadMode::Full, 0);
+
+        // 没有过渡：原样整段。
+        assert_eq!(session.streamed(0, "One two three."), "One two three.");
+
+        session.stream_chars = Some(8);
+        assert_eq!(session.streamed(0, "One two three."), "One two ");
+        // 第 2 段从第 1 段的 14 字之后开始计数。
+        assert_eq!(session.streamed(1, "Four five six."), "", "预算没到第 2 段");
+
+        session.stream_chars = Some(14 + 4);
+        assert_eq!(session.streamed(1, "Four five six."), "Four");
+
+        session.stream_chars = Some(999);
+        assert_eq!(session.streamed(1, "Four five six."), "Four five six.");
     }
 
     #[test]

@@ -515,9 +515,9 @@ impl App {
                     let _ = self.render_card();
                 }
             }
-            // 阅读过渡同理：每帧重画推进「段落按顺序分批出现」，出齐后收掉。
+            // 阅读过渡同理：每帧重画推进「正文流式吐出」，吐完后收掉。
             if let Some(started) = self.reading_fade_started {
-                if started.elapsed() >= Duration::from_millis(480) {
+                if started.elapsed() >= Duration::from_millis(1200) {
                     self.reading_fade_started = None;
                 }
                 let _ = self.render_reading();
@@ -540,7 +540,13 @@ impl App {
                 }
             }
 
-            if event::poll(Duration::from_millis(120))? {
+            // 流式过渡期间把轮询加密到 50ms：字往外蹦得才顺。
+            let poll_ms = if self.reading_fade_started.is_some() {
+                50
+            } else {
+                120
+            };
+            if event::poll(Duration::from_millis(poll_ms))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         self.handle_key(key)?;
@@ -3751,28 +3757,44 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_article_stages_its_paragraphs_in_order_from_the_first() {
+    fn a_fresh_article_streams_its_text_character_by_character() {
         let Harness { mut app, _dir } = harness();
         let path = _dir.path().join("long.txt");
+        // 超过 400 字符才值得流式；6 段 × ~90 字符。
         let body: String = (1..=6)
-            .map(|i| format!("Paragraph number {i} holds enough words to read slowly."))
+            .map(|i| format!("Paragraph number {i} holds enough words to read this slowly over time."))
             .collect::<Vec<_>>()
             .join("\n\n");
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, &body).unwrap();
+        let total_chars = body.chars().count();
+        assert!(total_chars > 400, "fixture must be long enough to stream");
 
         app.execute(Command::Read(path.to_string_lossy().to_string()))
             .unwrap();
         assert!(
             app.reading_fade_started.is_some(),
-            "从头开的新文章走过渡"
+            "从头开的新文章走流式过渡"
         );
-        assert_eq!(
-            app.reading.as_ref().unwrap().revealed_paragraphs,
-            Some(1),
-            "第一档只露出第一段，视角停在文章开头"
+        let shown = app
+            .reading
+            .as_ref()
+            .unwrap()
+            .stream_chars
+            .expect("first frame already has a character budget");
+        assert!(
+            shown >= 40 && shown < total_chars,
+            "起手先给一截但没到全文：{shown}/{total_chars}"
         );
         assert_eq!(app.reading.as_ref().unwrap().paragraph, 0);
         assert!(app.reveal_anchor, "视野请求对准第一段的锚点");
+
+        // 短文不流式：直接全量。
+        let short = _dir.path().join("short.txt");
+        std::fs::write(&short, "First.\n\nSecond.").unwrap();
+        app.execute(Command::Read(short.to_string_lossy().to_string()))
+            .unwrap();
+        assert!(app.reading_fade_started.is_none());
+        assert!(app.reading.as_ref().unwrap().stream_chars.is_none());
     }
 
     #[test]

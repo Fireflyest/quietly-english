@@ -14,16 +14,22 @@ use crate::app::App;
 /// 精读模式下最多列出几个候选词（对应数字键 1-9）。
 pub const MAX_CANDIDATES: usize = 9;
 
-/// 阅读过渡的分档：把全文按顺序分四批揭示，120ms 一档、480ms 出齐。
+/// 阅读过渡的字符预算：把全文在 1.2 秒内匀速吐完，像打字机一样流出。
 ///
-/// 不足 4 段的小文不值得分批，直接给全量——`None` 表示全部显示。
-fn staged_paragraphs(total: usize, elapsed: Duration) -> Option<usize> {
-    if total < 4 || elapsed >= Duration::from_millis(480) {
+/// 短文（不足 [`MIN_STREAM_CHARS`]）不值得流式，直接全量；起手先给 40 字符，
+/// 第一帧不白屏。吐完或超时返回 `None` = 全部显示。
+fn streamed_chars(total_chars: usize, elapsed: Duration) -> Option<usize> {
+    const DURATION_MS: u128 = 1200;
+    const FLOOR: usize = 40;
+    if total_chars < MIN_STREAM_CHARS || elapsed.as_millis() >= DURATION_MS {
         return None;
     }
-    let stage = (elapsed.as_millis() / 120).min(3) as usize;
-    Some((total * (stage + 1) / 4).max(1))
+    let revealed = total_chars as u128 * elapsed.as_millis() / DURATION_MS;
+    Some((revealed as usize).max(FLOOR))
 }
+
+/// 短于这个字符数的文章不走流式过渡（直接全量），开篇判断与预算共用这道杠。
+const MIN_STREAM_CHARS: usize = 400;
 
 /// 把文本文件读成一篇 `Text`。
 ///
@@ -173,13 +179,22 @@ impl App {
 
     /// 重画阅读卡片（原地替换那条消息）。
     pub fn render_reading(&mut self) -> Result<()> {
-        // 过渡进行中：段落按顺序分批揭示；`None` 表示全部显示。
-        let reveal = self.reading_fade_started.and_then(|started| {
-            let total = self.reading.as_ref()?.total();
-            staged_paragraphs(total, started.elapsed())
+        // 过渡进行中：全文字符匀速流出（打字机）；翻走（当前段不为 0）即中断。
+        let stream = self.reading_fade_started.and_then(|started| {
+            let session = self.reading.as_ref()?;
+            if session.paragraph != 0 {
+                return None;
+            }
+            let total_chars: usize = session
+                .text
+                .paragraphs()
+                .iter()
+                .map(|text| text.chars().count())
+                .sum();
+            streamed_chars(total_chars, started.elapsed())
         });
         if let Some(session) = self.reading.as_mut() {
-            session.revealed_paragraphs = reveal;
+            session.stream_chars = stream;
         }
         let Some(session) = self.reading.as_ref() else {
             return Ok(());
@@ -675,13 +690,20 @@ impl App {
         self.store.set_setting("last_text", &session.text.title)?;
         self.reading = Some(session);
         self.reveal_anchor = true;
-        // 过渡：从头读的新文章按段落顺序分四批加载（同学习卡的淡入手感）；
-        // 续读不揭——视角本来就在存档的那一段。
-        self.reading_fade_started = self
-            .reading
-            .as_ref()
-            .filter(|session| session.paragraph == 0 && session.total() >= 4)
-            .map(|_| Instant::now());
+        // 过渡：从头读、够长的新文章正文流式吐出（打字机）；续读不流——
+        // 视角本来就在存档的那一段。
+        self.reading_fade_started = self.reading.as_ref().and_then(|session| {
+            if session.paragraph != 0 {
+                return None;
+            }
+            let total: usize = session
+                .text
+                .paragraphs()
+                .iter()
+                .map(|text| text.chars().count())
+                .sum();
+            (total >= MIN_STREAM_CHARS).then(Instant::now)
+        });
         self.render_reading()
     }
 
@@ -1285,17 +1307,24 @@ mod tests {
     }
 
     #[test]
-    fn the_transition_reveals_paragraphs_in_four_ordered_steps() {
-        // 8 段：四档 2 → 4 → 6 → 8，最后一档出齐后交给 None（全部显示）。
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(0)), Some(2));
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(119)), Some(2));
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(120)), Some(4));
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(240)), Some(6));
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(360)), Some(8));
-        assert_eq!(staged_paragraphs(8, Duration::from_millis(480)), None);
-        assert_eq!(staged_paragraphs(8, Duration::from_secs(5)), None);
-        // 小文不值得分批。
-        assert_eq!(staged_paragraphs(3, Duration::from_millis(0)), None);
+    fn the_transition_streams_characters_at_a_steady_rate() {
+        // 长文在 1.2 秒内匀速吐完：起手 40 字符，越往后越接近全文，到点给全量。
+        let total = 6_000;
+        assert_eq!(streamed_chars(total, Duration::from_millis(0)), Some(40));
+        assert_eq!(
+            streamed_chars(total, Duration::from_millis(600)),
+            Some(3_000)
+        );
+        assert_eq!(
+            streamed_chars(total, Duration::from_millis(1_199)),
+            Some(5_995)
+        );
+        assert_eq!(streamed_chars(total, Duration::from_millis(1_200)), None);
+        assert_eq!(
+            streamed_chars(399, Duration::from_millis(0)),
+            None,
+            "短文直接全量，不值得流式"
+        );
     }
 
     #[test]
