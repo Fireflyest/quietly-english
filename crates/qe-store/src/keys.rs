@@ -55,6 +55,16 @@ pub const KEYS: &[Key] = &[
         hint: "腾讯云 SecretKey",
     },
     Key {
+        name: "deepseek_api_key",
+        env: &["DEEPSEEK_API_KEY", "deepseek_api_key"],
+        hint: "DeepSeek API key（国产 · 直连 · 翻译+批改）",
+    },
+    Key {
+        name: "mimo_api_key",
+        env: &["MIMO_API_KEY", "mimo_api_key", "XIAOMI_MIMO_API_KEY"],
+        hint: "小米 MiMo API key（国产 · 直连 · 翻译+批改）",
+    },
+    Key {
         name: "gemini_api_key",
         env: &["GEMINI_API_KEY", "gemini_api_key"],
         hint: "Gemini API key（国内要走代理）",
@@ -264,6 +274,10 @@ mod tests {
         assert_eq!(canonical("TENCENT_SECRET_KEY"), Some("tencent_secret_key"));
         assert_eq!(canonical("gemini"), Some("gemini_api_key"), "无歧义的短写");
         assert_eq!(canonical("baidu"), None, "两个 key 都以 baidu 开头，必须写全");
+        assert_eq!(canonical("deepseek"), Some("deepseek_api_key"), "国产模型的短写");
+        assert_eq!(canonical("DEEPSEEK_API_KEY"), Some("deepseek_api_key"));
+        assert_eq!(canonical("mimo"), Some("mimo_api_key"));
+        assert_eq!(canonical("XIAOMI_MIMO_API_KEY"), Some("mimo_api_key"));
         assert_eq!(canonical("nonsense"), None);
     }
 

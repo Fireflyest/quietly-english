@@ -317,14 +317,38 @@ Aeon 都只有英文。按 `tab` 或 `/translate` 时，程序会把**当前这�
 
 | 服务 | 额度 | 要什么 | 直连 |
 |---|---|---|---|
-| 百度翻译（配了就排第一） | 按账号免费额度 | 注册[百度翻译开放平台](https://fanyi-api.baidu.com/)，设 `BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY` | ✅ |
+| **大模型**（Gemini / 小米 MiMo / DeepSeek，随便加） | 按 token 计费 | key 用 `/apikey set gemini_api_key …` 这样配（同一把 key 也给 AI 批改用）；地址与型号看下面的 `models.json` | MiMo / DeepSeek ✅，Gemini 要代理 |
+| 百度翻译 | 按账号免费额度 | 注册[百度翻译开放平台](https://fanyi-api.baidu.com/)，设 `BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY` | ✅ |
 | 腾讯云翻译 TMT | 按账号免费额度 | 开通[机器翻译](https://console.cloud.tencent.com/tmt)，设 `TENCENT_SECRET_ID` + `TENCENT_SECRET_KEY` | ✅ |
 | MyMemory（都没配时默认） | 5000 字符/天 | 什么都不用 | ✅ |
 | MyMemory + 邮箱 | 50000 字符/天 | 填 `MYMEMORY_EMAIL`，**不用注册** | ✅ |
 | DeepL API Free | 50 万字符/月 | 要注册，设 `DEEPL_API_KEY`（[免费注册](https://www.deepl.com/pro-api)） | ✅ |
 
-按优先级取第一个配齐了的：**百度 > 腾讯 > Gemini（`GEMINI_API_KEY`，需代理） > DeepL > MyMemory**。
+顺序：**模型优先**——按数据目录 `models.json` 的**条目顺序**取第一个配了 key 的
+（默认 **Gemini > 小米 MiMo > DeepSeek**，改文件顺序就改调用顺序），模型一家都没配
+才轮到机器翻译 **百度 > 腾讯 > DeepL > MyMemory**。
 任一家失败都会自动回退到 MyMemory，提示里标明实际用的是谁。
+
+**模型清单 `models.json`**（和 `keys.json` 同目录，**启动时读取**，缺了自动写出默认）。
+地址、候选型号、调用顺序全在这个文件里——型号升级、换端点、换顺序都改它，
+**不用改代码、不用重编译**。结构就是常见的模型清单写法：
+
+```json
+[
+  {
+    "name": "Gemini",
+    "key": "gemini_api_key",
+    "apiType": "chat-completions",
+    "models": [
+      { "id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "url": "https://…" }
+    ]
+  }
+]
+```
+
+`key` 是 `/apikey set` 里的规范名，配上它这家才可用；`models` 按顺序逐个尝试，
+第一个返回正文的赢。从别的工具搬来的清单里多余的字段（`vision`、`thinking`、
+`maxInputTokens`…）不用删，照样能读。
 
 key 有两种配法，**文件优先**（没写的字段才回落到环境变量）：
 

@@ -41,6 +41,8 @@ pub enum Command {
     ApiKey(String),
     /// `/quiz [file]`：开始测验；给文件则先导入题目。
     Quiz(String),
+    /// `/practice <url>`：从中文网页按段生成翻译练习（AI 生成英文参考）。
+    Practice(String),
     /// `/goto <n>`：跳到第 n 段。
     Goto(String),
     /// `/take <n>`：把当前段第 n 个候选词收进词书。
@@ -246,6 +248,12 @@ pub const SPECS: &[Spec] = &[
         help: "answer the questions for this text, or import a quiz file",
     },
     Spec {
+        name: "/practice",
+        alias: "",
+        args: " [list|daily|<中文网页 url>]",
+        help: "list exercise collections, import from a page, run daily discovery",
+    },
+    Spec {
         name: "/apikey",
         alias: "key",
         args: " <set|list|clear>",
@@ -329,6 +337,7 @@ impl Command {
             "translate" | "tr" => Command::Translate,
             "apikey" | "key" => Command::ApiKey(arg),
             "quiz" | "test" => Command::Quiz(arg),
+            "practice" => Command::Practice(arg),
             "goto" | "g" => Command::Goto(arg),
             "take" | "keep" => Command::Take(arg),
             "drop" | "delete" | "forget" => Command::Drop(arg),
@@ -664,5 +673,16 @@ mod tests {
         assert_eq!(Command::parse("/limit 30"), Some(Command::Limit(Some(30))));
         assert_eq!(Command::parse("/limit"), Some(Command::Limit(None)));
         assert_eq!(Command::parse("/add serendipity"), Some(Command::Add("serendipity".into())));
+    }
+
+    #[test]
+    fn parses_practice_with_a_url() {
+        assert_eq!(
+            Command::parse("/practice https://example.cn/article/1"),
+            Some(Command::Practice("https://example.cn/article/1".into()))
+        );
+        assert_eq!(Command::parse("/practice"), Some(Command::Practice(String::new())));
+        // 没有候选可补（url 手输），按 Free 处理。
+        assert_eq!(arg_kind("/practice"), ArgKind::Free);
     }
 }

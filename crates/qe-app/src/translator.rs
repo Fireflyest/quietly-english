@@ -3,17 +3,20 @@
 //! 内建来源里只有 TED 和 BBC 带中文对照，新华网、Guardian 长读、Aeon 都只有英文。
 //! 这里接翻译 API：按段翻译、结果落库缓存，同一段只花一次额度。
 //!
-//! 五家按优先级挑（`/apikey set` 存的 `keys.json` 优先，环境变量兜底；
-//! **key 不进库、不进仓库**）：
+//! 挑服务的顺序：**模型优先**——按数据目录 `models.json` 的条目顺序
+//! （默认 Gemini > 小米 MiMo > DeepSeek，改文件就改顺序），模型都配不上才
+//! 落到机器翻译 百度 > 腾讯 > DeepL > MyMemory。key 从 `/apikey set` 存的
+//! `keys.json` 读、环境变量兜底；**key 不进库、不进仓库**。
+//!
+//! 模型的地址、型号、候选顺序全在 `models.json` 里（启动时读取，缺了写默认），
+//! 型号升级/换端点改文件即可，不用改代码。机器翻译几家：
 //!
 //! 1. **百度翻译**（`BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY`）
 //!    ——国内直连不用代理，签名是 `MD5(appid+q+salt+secretKey)`。
 //! 2. **腾讯云机器翻译**（`TENCENT_SECRET_ID` + `TENCENT_SECRET_KEY`）
 //!    ——同样国内直连，走腾讯云统一的 TC3-HMAC-SHA256 签名。
-//! 3. **Google Gemini**（`GEMINI_API_KEY`）——译文最顺，免费层按项目算配额。
-//!    缺点是国内**必须走代理**，而且高峰期偶尔 503，所以失败会自动回退到 MyMemory。
-//! 4. **DeepL API Free**（`DEEPL_API_KEY`）——50 万字符/月，但要注册绑卡。
-//! 5. **MyMemory**——不用注册，匿名 5000 字符/天；环境变量里填 `MYMEMORY_EMAIL`
+//! 3. **DeepL API Free**（`DEEPL_API_KEY`）——50 万字符/月，但要注册绑卡。
+//! 4. **MyMemory**——不用注册，匿名 5000 字符/天；环境变量里填 `MYMEMORY_EMAIL`
 //!    （只是请求里的一个 `de` 参数，不用验证）额度按 50000 字符/天算。
 //!
 //! `QUIETLY_TRANSLATE=none` 整个关掉（不想联网时用）。
@@ -31,54 +34,22 @@ const MYMEMORY_CHUNK: usize = 420;
 /// 百度 `q` 上限 6000 字节，留点余量。
 const BAIDU_CHUNK: usize = 5000;
 
-/// Gemini 的候选模型：从新到旧，第一个能用的就赢。
-///
-/// 模型改名很快（2.5-flash 已经对新用户下线），留几个备选、允许 `GEMINI_MODEL`
-/// 覆盖，比写死一个名字活得久。
-const GEMINI_MODELS: [&str; 3] = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
-    "gemini-flash-latest",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
+    /// `models.json` 里选中的聊天模型（Gemini / 小米 MiMo / DeepSeek / 以后加的）。
+    Model,
     Baidu,
     Tencent,
     MyMemory,
     DeepL,
-    Gemini,
-}
-
-impl Provider {
-    /// 显示名，用在结果和错误提示里。
-    pub fn label(self) -> &'static str {
-        match self {
-            Provider::Baidu => "Baidu",
-            Provider::Tencent => "Tencent",
-            Provider::MyMemory => "MyMemory",
-            Provider::DeepL => "DeepL",
-            Provider::Gemini => "Gemini",
-        }
-    }
-
-    /// 存进库里的服务名。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Provider::Baidu => "baidu",
-            Provider::Tencent => "tencent",
-            Provider::MyMemory => "mymemory",
-            Provider::DeepL => "deepl",
-            Provider::Gemini => "gemini",
-        }
-    }
 }
 
 /// 一次翻译的结果：译文 + 实际用的服务（可能是回退后的那家）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Translation {
     pub text: String,
-    pub provider: &'static str,
+    /// 服务短名（`baidu` / `gemini`…）；模型取它的 key 去掉 `_api_key`。
+    pub provider: String,
 }
 
 /// 当前生效的翻译配置。
@@ -88,16 +59,47 @@ pub struct Settings {
     /// MyMemory 的 `de` 参数：填了额度从 5000 涨到 50000 字符/天。
     /// 不用注册，也没有 key，只要一个能联系到你的真实邮箱。
     pub email: Option<String>,
-    /// DeepL / Gemini 的 API key；百度的 APP_ID；腾讯的 SecretId。
+    /// 模型 / DeepL 的 API key；百度的 APP_ID；腾讯的 SecretId。
     pub key: Option<String>,
     /// 百度的 SecretKey / 腾讯的 SecretKey，和 [`Settings::key`] 成对使用。
     pub secret: Option<String>,
+    /// `provider == Provider::Model` 时：`models.json` 里选中的那家，
+    /// 端点和候选型号都在里面——换模型改文件，不改代码。
+    pub model: Option<qe_store::models::ProviderEntry>,
 }
 
 impl Settings {
+    /// 显示名：机器翻译是固定名；模型用 `models.json` 里那家的 `name`。
+    pub fn label(&self) -> &str {
+        match self.provider {
+            Provider::Model => self.model.as_ref().map_or("model", |entry| entry.name.as_str()),
+            Provider::Baidu => "Baidu",
+            Provider::Tencent => "Tencent",
+            Provider::MyMemory => "MyMemory",
+            Provider::DeepL => "DeepL",
+        }
+    }
+
+    /// 存库/提示里用的短名：模型取 key 去掉 `_api_key`
+    /// （`gemini_api_key` → `gemini`），换模型后库里能看出是谁给的。
+    pub fn id(&self) -> &str {
+        match self.provider {
+            Provider::Model => self
+                .model
+                .as_ref()
+                .map(|entry| entry.key.strip_suffix("_api_key").unwrap_or(&entry.key))
+                .unwrap_or("model"),
+            Provider::Baidu => "baidu",
+            Provider::Tencent => "tencent",
+            Provider::MyMemory => "mymemory",
+            Provider::DeepL => "deepl",
+        }
+    }
+
     /// 说明这台机器会怎么翻，供 `/translate` 与 `quietly translate` 提示用。
     pub fn detail(&self) -> String {
         match self.provider {
+            Provider::Model => format!("{} · chat-completions · models.json", self.label()),
             Provider::MyMemory => {
                 let quota = if self.email.is_some() {
                     "50000 chars/day"
@@ -109,17 +111,17 @@ impl Settings {
             Provider::Baidu => "Baidu · 百度翻译开放平台 · 按账号免费额度 · 直连".to_string(),
             Provider::Tencent => "Tencent · 腾讯云机器翻译 TMT · 按账号免费额度 · 直连".to_string(),
             Provider::DeepL => "DeepL API Free · 500k chars/month".to_string(),
-            Provider::Gemini => "Gemini · free tier · needs a proxy in mainland China".to_string(),
         }
     }
 
-    /// 同一个配置换成回退用的 MyMemory（Gemini / DeepL 挂了时用）。
+    /// 同一个配置换成回退用的 MyMemory（模型 / DeepL 挂了时用）。
     fn fallback(&self) -> Self {
         Self {
             provider: Provider::MyMemory,
             email: self.email.clone(),
             key: None,
             secret: None,
+            model: None,
         }
     }
 }
@@ -127,8 +129,10 @@ impl Settings {
 /// 从 `keys.json`（`/apikey set`）读配置，缺的字段回落到环境变量；
 /// 返回 `None` 表示用户关掉了翻译。
 ///
-/// 优先级：百度 > 腾讯 > Gemini > DeepL > MyMemory。配了 key 不代表一定用得上，
-/// 用不上时 [`translate`] 会自动回退到 MyMemory。
+/// 优先级：**模型在前**——按 `models.json` 的条目顺序取第一个配了 key 的
+/// （默认 Gemini > 小米 MiMo > DeepSeek，改文件顺序就改调用顺序）；
+/// 模型全没配才轮到机器翻译 百度 > 腾讯 > DeepL > MyMemory。
+/// 配了 key 不代表一定用得上，用不上时 [`translate`] 会自动回退到 MyMemory。
 pub fn settings() -> Option<Settings> {
     if matches!(
         env(&["QUIETLY_TRANSLATE", "quietly_translate"]).as_deref(),
@@ -139,13 +143,32 @@ pub fn settings() -> Option<Settings> {
     let stored = keys::load();
     let get = |name: &str| keys::resolve(&stored, name);
     let email = get("mymemory_email");
-    // 百度 / 腾讯国内直连、不用代理，配了就排在最前。
+    // 模型优先：按 models.json 的顺序试。清单读不出来就当没有模型，
+    // 机器翻译照常干活（批改那边会把清单的错误原样报出来）。
+    if let Ok(entries) = qe_store::models::load() {
+        for entry in entries {
+            if entry.key.is_empty() {
+                continue;
+            }
+            if let Some(key) = get(&entry.key) {
+                return Some(Settings {
+                    provider: Provider::Model,
+                    email,
+                    key: Some(key),
+                    secret: None,
+                    model: Some(entry),
+                });
+            }
+        }
+    }
+    // 机器翻译兜底：百度 / 腾讯国内直连、不用代理，配了就先用。
     if let (Some(key), Some(secret)) = (get("baidu_app_id"), get("baidu_secret_key")) {
         return Some(Settings {
             provider: Provider::Baidu,
             email,
             key: Some(key),
             secret: Some(secret),
+            model: None,
         });
     }
     if let (Some(key), Some(secret)) = (get("tencent_secret_id"), get("tencent_secret_key")) {
@@ -154,15 +177,7 @@ pub fn settings() -> Option<Settings> {
             email,
             key: Some(key),
             secret: Some(secret),
-        });
-    }
-    // 再往后是 Gemini：译文明显更顺，免费层也够用，但国内要走代理。
-    if let Some(key) = get("gemini_api_key") {
-        return Some(Settings {
-            provider: Provider::Gemini,
-            email,
-            key: Some(key),
-            secret: None,
+            model: None,
         });
     }
     if let Some(key) = get("deepl_api_key") {
@@ -171,6 +186,7 @@ pub fn settings() -> Option<Settings> {
             email,
             key: Some(key),
             secret: None,
+            model: None,
         });
     }
     Some(Settings {
@@ -178,7 +194,131 @@ pub fn settings() -> Option<Settings> {
         email,
         key: None,
         secret: None,
+        model: None,
     })
+}
+
+/// 一次 AI 生成（批改这类要模型出结构化文本的请求）的接入信息：
+/// `models.json` 的条目 + `keys.json` 里配好的 key。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiModel {
+    /// 显示名（清单里的 `name`），进错误提示。
+    pub name: String,
+    /// 库里记录的服务短名：key 去掉 `_api_key`（`gemini_api_key` → `gemini`）。
+    pub id: String,
+    /// 候选型号 `(地址, 型号)`，按清单顺序依次尝试。
+    pub models: Vec<(String, String)>,
+    key: String,
+}
+
+impl AiModel {
+    fn of(entry: &qe_store::models::ProviderEntry, key: String) -> Result<Self> {
+        anyhow::ensure!(
+            entry.is_chat_completions(),
+            "{} 的 apiType \"{}\" 暂不支持（只认 chat-completions）",
+            entry.name,
+            entry.api_type
+        );
+        anyhow::ensure!(
+            !entry.models.is_empty(),
+            "{} 在 models.json 里没有型号",
+            entry.name
+        );
+        Ok(Self {
+            name: entry.name.clone(),
+            id: entry
+                .key
+                .strip_suffix("_api_key")
+                .unwrap_or(&entry.key)
+                .to_string(),
+            models: entry
+                .models
+                .iter()
+                .map(|model| (model.url.clone(), model.id.clone()))
+                .collect(),
+            key,
+        })
+    }
+}
+
+/// 批改用哪套模型：按 `models.json` 的条目顺序取第一个配了 key 的
+/// （默认 Gemini > 小米 MiMo > DeepSeek；改文件顺序就改调用顺序）。
+///
+/// 不受 `QUIETLY_TRANSLATE=none` 影响：批改是你显式发起的一次请求，
+/// 不是阅读时自动联网。全都没配就报错，指路 `models.json` 和 `/apikey set`。
+pub fn ai_settings() -> Result<AiModel> {
+    let stored = keys::load();
+    let entries = qe_store::models::load()?;
+    for entry in &entries {
+        if entry.key.is_empty() {
+            continue;
+        }
+        if let Some(key) = keys::resolve(&stored, &entry.key) {
+            return AiModel::of(entry, key);
+        }
+    }
+    anyhow::bail!(
+        "没有配好的模型：在 {} 里选一家，再 /apikey set <key>（/apikey list 看 key 名）",
+        qe_store::models::path().display()
+    )
+}
+
+/// 跑一次 AI 生成：按清单顺序把候选型号依次试过去，第一个返回正文的赢。
+///
+/// 全部走 chat-completions（`models.json` 的 `apiType`），所以接什么新模型
+/// 都不用改代码——改文件即可。
+pub(crate) fn ai_generate(ai: &AiModel, prompt: &str) -> Result<String> {
+    let mut last = format!("没有可用的型号（{}）", ai.name);
+    for (url, model) in &ai.models {
+        let payload = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "temperature": 0.2,
+        })
+        .to_string();
+        let response = match crate::fetch::with_proxy(
+            minreq::post(url)
+                .with_header("Authorization", format!("Bearer {}", ai.key))
+                .with_header("Content-Type", "application/json")
+                .with_timeout(60)
+                .with_body(payload),
+        )
+        .send()
+        {
+            Ok(response) => response,
+            // 网络不通换型号也没用，立刻报；提示带上代理状态，省得猜网络。
+            Err(err) => anyhow::bail!("{} 连不上（{}）· {err}", ai.name, link_note()),
+        };
+        let raw = response.as_str().unwrap_or_default();
+        if (200..300).contains(&response.status_code) {
+            match parse_chat_content(raw) {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    last = format!("{} {model} · {err:#}", ai.name);
+                    continue;
+                }
+            }
+        }
+        last = format!(
+            "{} {model} 返回 {} · {}",
+            ai.name,
+            response.status_code,
+            first_line(raw)
+        );
+        // key 被拒时换哪个型号都一样，别再试了。
+        if matches!(response.status_code, 401 | 403) {
+            anyhow::bail!("{} 拒绝了这个 key · {}", ai.name, first_line(raw));
+        }
+    }
+    anyhow::bail!("{last}")
+}
+
+/// 「经代理 127.0.0.1:7888」/「直连」，进错误提示。
+fn link_note() -> String {
+    match crate::fetch::proxy_address() {
+        Some(address) => format!("经代理 {address}"),
+        None => "直连".to_string(),
+    }
 }
 
 fn env(names: &[&str]) -> Option<String> {
@@ -194,104 +334,71 @@ pub fn translate(settings: &Settings, text: &str) -> Result<Translation> {
     let text = text.trim();
     anyhow::ensure!(!text.is_empty(), "没有可翻译的正文");
     let outcome = match settings.provider {
+        Provider::Model => chat(settings, text),
         Provider::Baidu => baidu(settings, text),
         Provider::Tencent => tencent(settings, text),
         Provider::MyMemory => mymemory(settings, text),
         Provider::DeepL => deepl(settings, text),
-        Provider::Gemini => gemini(settings, text),
     };
     match outcome {
         Ok(body) => Ok(Translation {
             text: body,
-            provider: settings.provider.as_str(),
+            provider: settings.id().to_string(),
         }),
         // MyMemory 自己失败就没什么可退的了。
         Err(err) if settings.provider == Provider::MyMemory => Err(err),
         Err(err) => {
-            // Gemini 必须走代理、高峰期还会 503；DeepL 没 key 也会走到这里。
+            // 模型可能连不上（要代理、超额度）；DeepL 没 key 也会走到这里。
             // 有 MyMemory 兜着，读者至少拿到译文，提示里说清是谁给的。
             let why = first_line(&format!("{err:#}"));
-            let body = mymemory(&settings.fallback(), text).with_context(|| {
-                format!(
-                    "{} 失败（{why}），MyMemory 也失败",
-                    settings.provider.label()
-                )
+            let fallback = settings.fallback();
+            let body = mymemory(&fallback, text).with_context(|| {
+                format!("{} 失败（{why}），MyMemory 也失败", settings.label())
             })?;
             Ok(Translation {
                 text: body,
-                provider: Provider::MyMemory.as_str(),
+                provider: fallback.id().to_string(),
             })
         }
     }
 }
 
-/// Gemini：一次请求翻整段，不用切分（上下文窗口上百万 token）。
-///
-/// 模型名和负载都会变，所以按 [`GEMINI_MODELS`] 依次试；网络本身不通时立刻放弃，
-/// 不把时间浪费在换模型上——那种情况换哪个都不通。
-fn gemini(settings: &Settings, text: &str) -> Result<String> {
-    let key = settings.key.as_deref().context("GEMINI_API_KEY 没有配置")?;
-    let models: Vec<String> = match env(&["GEMINI_MODEL", "gemini_model"]) {
-        Some(model) => vec![model],
-        None => GEMINI_MODELS.iter().map(|name| name.to_string()).collect(),
-    };
-    let prompt = format!(
+/// 阅读翻译的提示词：英文段落 → 纯中文译文，所有模型共用一句。
+fn translate_prompt(text: &str) -> String {
+    format!(
         "Translate the following English passage into natural, fluent Simplified Chinese. \
          Keep the meaning and tone, do not add explanations. Output only the translation.\n\n{text}"
-    );
-    let payload = serde_json::json!({
-        "contents": [{ "parts": [{ "text": prompt }] }],
-        "generationConfig": { "temperature": 0.2 }
-    })
-    .to_string();
+    )
+}
 
-    let mut last = String::from("没有可用的模型");
-    for model in &models {
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        );
-        let response = match crate::fetch::with_proxy(
-            minreq::post(&url)
-                .with_header("x-goog-api-key", key)
-                .with_header("Content-Type", "application/json")
-                .with_timeout(45)
-                .with_body(payload.clone()),
-        )
-        .send()
-        {
-            Ok(response) => response,
-            // 连不上就到此为止；提示里带上代理状态，省得猜是 key 错还是网络错。
-            Err(err) => anyhow::bail!(
-                "Gemini 连不上（{}）· {err}",
-                match crate::fetch::proxy_address() {
-                    Some(address) => format!("经代理 {address}"),
-                    None => "没找到代理，国内需开系统代理或设 HTTPS_PROXY".to_string(),
-                }
-            ),
-        };
-        let raw = response.as_str().unwrap_or_default();
-        if response.status_code == 200 {
-            let json: serde_json::Value =
-                serde_json::from_str(raw).context("Gemini 返回的不是 JSON")?;
-            let translated = json
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !translated.is_empty() {
-                return Ok(translated);
-            }
-            last = format!("{model} 返回了空译文");
-            continue;
-        }
-        last = format!("{model} 返回 {}", response.status_code);
-        // 503 / 429 是忙，换个模型也许就好；400 / 404 是模型名不对，也别停。
-        if matches!(response.status_code, 401 | 403) {
-            anyhow::bail!("Gemini 拒绝了这个 key · {}", hint(raw));
-        }
-    }
-    anyhow::bail!("Gemini: {last}")
+/// `models.json` 选中的模型翻整段：端点和型号来自清单，出问题回退 MyMemory。
+fn chat(settings: &Settings, text: &str) -> Result<String> {
+    let entry = settings
+        .model
+        .as_ref()
+        .context("模型配置丢失：settings 里没有 models.json 条目")?;
+    let key = settings.key.clone().context("模型 key 没有配置")?;
+    let ai = AiModel::of(entry, key)?;
+    ai_generate(&ai, &translate_prompt(text))
+}
+
+/// chat-completions 响应里要的正文：`choices[0].message.content`。
+///
+/// thinking 模型可能把草稿放 `reasoning_content`、`content` 给 null——
+/// 草稿不是答案，正文为空就明确报错，绝不拿它当译文或批改结果。
+fn parse_chat_content(raw: &str) -> Result<String> {
+    let json: serde_json::Value = serde_json::from_str(raw).context("返回的不是 JSON")?;
+    let content = json
+        .pointer("/choices/0/message/content")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+    anyhow::ensure!(
+        !content.is_empty(),
+        "choices[0].message.content 是空的 · {}",
+        first_line(raw)
+    );
+    Ok(content.to_string())
 }
 
 /// 错误信息常常好几行，界面上只留第一行。
@@ -756,6 +863,7 @@ pub(crate) mod tests {
             email: None,
             key: Some("x".into()),
             secret: None,
+            model: None,
         };
         assert!(deepl.detail().contains("DeepL"));
         let free = Settings {
@@ -763,6 +871,7 @@ pub(crate) mod tests {
             email: None,
             key: None,
             secret: None,
+            model: None,
         };
         assert!(free.detail().contains("5000"));
         let with_email = Settings {
@@ -779,6 +888,7 @@ pub(crate) mod tests {
             email: None,
             key: Some("2015066600".into()),
             secret: Some("secret".into()),
+            model: None,
         };
         assert!(baidu.detail().contains("Baidu"));
         let tencent = Settings {
@@ -786,6 +896,7 @@ pub(crate) mod tests {
             email: None,
             key: Some("AKIDxxx".into()),
             secret: Some("secret".into()),
+            model: None,
         };
         assert!(tencent.detail().contains("Tencent"));
         // 回退永远是 MyMemory，两家的凭证不能跟着漏过去。
@@ -828,6 +939,24 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("QUIETLY_HOME");
         std::env::set_var("QUIETLY_HOME", dir.path());
+        // 模型排在机器翻译前面：机器上真配着 GEMINI_API_KEY 之类的环境变量，
+        // 摘掉才能只验「文件里的百度 key 直接生效」这件事。
+        let model_envs = [
+            "GEMINI_API_KEY",
+            "gemini_api_key",
+            "MIMO_API_KEY",
+            "mimo_api_key",
+            "XIAOMI_MIMO_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "deepseek_api_key",
+        ];
+        let saved_models: Vec<(&str, Option<std::ffi::OsString>)> = model_envs
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for name in model_envs {
+            std::env::remove_var(name);
+        }
         qe_store::keys::set("baidu_app_id", "2015066600").unwrap();
         qe_store::keys::set("baidu_secret_key", "s3cret").unwrap();
 
@@ -840,9 +969,165 @@ pub(crate) mod tests {
         let fallback = settings().expect("still on");
         assert_ne!(fallback.key.as_deref(), Some("2015066600"));
 
+        for (name, value) in saved_models {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
         match previous {
             Some(value) => std::env::set_var("QUIETLY_HOME", value),
             None => std::env::remove_var("QUIETLY_HOME"),
         }
+    }
+
+    /// 摘掉会影响优先级判定的环境变量（key 的各种写法 + 总开关），
+    /// 返回恢复用的清单；和 [`lock_env`] 配套用。
+    fn quiet_key_envs() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        let names = [
+            "QUIETLY_TRANSLATE",
+            "quietly_translate",
+            "BAIDU_TRANSLATE_APP_ID",
+            "baidu_translate_app_id",
+            "BAIDU_APP_ID",
+            "baidu_app_id",
+            "BAIDU_TRANSLATE_SECRET_KEY",
+            "baidu_translate_secret_key",
+            "BAIDU_SECRET_KEY",
+            "baidu_secret_key",
+            "TENCENT_SECRET_ID",
+            "tencent_secret_id",
+            "TENCENT_SECRET_KEY",
+            "tencent_secret_key",
+            "DEEPSEEK_API_KEY",
+            "deepseek_api_key",
+            "MIMO_API_KEY",
+            "mimo_api_key",
+            "XIAOMI_MIMO_API_KEY",
+            "GEMINI_API_KEY",
+            "gemini_api_key",
+            "DEEPL_API_KEY",
+            "deepl_api_key",
+        ];
+        let saved = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+        saved
+    }
+
+    fn restore_key_envs(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn ai_settings_follows_models_json_order() {
+        // 批改选哪家 = models.json 的条目顺序（这里故意把 Deepseek 放最前）。
+        let _guard = lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("QUIETLY_HOME");
+        std::env::set_var("QUIETLY_HOME", dir.path());
+        let saved = quiet_key_envs();
+
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"[
+                {"name":"Deepseek","key":"deepseek_api_key","apiType":"chat-completions",
+                 "models":[{"id":"deepseek-flash","url":"https://api.deepseek.com/chat/completions"}]},
+                {"name":"Gemini","key":"gemini_api_key","apiType":"chat-completions",
+                 "models":[{"id":"gemini-flash-latest","url":"https://example.invalid/chat"}]}
+            ]"#,
+        )
+        .unwrap();
+        qe_store::keys::set("gemini_api_key", "g").unwrap();
+        qe_store::keys::set("deepseek_api_key", "ds").unwrap();
+
+        let first = ai_settings().unwrap();
+        assert_eq!(first.name, "Deepseek", "清单在前的先用");
+        assert_eq!(first.id, "deepseek", "id 是 key 去掉 _api_key");
+
+        // 第一家的 key 没配就顺延到下一家。
+        qe_store::keys::clear(Some("deepseek_api_key")).unwrap();
+        let second = ai_settings().unwrap();
+        assert_eq!(second.name, "Gemini");
+        assert_eq!(second.id, "gemini");
+
+        // 一家都没配：报错并同时指路 models.json 和 /apikey。
+        qe_store::keys::clear(None).unwrap();
+        let message = format!("{:#}", ai_settings().unwrap_err());
+        assert!(message.contains("models.json"), "指路清单：{message}");
+        assert!(message.contains("/apikey set"), "指路 key 配置：{message}");
+
+        restore_key_envs(saved);
+        match previous_home {
+            Some(value) => std::env::set_var("QUIETLY_HOME", value),
+            None => std::env::remove_var("QUIETLY_HOME"),
+        }
+    }
+
+    #[test]
+    fn translation_follows_models_json_order_then_machine_translation() {
+        // 翻译：模型优先（按清单顺序），模型的 key 一家都没配才轮到机器翻译。
+        let _guard = lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("QUIETLY_HOME");
+        std::env::set_var("QUIETLY_HOME", dir.path());
+        let saved = quiet_key_envs();
+
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"[
+                {"name":"Xiaomi Mimo","key":"mimo_api_key",
+                 "models":[{"id":"mimo-v2.6-flash","url":"https://token-plan-cn.xiaomimimo.com/v1/chat/completions"}]},
+                {"name":"Gemini","key":"gemini_api_key",
+                 "models":[{"id":"gemini-flash-latest","url":"https://example.invalid/chat"}]}
+            ]"#,
+        )
+        .unwrap();
+        qe_store::keys::set("gemini_api_key", "g").unwrap();
+        qe_store::keys::set("mimo_api_key", "m").unwrap();
+        qe_store::keys::set("baidu_app_id", "2015066600").unwrap();
+        qe_store::keys::set("baidu_secret_key", "s3cret").unwrap();
+
+        let picked = settings().unwrap();
+        assert_eq!(picked.provider, Provider::Model, "模型优先于机器翻译");
+        assert_eq!(
+            picked.model.as_ref().unwrap().name,
+            "Xiaomi Mimo",
+            "清单顺序决定先用哪家"
+        );
+
+        // 模型的 key 全清掉 → 轮到机器翻译（百度在机器翻译里最先）。
+        qe_store::keys::clear(Some("mimo_api_key")).unwrap();
+        qe_store::keys::clear(Some("gemini_api_key")).unwrap();
+        let machine = settings().unwrap();
+        assert_eq!(machine.provider, Provider::Baidu, "模型没配才轮到机器翻译");
+
+        restore_key_envs(saved);
+        match previous_home {
+            Some(value) => std::env::set_var("QUIETLY_HOME", value),
+            None => std::env::remove_var("QUIETLY_HOME"),
+        }
+    }
+
+    #[test]
+    fn chat_content_comes_out_of_the_openai_shape() {
+        let raw = r#"{"choices":[{"message":{"role":"assistant","content":"你好。"}}]}"#;
+        assert_eq!(parse_chat_content(raw).unwrap(), "你好。");
+
+        // thinking 模型可能只给 reasoning 草稿、content 为 null——
+        // 草稿不是答案，必须报错而不是拿去当译文/批改结果。
+        let draft = r#"{"choices":[{"message":{"reasoning_content":"let me think…","content":null}}]}"#;
+        let err = parse_chat_content(draft).unwrap_err();
+        assert!(format!("{err:#}").contains("content 是空的"));
+        assert!(parse_chat_content("not json at all").is_err());
     }
 }

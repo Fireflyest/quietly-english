@@ -417,6 +417,23 @@ pub struct TranslationAttempt {
     pub created_at: DateTime<Utc>,
 }
 
+/// 一个练习合集的列表行（`/practice` 的 list 视图用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PracticeSetStat {
+    /// 合集 id；`0` 是「未分组」（迁移前的旧题，不可再挂题）。
+    pub id: i64,
+    pub name: String,
+    /// `manual` / `web` / `daily` / `legacy`。
+    pub kind: String,
+    /// 来源页面：网页导入是文章页，每日来源是列表页；手动没有。
+    pub url: Option<String>,
+    pub exercises: u32,
+    /// 至少提交过一次答案的题数。
+    pub submitted: u32,
+    /// 至少有一个带分数提交的题数（人写或 AI 批改都算）。
+    pub graded: u32,
+}
+
 /// 一次阅读的记录。
 #[derive(Debug, Clone)]
 pub struct ReadingLog {

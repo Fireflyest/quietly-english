@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::model::{
-    Book, BookProgress,     DailyStats, DictReport, Example, ImportPlan, ImportReport, Quiz, Rating, ReviewStats,
-    ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
+    Book, BookProgress,     DailyStats, DictReport, Example, ImportPlan, ImportReport, PracticeSetStat, Quiz, Rating,
+    ReviewStats, ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
     TranslationAttempt, TranslationExercise,
 };
 
@@ -161,6 +161,30 @@ pub trait Store {
         provider: Option<&str>,
     ) -> Result<i64>;
     fn translation_attempts(&self, exercise_id: i64) -> Result<Vec<TranslationAttempt>>;
+    /// 按提交 id 取一次作答（AI 批改要用它找回题目）。
+    fn translation_attempt(&self, id: i64) -> Result<Option<TranslationAttempt>>;
+    /// 同一段原文的练习（网页导入按原文去重）。
+    fn translation_exercise_by_source(&self, source: &str) -> Result<Option<TranslationExercise>>;
+
+    // ---- 练习合集 ----
+    /// 取（或建）一个练习合集。给了 `url` 按来源页找，没给按名字找。
+    fn ensure_practice_set(&mut self, name: &str, kind: &str, url: Option<&str>) -> Result<i64>;
+    /// 把一道题挂进合集。
+    fn assign_exercise_set(&mut self, exercise_id: i64, set_id: i64) -> Result<()>;
+    /// 合集列表 + 题数 / 已作答 / 已批改；没有合集的旧题算一行「未分组」。
+    fn practice_sets_with_stats(&self) -> Result<Vec<PracticeSetStat>>;
+    /// 这篇文章导过没有（每日发现用）。
+    fn practice_article_imported(&self, url: &str) -> Result<bool>;
+    /// 记下一篇文章已导入，下次每日发现跳过它。
+    fn record_practice_article(&mut self, url: &str) -> Result<()>;
+    /// 把批改结果（分数、反馈、服务名）写回一次作答；id 不存在时报错。
+    fn update_translation_attempt_grade(
+        &mut self,
+        id: i64,
+        score: u32,
+        feedback: &str,
+        provider: &str,
+    ) -> Result<()>;
 
     // ---- 设置 ----
     fn setting(&self, key: &str) -> Result<Option<String>>;

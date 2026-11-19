@@ -109,6 +109,9 @@ pub struct App {
     study_fade_started: Option<Instant>,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
+    /// `/practice <url>` 后台导入翻译练习的结果通道。
+    practice_fetch:
+        Option<std::sync::mpsc::Receiver<Result<crate::practice::ImportReport, String>>>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落, 段落结果)`。
     pub(crate) translation_fetch: Option<(
         i64,
@@ -168,6 +171,7 @@ impl App {
             reading_progress_tick: Instant::now(),
             study_fade_started: None,
             news_fetch: None,
+            practice_fetch: None,
             translation_fetch: None,
             db_path: None,
         };
@@ -256,6 +260,173 @@ impl App {
         }
     }
 
+    /// `/practice`：不带参数（或 `list`）列合集；`daily` 立刻跑一轮每日发现；
+    /// 其余当 URL，后台导入。
+    fn practice_command(&mut self, arg: &str) -> Result<()> {
+        let arg = arg.trim();
+        if arg.is_empty() || arg.eq_ignore_ascii_case("list") {
+            return self.show_practice_list();
+        }
+        if arg.eq_ignore_ascii_case("daily") {
+            if self.practice_fetch.is_some() {
+                self.note("already importing · one moment");
+                return Ok(());
+            }
+            return self.spawn_practice_daily();
+        }
+        self.import_practice(arg)
+    }
+
+    /// 题目合集一览：每行一个合集，题数 / 已作答 / 已批改。
+    fn show_practice_list(&mut self) -> Result<()> {
+        let sets = self.store.practice_sets_with_stats()?;
+        if sets.is_empty() {
+            self.note(
+                "no exercises yet · /practice <中文网页 url> 出题 · translate-practice list",
+            );
+            return Ok(());
+        }
+        let mut view = ToolView::new("practice")
+            .accent(Accent::Note)
+            .result(format!("{} collections", sets.len()));
+        for stat in &sets {
+            let mut line = format!("{} exercises", stat.exercises);
+            if stat.submitted > 0 {
+                line.push_str(&format!(" · {} submitted", stat.submitted));
+            }
+            if stat.graded > 0 {
+                line.push_str(&format!(" · {} graded", stat.graded));
+            }
+            if let Some(url) = &stat.url {
+                line.push_str(&format!(" · {url}"));
+            }
+            view = view.kv(&stat.name, &line);
+        }
+        self.push(Message::tool(
+            view.muted("translate-practice from <url> 导新题 · history <id> 做题"),
+        ));
+        Ok(())
+    }
+
+    /// 每天第一次启动时自动按来源发现新文章、导入练习（和新闻抓取同款）。
+    pub fn enable_daily_practice(&mut self, db_path: std::path::PathBuf) -> Result<()> {
+        self.db_path = Some(db_path);
+        let today = qe_core::time::format_day(qe_core::time::today());
+        if self
+            .store
+            .setting("practice_fetched_on")?
+            .as_deref()
+            == Some(today.as_str())
+        {
+            return Ok(());
+        }
+        self.spawn_practice_daily()
+    }
+
+    /// 后台跑一轮每日发现；结果并进 `/practice` 的结果通道。
+    fn spawn_practice_daily(&mut self) -> Result<()> {
+        let Some(db) = self.db_path.clone() else {
+            self.note("daily practice is only wired up in the TUI binary");
+            return Ok(());
+        };
+        if self.practice_fetch.is_some() {
+            self.note("already importing · one moment");
+            return Ok(());
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome =
+                crate::practice::daily_import_at(&db).map_err(|err| format!("{err:#}"));
+            if outcome.is_ok() {
+                // 记住今天跑过了（同新闻的 news_fetched_on）；跑完再记，
+                // 半途挂了明天还会自动重试。
+                if let Ok(store) = qe_store::SqliteStore::open_at(&db) {
+                    let today = qe_core::time::format_day(qe_core::time::today());
+                    let _ = store.set_setting("practice_fetched_on", &today);
+                }
+            }
+            let _ = sender.send(outcome);
+        });
+        self.practice_fetch = Some(receiver);
+        self.note("checking practice sources in the background …");
+        Ok(())
+    }
+
+    /// `/practice <url>`：后台抓中文网页、按段建题，界面不阻塞。
+    fn import_practice(&mut self, url: &str) -> Result<()> {
+        if self.practice_fetch.is_some() {
+            self.note("already importing · one moment");
+            return Ok(());
+        }
+        let url = url.trim().to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            self.note("usage: /practice <中文网页 url>");
+            return Ok(());
+        }
+        // 先验模型 key：没有它出不了参考译文，抓完网页也是白抓。
+        if let Err(err) = crate::translator::ai_settings() {
+            self.note(format!("practice needs a model key · {err:#}"));
+            return Ok(());
+        }
+        let Some(db) = self.db_path.clone() else {
+            self.note("practice import is only wired up in the TUI binary");
+            return Ok(());
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome =
+                crate::practice::import_at(&db, &url).map_err(|err| format!("{err:#}"));
+            let _ = sender.send(outcome);
+        });
+        self.practice_fetch = Some(receiver);
+        self.note("importing exercises from the page in the background …");
+        Ok(())
+    }
+
+    /// 导入线程有结果了就报到对话里；每帧调一次。
+    fn poll_practice(&mut self) {
+        let Some(receiver) = self.practice_fetch.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.practice_fetch = None;
+                if report.created > 0 {
+                    let ids: Vec<String> = report.ids.iter().map(|id| format!("#{id}")).collect();
+                    let mut view = ToolView::new("practice")
+                        .accent(Accent::Note)
+                        .result(report.summary())
+                        .kv("new", ids.join(" "));
+                    for note in &report.notes {
+                        view = view.kv("·", note);
+                    }
+                    self.push(Message::tool(
+                        view.muted("translate-practice history <id> 看题目 · submit 作答"),
+                    ));
+                } else if report.notes.is_empty() {
+                    self.note(format!("practice: nothing new · {}", report.summary()));
+                } else {
+                    // 没有新题但有话说（来源没配、列表页抓不开……）。
+                    let mut view = ToolView::new("practice")
+                        .accent(Accent::Note)
+                        .result(report.summary());
+                    for note in &report.notes {
+                        view = view.kv("·", note);
+                    }
+                    self.push(Message::tool(view));
+                }
+            }
+            Ok(Err(error)) => {
+                self.practice_fetch = None;
+                self.note(format!("practice import failed · {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.practice_fetch = None;
+            }
+        }
+    }
+
     /// Main loop. Polls at 120ms so resizes and mouse drags feel responsive.
     pub fn run(mut self, terminal: &mut TerminalSession) -> Result<()> {
         while !self.quit {
@@ -326,6 +497,8 @@ impl App {
 
             // 后台抓取跑在独立线程里，这里只收结果。
             self.poll_news_fetch();
+            // 网页导入翻译练习也一样：建完题再报，界面不卡。
+            self.poll_practice();
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
             if let Some(started) = self.study_fade_started {
@@ -1140,6 +1313,7 @@ impl App {
             Command::Texts => self.list_texts(),
             Command::Library => self.list_library(),
             Command::News => self.fetch_news_now(),
+            Command::Practice(arg) => self.practice_command(&arg),
             Command::Mode(arg) => self.set_reading_mode(&arg),
             Command::Mark(word) => self.mark_word(&word),
             Command::Words => self.list_reading_words(),
@@ -3618,6 +3792,59 @@ mod tests {
         assert!(
             app.store.setting("news_fetched_on").unwrap().is_none(),
             "a failure does not mark the day as done"
+        );
+    }
+
+    #[test]
+    fn practice_without_args_says_there_are_none_or_lists_collections() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Practice(String::new())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("no exercises yet")
+            )),
+            "空库先说没有题，并给出出题入口"
+        );
+
+        // 手动建一组再列：走 practice 面板，名字和题数都在。
+        let set = app
+            .store
+            .ensure_practice_set("测试文章", "web", Some("https://example.cn/a"))
+            .unwrap();
+        let id = app
+            .store
+            .create_translation_exercise(
+                "测试的一道题，长度足够长可以出。",
+                "EN test",
+                "zh-en",
+                "web:https://example.cn/a",
+                None,
+            )
+            .unwrap();
+        app.store.assign_exercise_set(id, set).unwrap();
+
+        app.execute(Command::Practice("list".into())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.name == "practice"
+            )),
+            "/practice list 渲染合集面板"
+        );
+    }
+
+    #[test]
+    fn practice_without_a_url_or_subcommand_spells_out_usage() {
+        let Harness { mut app, _dir } = harness();
+        // 不是 URL 也不是子命令的入参按 URL 处理，最终给出用法提示。
+        app.execute(Command::Practice("not-a-url".into())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("usage: /practice")
+            )),
+            "坏入参给用法"
         );
     }
 

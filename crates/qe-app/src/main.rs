@@ -8,9 +8,11 @@ mod command;
 mod editor;
 mod epub;
 mod fetch;
+mod grade;
 mod guardian;
 mod html;
 mod news;
+mod practice;
 mod reader;
 mod session;
 mod ted;
@@ -74,15 +76,22 @@ fn run() -> Result<()> {
         None => SqliteStore::open_default()?,
     };
 
+    // 模型清单落在数据目录 models.json：启动时读一次（缺了就写内置默认）。
+    // 以后换型号、换端点、调顺序都改这个文件，不用改代码。
+    if let Err(err) = qe_store::models::load() {
+        eprintln!("quietly: {err:#}");
+    }
+
     match command.as_deref() {
         None => {
             cli::install_panic_hook();
             let mut terminal = cli::TerminalSession::new()?;
             let db_path = store.path().to_path_buf();
             let mut app = app::App::new(Box::new(store))?;
-            // 每天第一次打开时抓一批双语新闻当阅读材料；抓取在后台线程里跑，
-            // 界面不阻塞，失败只提示一次。
-            app.enable_daily_news(db_path)?;
+            // 每天第一次打开时抓一批双语新闻当阅读材料、按来源发现新练习；
+            // 都在后台线程里跑，界面不阻塞，失败只提示一次。
+            app.enable_daily_news(db_path.clone())?;
+            app.enable_daily_practice(db_path)?;
             app.run(&mut terminal)
         }
         Some("db") => {
@@ -535,7 +544,7 @@ fn run() -> Result<()> {
                 text.id,
                 index,
                 &translation.text,
-                translation.provider,
+                &translation.provider,
             )?;
             println!("  {}", translation.text);
             println!("({})", translation.provider);
@@ -716,6 +725,9 @@ fn run_translation_practice(store: &mut SqliteStore, args: &[String]) -> Result<
                 "manual",
                 difficulty,
             )?;
+            // 手动题都进固定合集，`list` 里不落单。
+            let manual = store.ensure_practice_set("手动出题", "manual", None)?;
+            store.assign_exercise_set(id, manual)?;
             println!("translation exercise #{id}");
             println!("source: {source}");
             Ok(())
@@ -739,14 +751,88 @@ fn run_translation_practice(store: &mut SqliteStore, args: &[String]) -> Result<
                 .position(|arg| arg == "--feedback")
                 .and_then(|index| args.get(index + 1))
                 .map(String::as_str);
-            let attempt = store.record_translation_attempt(
-                id,
-                answer,
-                score,
-                feedback,
-                Some("manual"),
-            )?;
+            // `--ai` 先让 Gemini 批改；`--score` / `--feedback` 是人写的，
+            // 显式给的永远压过 AI 结果。
+            let graded = if args.iter().any(|arg| arg == "--ai") {
+                let exercise = store
+                    .translation_exercise(id)?
+                    .with_context(|| format!("翻译练习不存在: {id}"))?;
+                let grade = grade::grade(
+                    &exercise.source,
+                    &exercise.reference,
+                    &exercise.direction,
+                    answer,
+                )?;
+                println!("AI grade · score {}", grade.score);
+                println!("{}", grade.feedback);
+                Some(grade)
+            } else {
+                None
+            };
+            let score = score.or_else(|| graded.as_ref().map(|grade| grade.score));
+            let ai_feedback: Option<String> = graded.as_ref().map(|grade| grade.feedback.clone());
+            let feedback = feedback.or(ai_feedback.as_deref());
+            let provider = Some(graded.as_ref().map_or("manual", |grade| grade.provider.as_str()));
+            let attempt = store.record_translation_attempt(id, answer, score, feedback, provider)?;
             println!("translation attempt #{attempt} saved for exercise #{id}");
+            Ok(())
+        }
+        "grade" => {
+            let id = args
+                .get(1)
+                .context("用法：quietly translate-practice grade <提交 id>")?
+                .parse::<i64>()
+                .context("提交 id 必须是数字")?;
+            let Some(attempt) = store.translation_attempt(id)? else {
+                bail!("翻译提交不存在: {id}");
+            };
+            let exercise = store
+                .translation_exercise(attempt.exercise_id)?
+                .with_context(|| format!("翻译练习不存在: {}", attempt.exercise_id))?;
+            let grade = grade::grade(
+                &exercise.source,
+                &exercise.reference,
+                &exercise.direction,
+                &attempt.answer,
+            )?;
+            store.update_translation_attempt_grade(id, grade.score, &grade.feedback, &grade.provider)?;
+            println!("attempt #{id} graded by {}", grade.provider);
+            println!("score: {}", grade.score);
+            println!("feedback: {}", grade.feedback);
+            Ok(())
+        }
+        "list" => {
+            let sets = store.practice_sets_with_stats()?;
+            if sets.is_empty() {
+                println!("（还没有练习 · from <url> 出题，或 create 手动建题）");
+                return Ok(());
+            }
+            for stat in sets {
+                print!(
+                    "{}\n    {} exercises · {} submitted · {} graded",
+                    stat.name, stat.exercises, stat.submitted, stat.graded
+                );
+                if let Some(url) = stat.url {
+                    print!(" · {url}");
+                }
+                println!();
+            }
+            Ok(())
+        }
+        "daily" => {
+            let report = crate::practice::daily_import(store)?;
+            print_report(&report);
+            Ok(())
+        }
+        "from" => {
+            let url = args
+                .get(1)
+                .context("用法：quietly translate-practice from <中文网页 URL>")?;
+            let report = crate::practice::import(store, url)?;
+            print_report(&report);
+            if report.created == 0 && report.notes.is_empty() {
+                println!("（没有新题：检查页面是否为中文正文，或这些段落已经导过）");
+            }
             Ok(())
         }
         "history" => {
@@ -778,11 +864,27 @@ fn run_translation_practice(store: &mut SqliteStore, args: &[String]) -> Result<
             Ok(())
         }
         _ => bail!(
-            "用法：translate-practice create|submit|history\n\
+            "用法：translate-practice create|from|list|daily|submit|grade|history\n\
              create <原文> --reference <参考译文>\n\
-             submit <id> <答案> [--score N] [--feedback 文本]\n\
+             from <中文网页 url>   按段出题，AI 生成英文参考\n\
+             list                  合集一览（题数/作答/批改）\n\
+             daily                 按 practice_sources.json 发现新文章并导入\n\
+             submit <id> <答案> [--score N] [--feedback 文本] [--ai]\n\
+             grade <提交 id>   用 AI 批改一次已提交的答案\n\
              history <id>"
         ),
+    }
+}
+
+/// 一次导入/每日发现的结果：总览 + 新题 id + 逐条说明。
+fn print_report(report: &crate::practice::ImportReport) {
+    println!("{}", report.summary());
+    if !report.ids.is_empty() {
+        let ids: Vec<String> = report.ids.iter().map(|id| format!("#{id}")).collect();
+        println!("  new: {}", ids.join(" "));
+    }
+    for note in &report.notes {
+        println!("  note: {note}");
     }
 }
 
@@ -804,7 +906,11 @@ USAGE:
     quietly news                   从 TED / BBC / 新华网 / Guardian 长读 / Aeon 各抓一批阅读材料
     quietly translate [<标题>] [--para N]  按段机翻（默认第一段还没译文的），结果落库缓存
     quietly translate-practice create <原文> --reference <参考译文>
-    quietly translate-practice submit <练习 id> <答案> [--score N] [--feedback 文本]
+    quietly translate-practice from <中文网页 url>  按段出题（AI 生成英文参考）
+    quietly translate-practice list   合集一览（题数 / 作答 / 批改）
+    quietly translate-practice daily  按 practice_sources.json 发现新文章并导入
+    quietly translate-practice submit <练习 id> <答案> [--score N] [--feedback 文本] [--ai]
+    quietly translate-practice grade <提交 id>  AI 批改已提交的答案（分数+中文反馈）
     quietly translate-practice history <练习 id>  查看翻译提交历史
     quietly drop <text>           删除一篇文本及其进度、标记、题目
     quietly quiz <text> <file>    往某篇文本导入题目

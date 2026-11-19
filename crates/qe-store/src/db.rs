@@ -9,8 +9,8 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
     Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
-    Phase, Quiz, Rating, ReadingLog, ReadingStats, ReviewStats, SessionLog, SrsCard, StudyCard,
-    TranslationAttempt, TranslationExercise, Word,
+    Phase, PracticeSetStat, Quiz, Rating, ReadingLog, ReadingStats, ReviewStats, SessionLog,
+    SrsCard, StudyCard, TranslationAttempt, TranslationExercise, Word,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -264,6 +264,25 @@ CREATE INDEX IF NOT EXISTS idx_translation_attempts_exercise
     ON translation_attempts(exercise_id, id);
 "#;
 
+/// 练习合集（题目分组，类似阅读的 books）+ 每日发现的文章 URL 去重表。
+/// `set_id` 用 ALTER 补列：老库里的旧题是 NULL，列表里算「未分组」。
+const SCHEMA_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS practice_sets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'manual',
+    url         TEXT,
+    created_at  TEXT NOT NULL
+);
+
+ALTER TABLE translation_exercises ADD COLUMN set_id INTEGER;
+
+CREATE TABLE IF NOT EXISTS practice_articles (
+    url         TEXT PRIMARY KEY,
+    imported_at TEXT NOT NULL
+);
+"#;
+
 pub struct SqliteStore {
     conn: Connection,
     path: PathBuf,
@@ -421,6 +440,11 @@ impl SqliteStore {
         if version < 10 {
             self.conn.execute_batch(SCHEMA_V10)?;
             self.conn.execute_batch("PRAGMA user_version = 10")?;
+        }
+        if version < 11 {
+            // 练习合集 + 每日导入的文章去重；`ALTER` 补列只在这一档执行一次。
+            self.conn.execute_batch(SCHEMA_V11)?;
+            self.conn.execute_batch("PRAGMA user_version = 11")?;
         }
         Ok(())
     }
@@ -1167,6 +1191,34 @@ fn overdue_seconds(before: Option<&SrsCard>, now: DateTime<Utc>) -> i64 {
         .map(|card| card.interval_days as i64 * 86_400)
         .unwrap_or(0);
     (elapsed - scheduled).max(0)
+}
+
+/// 一行 `translation_exercises` 查询结果 → [`TranslationExercise`]。
+/// 按 id 和按原文取共用这一处，免得两份字段顺序各自漂移。
+fn exercise_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranslationExercise> {
+    Ok(TranslationExercise {
+        id: row.get(0)?,
+        source: row.get(1)?,
+        reference: row.get(2)?,
+        direction: row.get(3)?,
+        source_type: row.get(4)?,
+        difficulty: row.get(5)?,
+    })
+}
+
+/// 一行 `translation_attempts` 查询结果 → [`TranslationAttempt`]。
+/// 单取一条和列全部共用这一处，免得两份字段顺序各自漂移。
+fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranslationAttempt> {
+    let created: String = row.get(6)?;
+    Ok(TranslationAttempt {
+        id: row.get(0)?,
+        exercise_id: row.get(1)?,
+        answer: row.get(2)?,
+        score: row.get::<_, Option<i64>>(3)?.map(|value| value as u32),
+        feedback: row.get(4)?,
+        provider: row.get(5)?,
+        created_at: time::parse_rfc(&created).unwrap_or_else(Utc::now),
+    })
 }
 
 impl Store for SqliteStore {
@@ -2134,19 +2186,137 @@ impl Store for SqliteStore {
                 "SELECT id, source, reference, direction, source_type, difficulty
                  FROM translation_exercises WHERE id = ?1",
                 [id],
-                |row| {
-                    Ok(TranslationExercise {
-                        id: row.get(0)?,
-                        source: row.get(1)?,
-                        reference: row.get(2)?,
-                        direction: row.get(3)?,
-                        source_type: row.get(4)?,
-                        difficulty: row.get(5)?,
-                    })
-                },
+                exercise_from_row,
             )
             .optional()?;
         Ok(exercise)
+    }
+
+    fn translation_exercise_by_source(&self, source: &str) -> Result<Option<TranslationExercise>> {
+        let exercise = self
+            .conn
+            .query_row(
+                "SELECT id, source, reference, direction, source_type, difficulty
+                 FROM translation_exercises WHERE source = ?1",
+                [source],
+                exercise_from_row,
+            )
+            .optional()?;
+        Ok(exercise)
+    }
+
+    fn ensure_practice_set(&mut self, name: &str, kind: &str, url: Option<&str>) -> Result<i64> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "合集名不能为空");
+        // 给了来源页就按页找（标题可能变，URL 不变）；没给按名字找（手动出题的固定合集）。
+        let existing = match url {
+            Some(url) => self
+                .conn
+                .query_row("SELECT id FROM practice_sets WHERE url = ?1", [url], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?,
+            None => self
+                .conn
+                .query_row(
+                    "SELECT id FROM practice_sets WHERE url IS NULL AND name = ?1",
+                    [name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?,
+        };
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        // 后台线程和主界面可能同时建：UNIQUE 撞了就取别人插好的那行。
+        self.conn.execute(
+            "INSERT INTO practice_sets (name, kind, url, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![name, kind, url, Utc::now().to_rfc3339()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn assign_exercise_set(&mut self, exercise_id: i64, set_id: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE translation_exercises SET set_id = ?2 WHERE id = ?1",
+            params![exercise_id, set_id],
+        )?;
+        anyhow::ensure!(changed > 0, "翻译练习不存在: {exercise_id}");
+        Ok(())
+    }
+
+    fn practice_sets_with_stats(&self) -> Result<Vec<PracticeSetStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.name, s.kind, s.url,
+                    (SELECT COUNT(*) FROM translation_exercises e WHERE e.set_id = s.id),
+                    (SELECT COUNT(DISTINCT a.exercise_id)
+                       FROM translation_attempts a
+                       JOIN translation_exercises e2 ON e2.id = a.exercise_id
+                      WHERE e2.set_id = s.id),
+                    (SELECT COUNT(DISTINCT a.exercise_id)
+                       FROM translation_attempts a
+                       JOIN translation_exercises e3 ON e3.id = a.exercise_id
+                      WHERE e3.set_id = s.id AND a.score IS NOT NULL)
+             FROM practice_sets s
+             ORDER BY s.id ASC",
+        )?;
+        let mut sets: Vec<PracticeSetStat> = stmt
+            .query_map([], |row| {
+                Ok(PracticeSetStat {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    url: row.get(3)?,
+                    exercises: row.get::<_, i64>(4)?.max(0) as u32,
+                    submitted: row.get::<_, i64>(5)?.max(0) as u32,
+                    graded: row.get::<_, i64>(6)?.max(0) as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // 迁移前的老题没有合集：凑一行「未分组」，列表里不丢东西。
+        let (orphan, orphan_submitted, orphan_graded): (i64, i64, i64) = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM translation_exercises WHERE set_id IS NULL),
+                (SELECT COUNT(DISTINCT a.exercise_id)
+                   FROM translation_attempts a
+                   JOIN translation_exercises e ON e.id = a.exercise_id
+                  WHERE e.set_id IS NULL),
+                (SELECT COUNT(DISTINCT a.exercise_id)
+                   FROM translation_attempts a
+                   JOIN translation_exercises e ON e.id = a.exercise_id
+                  WHERE e.set_id IS NULL AND a.score IS NOT NULL)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if orphan > 0 {
+            sets.push(PracticeSetStat {
+                id: 0,
+                name: "未分组".to_string(),
+                kind: "legacy".to_string(),
+                url: None,
+                exercises: orphan as u32,
+                submitted: orphan_submitted as u32,
+                graded: orphan_graded as u32,
+            });
+        }
+        Ok(sets)
+    }
+
+    fn practice_article_imported(&self, url: &str) -> Result<bool> {
+        let seen: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM practice_articles WHERE url = ?1)",
+            [url],
+            |row| row.get(0),
+        )?;
+        Ok(seen)
+    }
+
+    fn record_practice_article(&mut self, url: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO practice_articles (url, imported_at) VALUES (?1, ?2)",
+            params![url, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     fn record_translation_attempt(
@@ -2185,19 +2355,33 @@ impl Store for SqliteStore {
             "SELECT id, exercise_id, answer, score, feedback, provider, created_at
              FROM translation_attempts WHERE exercise_id = ?1 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map([exercise_id], |row| {
-            let created: String = row.get(6)?;
-            Ok(TranslationAttempt {
-                id: row.get(0)?,
-                exercise_id: row.get(1)?,
-                answer: row.get(2)?,
-                score: row.get::<_, Option<i64>>(3)?.map(|value| value as u32),
-                feedback: row.get(4)?,
-                provider: row.get(5)?,
-                created_at: time::parse_rfc(&created).unwrap_or_else(Utc::now),
-            })
-        })?;
+        let rows = stmt.query_map([exercise_id], attempt_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn translation_attempt(&self, id: i64) -> Result<Option<TranslationAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, exercise_id, answer, score, feedback, provider, created_at
+             FROM translation_attempts WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], attempt_from_row)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    fn update_translation_attempt_grade(
+        &mut self,
+        id: i64,
+        score: u32,
+        feedback: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE translation_attempts SET score = ?2, feedback = ?3, provider = ?4
+             WHERE id = ?1",
+            params![id, score.min(100) as i64, feedback, provider],
+        )?;
+        anyhow::ensure!(changed > 0, "翻译提交不存在: {id}");
+        Ok(())
     }
 
     fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -2750,6 +2934,187 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].score, Some(85));
         assert_eq!(attempts[1].answer, "They came despite the rain.");
+    }
+
+    #[test]
+    fn exercises_are_findable_by_source_for_dedup() {
+        let (mut store, _dir) = temp_store();
+        let id = store
+            .create_translation_exercise(
+                "春眠不觉晓，处处闻啼鸟。",
+                "In spring sleep I miss the dawn, everywhere I hear birds sing.",
+                "zh-en",
+                "web:https://example.cn/poem",
+                None,
+            )
+            .unwrap();
+
+        let found = store
+            .translation_exercise_by_source("春眠不觉晓，处处闻啼鸟。")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.source_type, "web:https://example.cn/poem");
+        assert!(store
+            .translation_exercise_by_source("别的段落。")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_grade_writes_back_to_the_attempt() {
+        let (mut store, _dir) = temp_store();
+        let id = store
+            .create_translation_exercise(
+                "尽管下雨，他们还是来了。",
+                "Although it rained, they still came.",
+                "zh-en",
+                "manual",
+                None,
+            )
+            .unwrap();
+        let attempt = store
+            .record_translation_attempt(id, "They came despite the rain.", None, None, None)
+            .unwrap();
+
+        // 批改前分数是空的，批改后同一条记录带上分数、反馈和服务名。
+        let before = store.translation_attempt(attempt).unwrap().unwrap();
+        assert_eq!(before.score, None);
+        store
+            .update_translation_attempt_grade(attempt, 88, "意思准确，时态更自然", "gemini")
+            .unwrap();
+        let after = store.translation_attempt(attempt).unwrap().unwrap();
+        assert_eq!(after.score, Some(88));
+        assert_eq!(after.feedback.as_deref(), Some("意思准确，时态更自然"));
+        assert_eq!(after.provider.as_deref(), Some("gemini"));
+        assert_eq!(after.answer, "They came despite the rain.");
+
+        // 不存在的提交要明确报错，不能静默成功。
+        assert!(store
+            .update_translation_attempt_grade(999, 50, "x", "gemini")
+            .is_err());
+        assert!(store.translation_attempt(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_imported_article_url_is_remembered_for_daily_discovery() {
+        let (mut store, _dir) = temp_store();
+        assert!(!store.practice_article_imported("https://example.cn/a").unwrap());
+        store.record_practice_article("https://example.cn/a").unwrap();
+        store.record_practice_article("https://example.cn/a").unwrap(); // 重复记不报错
+        assert!(store.practice_article_imported("https://example.cn/a").unwrap());
+        assert!(!store.practice_article_imported("https://example.cn/b").unwrap());
+    }
+
+    #[test]
+    fn practice_sets_group_exercises_and_report_stats() {
+        let (mut store, _dir) = temp_store();
+        let set = store
+            .ensure_practice_set("某文章标题", "web", Some("https://example.cn/a"))
+            .unwrap();
+        let same = store
+            .ensure_practice_set("标题改了也不要紧", "web", Some("https://example.cn/a"))
+            .unwrap();
+        assert_eq!(set, same, "同一篇来源页复用同一个合集");
+
+        let a = store
+            .create_translation_exercise(
+                "第一段中文正文，长度足够长可以出题。",
+                "EN one",
+                "zh-en",
+                "web:https://example.cn/a",
+                None,
+            )
+            .unwrap();
+        store.assign_exercise_set(a, set).unwrap();
+        let b = store
+            .create_translation_exercise(
+                "第二段中文正文，同样足够长可以出题。",
+                "EN two",
+                "zh-en",
+                "web:https://example.cn/a",
+                None,
+            )
+            .unwrap();
+        store.assign_exercise_set(b, set).unwrap();
+
+        let manual = store.ensure_practice_set("手动出题", "manual", None).unwrap();
+        let c = store
+            .create_translation_exercise(
+                "手动的一道题，长度也足够长可以出。",
+                "EN three",
+                "zh-en",
+                "manual",
+                None,
+            )
+            .unwrap();
+        store.assign_exercise_set(c, manual).unwrap();
+        assert_eq!(
+            store.ensure_practice_set("手动出题", "manual", None).unwrap(),
+            manual,
+            "没给 url 的合集按名字复用"
+        );
+
+        // 作答与批改各算各的：两次提交同一题，submitted 还是 1。
+        store
+            .record_translation_attempt(a, "answer", Some(90), None, Some("gemini"))
+            .unwrap();
+        store
+            .record_translation_attempt(a, "answer again", None, None, None)
+            .unwrap();
+        store
+            .record_translation_attempt(c, "answer", None, None, None)
+            .unwrap();
+
+        let stats = store.practice_sets_with_stats().unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].name, "某文章标题");
+        assert_eq!(stats[0].exercises, 2);
+        assert_eq!(stats[0].submitted, 1, "按题算，不按提交次数");
+        assert_eq!(stats[0].graded, 1, "带分数的才算已批改");
+        assert_eq!(stats[1].name, "手动出题");
+        assert_eq!(stats[1].exercises, 1);
+        assert_eq!(stats[1].submitted, 1);
+        assert_eq!(stats[1].graded, 0);
+
+        // 不存在的题挂不上。
+        assert!(store.assign_exercise_set(999, set).is_err());
+    }
+
+    #[test]
+    fn migration_v11_adds_practice_sets_and_set_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v10.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V10).unwrap();
+            conn.execute_batch(
+                "INSERT INTO translation_exercises
+                     (source, reference, direction, source_type, created_at)
+                 VALUES ('老题原文，迁移前就有了。', 'legacy ref', 'zh-en', 'manual',
+                         '2026-01-01T00:00:00+00:00');
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+        }
+
+        let mut store = SqliteStore::open_at(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+
+        // 旧题还在，没有合集 → 列表里凑成「未分组」一行。
+        let sets = store.practice_sets_with_stats().unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].kind, "legacy");
+        assert_eq!(sets[0].exercises, 1);
+        // 新表可用。
+        let id = store
+            .ensure_practice_set("新合集", "web", Some("https://example.cn/x"))
+            .unwrap();
+        assert!(id > 0);
     }
 
     #[test]

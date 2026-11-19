@@ -459,7 +459,7 @@ impl App {
                     text_id,
                     paragraph,
                     &translation.text,
-                    translation.provider,
+                    &translation.provider,
                 );
                 if let Some(session) = self.reading.as_mut() {
                     if session.text.id == text_id {

@@ -145,10 +145,11 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 高亮，按数字看完整卡片，`/take` 收进词书，然后照常走记忆曲线。双语文本用 `---`
 分隔原文与译文；读后测验的题目必须带出处，导入时无出处的条目会被跳过。
 
-没有译文的文章（新华网、Guardian 长读、Aeon）按 `tab` 会**按段机翻**当前段：配了
-`BAIDU_TRANSLATE_APP_ID` + `BAIDU_TRANSLATE_SECRET_KEY` 就用百度翻译，
-`TENCENT_SECRET_ID` + `TENCENT_SECRET_KEY` 用腾讯云翻译（两家都国内直连），否则退回
-DeepL Free / MyMemory。key 可以在软件里配——`/apikey set gemini <key>`——存到数据目录的
+没有译文的文章（新华网、Guardian 长读、Aeon）按 `tab` 会**按段机翻**当前段：**模型
+优先**——按数据目录 `models.json` 的条目顺序取第一个配了 key 的（默认 Gemini >
+小米 MiMo > DeepSeek，`models.json` 启动时读取、缺了自动写出默认，改文件就改顺序
+和型号），模型一家都没配再用百度（`BAIDU_…`）、腾讯云（`TENCENT_…`），
+否则退回 DeepL Free / MyMemory。key 可以在软件里配——`/apikey set gemini <key>`——存到数据目录的
 `keys.json`（不进 `quietly.db`、不进仓库），没写的字段继续读环境变量，文件里的值优先。
 译文落库缓存，同一段只花一次额度。
 
@@ -178,6 +179,7 @@ DeepL Free / MyMemory。key 可以在软件里配——`/apikey set gemini <key>
 | `/mark [word]` | 标记生词（`/mark all` 标全部） |
 | `/take <n>` | 把当前段第 n 个词收进词书 |
 | `/quiz [file]` | 读后测验 |
+| `/practice [list\|daily\|<url>]` | 合集一览 / 按 `practice_sources.json` **每日自动发现**新文章出题 / 从中文网页按段导入（zh-en，AI 生成英文参考，后台执行） |
 | `/bury` | 把当前卡推迟到明天 |
 | `/undo` | 撤销上一次评分，回到那张卡 |
 | `/quiet` | 低调模式，隐藏顶栏词书名 |
@@ -247,7 +249,7 @@ cargo test                       # 领域、存储、排版、命令解析
 | 模块 | 计划 |
 | --- | --- |
 | 阅读 | `/read <article>`：分级短文，点击生词入词书，长难句拆解 |
-| 翻译 | `translate-practice`：保存题目、答案、评分与历史提交；后续接入 AI 批改，见 [docs/translation.md](docs/translation.md) |
+| 翻译 | `translate-practice`：保存题目、答案、评分与历史提交；AI 批改已接入（`--ai` / `grade`，模型无关入口，选哪家看 `models.json` 顺序），见 [docs/translation.md](docs/translation.md) |
 | 写作 | `/write <topic>`：写作提示、字数统计、句法检查、历史版本对比 |
 
 ## License
