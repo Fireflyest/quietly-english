@@ -602,6 +602,10 @@ pub struct ReadingSession {
     pub opened: u32,
     /// 收进词书几个词。
     pub added: u32,
+    /// 过渡期间已经揭示的段数（`None` = 全部显示）。
+    ///
+    /// 新文章按段落顺序分批加载时由 app 每帧更新，读起来像学习卡的淡入。
+    pub revealed_paragraphs: Option<usize>,
     /// 消息在 `App::messages` 里的位置，用于原地刷新。
     pub message: Option<usize>,
 }
@@ -623,6 +627,7 @@ impl ReadingSession {
             shown: std::collections::HashSet::new(),
             opened: 0,
             added: 0,
+            revealed_paragraphs: None,
             message: None,
         }
     }

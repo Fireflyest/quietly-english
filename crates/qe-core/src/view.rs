@@ -347,6 +347,13 @@ impl ToolView {
             crate::reading::ReadMode::Full => {
                 // 全篇：连续输出，靠终端滚动阅读。段落之间空一行。
                 for (index, paragraph) in text.paragraphs().iter().enumerate() {
+                    // 过渡期间段落按顺序分批出现；`revealed_paragraphs` 是已揭示的段数。
+                    if session
+                        .revealed_paragraphs
+                        .is_some_and(|revealed| index >= revealed)
+                    {
+                        continue;
+                    }
                     // 全篇模式没有「当前段」的独立画面，用一行暗色标记指出
                     // `next` / `goto` 把位置移到哪了，否则这两个键看不出效果。
                     // `Anchor` 让渲染层回报这一行的位置，滚动时据此把当前段带回视野。

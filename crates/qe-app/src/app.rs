@@ -57,7 +57,7 @@ pub struct App {
     pub(crate) messages: Vec<Message>,
     editor: Editor,
     pub(crate) session: Option<StudySession>,
-    status: String,
+    pub(crate) status: String,
     pub(crate) scroll_back: u16,
     quit: bool,
     daily_new_limit: u32,
@@ -107,6 +107,10 @@ pub struct App {
     reading_progress_tick: Instant,
     /// Start time of the short progressive reveal when advancing to a card.
     study_fade_started: Option<Instant>,
+    /// 阅读过渡的起点：新文章的段落按顺序分批加载。
+    pub(crate) reading_fade_started: Option<Instant>,
+    /// 读完一篇后，等空格接上的下一篇标题。
+    pub(crate) pending_next_text: Option<String>,
     /// 后台抓取朗读材料的结果通道；`Some` 表示有任务在跑。
     news_fetch: Option<std::sync::mpsc::Receiver<Result<crate::news::FetchReport, String>>>,
     /// `/practice <url>` 后台导入翻译练习的结果通道。
@@ -170,6 +174,8 @@ impl App {
             prev_anchor: None,
             reading_progress_tick: Instant::now(),
             study_fade_started: None,
+            reading_fade_started: None,
+            pending_next_text: None,
             news_fetch: None,
             practice_fetch: None,
             translation_fetch: None,
@@ -509,6 +515,13 @@ impl App {
                     let _ = self.render_card();
                 }
             }
+            // 阅读过渡同理：每帧重画推进「段落按顺序分批出现」，出齐后收掉。
+            if let Some(started) = self.reading_fade_started {
+                if started.elapsed() >= Duration::from_millis(480) {
+                    self.reading_fade_started = None;
+                }
+                let _ = self.render_reading();
+            }
             if self.reading.is_some()
                 && self.reading_progress_tick.elapsed() >= Duration::from_secs(1)
             {
@@ -606,6 +619,18 @@ impl App {
         self.wake_cursor();
         // Any keypress cancels a pending "press esc again".
         let was_confirming = self.confirm_exit;
+
+        // 读完一篇后的总结在等空格：空格接下一篇，按了别的键就作废——
+        // 之后再按空格不该被一个陈旧状态拽进别的文章。
+        if self.pending_next_text.is_some() {
+            match key.code {
+                KeyCode::Char(' ') if self.editor.is_empty() && self.session.is_none() => {
+                    let next = self.pending_next_text.take().expect("checked above");
+                    return self.start_reading(&next);
+                }
+                _ => self.pending_next_text = None,
+            }
+        }
 
         let suggestion_count = self.suggestions_for(&self.editor.text()).0.len();
 
@@ -1295,6 +1320,8 @@ impl App {
     // ---------------------------------------------------------------- commands
 
     fn execute(&mut self, command: Command) -> Result<()> {
+        // 任何命令都作废「总结等空格接下一篇」的状态。
+        self.pending_next_text = None;
         match command {
             Command::Help => self.help(),
             Command::Db => self.show_db(),
@@ -3613,13 +3640,33 @@ mod tests {
             "a fresh book starts at the first chapter"
         );
 
-        // 读完第一篇（两段）。
+        // 读完第一篇（两段）：出总结停一下，等空格再接下一篇。
         app.reading_next().unwrap();
         app.reading_next().unwrap();
+        assert!(
+            app.reading.is_none() && app.pending_next_text.as_deref() == Some("Chapter Two"),
+            "finishing a chapter parks on the summary for space"
+        );
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.badge.as_deref() == Some("done")
+            )),
+            "阅读总结要显示出来"
+        );
+        assert!(app.status.contains("space"), "状态栏提示空格接下一篇");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
         assert_eq!(
             app.reading.as_ref().map(|s| s.text.title.as_str()),
             Some("Chapter Two"),
-            "finishing a chapter continues with the next one"
+            "finishing a chapter continues with the next one after space"
+        );
+        assert_eq!(
+            app.reading.as_ref().unwrap().paragraph,
+            0,
+            "下一篇从第一段开始"
         );
     }
 
@@ -3636,6 +3683,9 @@ mod tests {
             .set_translation_shown(0, true);
         app.reading_next().unwrap();
         app.reading_next().unwrap();
+        // 总结等空格，按一下才进下一篇。
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
 
         assert_eq!(
             app.reading.as_ref().map(|session| session.text.title.as_str()),
@@ -3677,6 +3727,52 @@ mod tests {
             "a loose text stays open instead of jumping elsewhere"
         );
         assert_eq!(app.reading.as_ref().unwrap().paragraph, 1);
+        assert!(
+            app.pending_next_text.is_none(),
+            "没有下一篇可接，不该等空格"
+        );
+    }
+
+    #[test]
+    fn any_other_key_cancels_waiting_for_the_next_article() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+
+        app.execute(Command::Read("animal-farm".into())).unwrap();
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        assert!(app.pending_next_text.is_some(), "总结在等空格");
+
+        // 打了别的命令就作废：之后的空格不该把人拽进下一篇。
+        app.execute(Command::Books).unwrap();
+        assert!(app.pending_next_text.is_none());
+        assert!(app.reading.is_none(), "总结阶段没有正在读的文章");
+    }
+
+    #[test]
+    fn a_fresh_article_stages_its_paragraphs_in_order_from_the_first() {
+        let Harness { mut app, _dir } = harness();
+        let path = _dir.path().join("long.txt");
+        let body: String = (1..=6)
+            .map(|i| format!("Paragraph number {i} holds enough words to read slowly."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        std::fs::write(&path, body).unwrap();
+
+        app.execute(Command::Read(path.to_string_lossy().to_string()))
+            .unwrap();
+        assert!(
+            app.reading_fade_started.is_some(),
+            "从头开的新文章走过渡"
+        );
+        assert_eq!(
+            app.reading.as_ref().unwrap().revealed_paragraphs,
+            Some(1),
+            "第一档只露出第一段，视角停在文章开头"
+        );
+        assert_eq!(app.reading.as_ref().unwrap().paragraph, 0);
+        assert!(app.reveal_anchor, "视野请求对准第一段的锚点");
     }
 
     #[test]

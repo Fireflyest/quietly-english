@@ -3,6 +3,8 @@
 //! 这里只做「读文本该有的动作」：翻页、选词、标记、切模式、收词、出题。
 //! 查词、加词书、写日志都调已有的 `Store` 方法，不重复实现。
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use qe_core::model::{Quiz, ReadingLog, Word};
 use qe_core::reading::{ReadMode, ReadingSession, Text};use qe_core::view::{Accent, Candidate, Message, ToolView};
@@ -11,6 +13,17 @@ use crate::app::App;
 
 /// 精读模式下最多列出几个候选词（对应数字键 1-9）。
 pub const MAX_CANDIDATES: usize = 9;
+
+/// 阅读过渡的分档：把全文按顺序分四批揭示，120ms 一档、480ms 出齐。
+///
+/// 不足 4 段的小文不值得分批，直接给全量——`None` 表示全部显示。
+fn staged_paragraphs(total: usize, elapsed: Duration) -> Option<usize> {
+    if total < 4 || elapsed >= Duration::from_millis(480) {
+        return None;
+    }
+    let stage = (elapsed.as_millis() / 120).min(3) as usize;
+    Some((total * (stage + 1) / 4).max(1))
+}
 
 /// 把文本文件读成一篇 `Text`。
 ///
@@ -160,6 +173,14 @@ impl App {
 
     /// 重画阅读卡片（原地替换那条消息）。
     pub fn render_reading(&mut self) -> Result<()> {
+        // 过渡进行中：段落按顺序分批揭示；`None` 表示全部显示。
+        let reveal = self.reading_fade_started.and_then(|started| {
+            let total = self.reading.as_ref()?.total();
+            staged_paragraphs(total, started.elapsed())
+        });
+        if let Some(session) = self.reading.as_mut() {
+            session.revealed_paragraphs = reveal;
+        }
         let Some(session) = self.reading.as_ref() else {
             return Ok(());
         };
@@ -654,6 +675,13 @@ impl App {
         self.store.set_setting("last_text", &session.text.title)?;
         self.reading = Some(session);
         self.reveal_anchor = true;
+        // 过渡：从头读的新文章按段落顺序分四批加载（同学习卡的淡入手感）；
+        // 续读不揭——视角本来就在存档的那一段。
+        self.reading_fade_started = self
+            .reading
+            .as_ref()
+            .filter(|session| session.paragraph == 0 && session.total() >= 4)
+            .map(|_| Instant::now());
         self.render_reading()
     }
 
@@ -691,29 +719,36 @@ impl App {
         Ok(text)
     }
 
-    /// 读完一篇后接着读书里的下一篇；散篇或没有下一篇时返回 `false`。
-    fn advance_within_book(&mut self) -> Result<bool> {
+    /// 读完一篇：先出总结（[`Self::finish_reading`]），把下一篇**存起来等空格**。
+    ///
+    /// `next_title` 在进度存进最后一段时就指向了下一篇（本篇此刻已算读完），
+    /// 所以先算再收尾。散篇或全书读完只出总结，不留空格——没有「下一篇」可接。
+    fn hold_for_next_article(&mut self) -> Result<()> {
         let Some(session) = self.reading.as_ref() else {
-            return Ok(false);
+            return Ok(());
         };
         let Some(book) = session.text.book.clone() else {
-            return Ok(false);
+            return Ok(());
         };
         let current = session.text.title.clone();
         let slug = qe_core::reading::book_slug(&book);
         let progress = self.store.text_book_progress(&slug)?;
         let Some(next) = progress.next_title else {
-            return Ok(false);
+            return Ok(());
         };
-        if next.eq_ignore_ascii_case(&current) {
+        let chained = !next.eq_ignore_ascii_case(&current);
+        self.finish_reading()?;
+        if chained {
+            self.pending_next_text = Some(next);
+            // 状态栏给下一步提示；放在 finish（内部会刷新状态栏）之后。
+            self.status = "space · next article".to_string();
+        } else {
             self.note(format!(
                 "book \"{book}\" finished · {}/{} · /read {slug} re-reads it",
                 progress.finished, progress.total
             ));
-            return Ok(false);
         }
-        self.start_reading(&next)?;
-        Ok(true)
+        Ok(())
     }
 
     /// 切换模式。全篇 ↔ 精读。
@@ -781,9 +816,9 @@ impl App {
             self.note(format!("last paragraph ({last}/{last}) · /read to pick another text"));
             return Ok(());
         }
-        self.note(format!("text finished ({last}/{last})"));
-        self.advance_within_book()?;
-        Ok(())
+        // 到头了：出总结、**停一下**，按空格才接着读下一篇——
+        // 和学习卡「空格前进」同一手感，也给读者看清统计的机会。
+        self.hold_for_next_article()
     }
 
     /// 上一页。
@@ -1247,6 +1282,20 @@ mod tests {
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn the_transition_reveals_paragraphs_in_four_ordered_steps() {
+        // 8 段：四档 2 → 4 → 6 → 8，最后一档出齐后交给 None（全部显示）。
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(0)), Some(2));
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(119)), Some(2));
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(120)), Some(4));
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(240)), Some(6));
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(360)), Some(8));
+        assert_eq!(staged_paragraphs(8, Duration::from_millis(480)), None);
+        assert_eq!(staged_paragraphs(8, Duration::from_secs(5)), None);
+        // 小文不值得分批。
+        assert_eq!(staged_paragraphs(3, Duration::from_millis(0)), None);
     }
 
     #[test]
