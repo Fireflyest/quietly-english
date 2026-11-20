@@ -77,9 +77,12 @@ const MAX_CHARS: usize = 200;
 
 /// CLI 用：直接借已经打开的库导入。
 pub fn import(store: &mut SqliteStore, url: &str) -> Result<ImportReport> {
-    // 先确认模型 key 配了：没有参考译文就没法出题，别等抓完网页才失败。
-    let model = crate::translator::ai_settings()?;
-    import_article(store, url, None, &model)
+    // 先探路：模型整体不通就立刻失败——一次不通就够了，
+    // 不要抓完网页再一段段挨超时。
+    let candidates = crate::translator::ai_candidates()?;
+    crate::translator::ai_generate(&candidates, "Reply with the single word: ok")
+        .context("模型探路失败，先不抓网页")?;
+    import_article(store, url, None, &candidates)
 }
 
 /// 后台线程用：自己开一条连接（和新闻抓取同款），不碰主界面的连接。
@@ -97,7 +100,7 @@ fn import_article(
     store: &mut SqliteStore,
     url: &str,
     set: Option<i64>,
-    model: &crate::translator::AiModel,
+    models: &[crate::translator::AiModel],
 ) -> Result<ImportReport> {
     let raw = crate::fetch::get(url).with_context(|| format!("抓取失败：{url}"))?;
     let paragraphs = article_paragraphs(&raw);
@@ -107,7 +110,7 @@ fn import_article(
         None => store.ensure_practice_set(&page_title(&raw, url), "web", Some(url))?,
     };
     let translator = |text: &str| -> Result<String> {
-        crate::translator::ai_generate(model, &reference_prompt(text))
+        Ok(crate::translator::ai_generate(models, &reference_prompt(text))?.text)
     };
     let report = create_exercises(store, &paragraphs, url, Some(set_id), &translator)?;
     // 导过就记 URL：每日发现不再重复抓这篇（全失败时不记，下轮还能重试）。
@@ -177,8 +180,9 @@ fn create_exercises(
     set_id: Option<i64>,
     translate: &dyn Fn(&str) -> Result<String>,
 ) -> Result<ImportReport> {
-    let mut report = ImportReport::default();
     let source_type = format!("web:{source_url}");
+    let mut report = ImportReport::default();
+    let mut consecutive_failures = 0usize;
     for paragraph in paragraphs {
         if report.created as usize >= LIMIT {
             break;
@@ -190,6 +194,7 @@ fn create_exercises(
         }
         match translate(paragraph) {
             Ok(reference) => {
+                consecutive_failures = 0;
                 let created = store.create_translation_exercise(
                     paragraph,
                     &reference,
@@ -208,8 +213,15 @@ fn create_exercises(
                     Err(_) => report.failed += 1,
                 }
             }
-            // 一段翻不出来不影响后面的：数进 failed，继续下一段。
-            Err(_) => report.failed += 1,
+            // 连续两段翻不出来：网络/模型整体有问题（冷却、断网都是这个形态），
+            // 再一段段试下去只是白等，剩下的段下轮再说。
+            Err(_) => {
+                report.failed += 1;
+                consecutive_failures += 1;
+                if consecutive_failures >= 2 {
+                    break;
+                }
+            }
         }
         // 对模型客气一点，也避免一次把免费额度打满。
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -243,22 +255,44 @@ impl DailySource {
     }
 }
 
-/// 内置默认：一个空 `url` 的示例条目，打开文件就知道格式。
+/// 内置默认来源：实测国内直连、列表页是静态 HTML、正文段落适合出题。
+/// 每天各导 2 篇；想增删换改 `practice_sources.json`（文件存在时**不覆盖**）。
 const DEFAULT_SOURCES: &str = r#"[
   {
-    "name": "示例来源（把 url 换成列表页）",
-    "url": "",
+    "name": "人民网 · 观点",
+    "url": "http://opinion.people.com.cn/",
+    "limit": 2
+  },
+  {
+    "name": "中国政府网 · 要闻",
+    "url": "https://www.gov.cn/",
     "limit": 2
   }
 ]
 "#;
+
+/// 老版本写出的占位条目（只有示例、url 为空）：识别出来换成内置真实来源，
+/// 别让老用户停在「没有可用来源」上。**用户自己改过的文件绝不动。**
+fn is_old_placeholder(sources: &[DailySource]) -> bool {
+    sources.len() == 1
+        && sources[0].url.trim().is_empty()
+        && sources[0].name.contains("示例来源")
+}
+
+/// 真正参与每日发现的来源：url 留空的条目当停用开关，跳过。
+fn active_sources(sources: Vec<DailySource>) -> Vec<DailySource> {
+    sources
+        .into_iter()
+        .filter(|source| !source.url.trim().is_empty())
+        .collect()
+}
 
 /// `practice_sources.json` 的完整路径（与 `keys.json` 同目录）。
 pub fn sources_path() -> PathBuf {
     qe_store::keys::default_dir().join("practice_sources.json")
 }
 
-/// 读每日来源；文件缺失先写出默认（带一条示例）再读。
+/// 读每日来源；文件缺失先写出内置默认（真实来源）再读。
 pub fn load_sources() -> Result<Vec<DailySource>> {
     load_sources_at(&qe_store::keys::default_dir())
 }
@@ -271,18 +305,24 @@ fn load_sources_at(dir: &Path) -> Result<Vec<DailySource>> {
         std::fs::write(&path, DEFAULT_SOURCES)
             .with_context(|| format!("无法写出默认来源清单 {}", path.display()))?;
     }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("无法读取 {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("{} 不是合法 JSON", path.display()))
+    let parse = || -> Result<Vec<DailySource>> {
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("无法读取 {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("{} 不是合法 JSON", path.display()))
+    };
+    let sources = parse()?;
+    if is_old_placeholder(&sources) {
+        std::fs::write(&path, DEFAULT_SOURCES)
+            .with_context(|| format!("无法更新 {}", path.display()))?;
+        return parse();
+    }
+    Ok(sources)
 }
 
 /// 每日自动导入（CLI `translate-practice daily` 也走这里）：
 /// 逐个来源抓列表页 → 找没导过的新文章 → 按段出题，进该来源的合集。
 pub fn daily_import(store: &mut SqliteStore) -> Result<ImportReport> {
-    let sources: Vec<DailySource> = load_sources()?
-        .into_iter()
-        .filter(|source| !source.url.trim().is_empty())
-        .collect();
+    let sources = active_sources(load_sources()?);
     if sources.is_empty() {
         return Ok(ImportReport {
             notes: vec![format!(
@@ -292,8 +332,10 @@ pub fn daily_import(store: &mut SqliteStore) -> Result<ImportReport> {
             ..ImportReport::default()
         });
     }
-    // 没有模型 key 就出不了参考译文，整轮直接失败，别抓半天。
-    let model = crate::translator::ai_settings()?;
+    // 没有模型 key 就出不了参考译文；先探路，模型整体不通就本轮直接失败。
+    let candidates = crate::translator::ai_candidates()?;
+    crate::translator::ai_generate(&candidates, "Reply with the single word: ok")
+        .context("模型探路失败，本轮先跳过")?;
     let mut report = ImportReport::default();
     for source in &sources {
         let listing = match crate::fetch::get(&source.url) {
@@ -308,20 +350,25 @@ pub fn daily_import(store: &mut SqliteStore) -> Result<ImportReport> {
             }
         };
         let mut fresh = 0;
+        // 尝试上限：打不开/没正文的链接别把一轮拖死（失败的不会记库，
+        // 下一轮还会再试它们，所以这里只是本轮内的止损）。
+        let mut attempts = 0;
+        let cap = source.articles_per_day() * 4;
         for link in article_links(&listing, &source.url) {
-            if fresh >= source.articles_per_day() {
+            if fresh >= source.articles_per_day() || attempts >= cap {
                 break;
             }
             if store.practice_article_imported(&link)? {
                 continue;
             }
+            attempts += 1;
             let name = if source.name.trim().is_empty() {
                 link.as_str()
             } else {
                 source.name.trim()
             };
             let set = store.ensure_practice_set(name, "daily", Some(&source.url))?;
-            match import_article(store, &link, Some(set), &model) {
+            match import_article(store, &link, Some(set), &candidates) {
                 Ok(one) => {
                     report.merge(one);
                     fresh += 1;
@@ -338,6 +385,11 @@ pub fn daily_import(store: &mut SqliteStore) -> Result<ImportReport> {
         }
         if fresh == 0 {
             report.notes.push(format!("{} · 没有新文章", source.name));
+        } else if attempts >= cap && fresh < source.articles_per_day() {
+            report.notes.push(format!(
+                "{} · {attempts} 个链接试完只成了 {fresh} 篇，其余下轮再试",
+                source.name
+            ));
         }
     }
     Ok(report)
@@ -350,7 +402,9 @@ pub fn daily_import_at(db: &Path) -> Result<ImportReport> {
     daily_import(&mut store)
 }
 
-/// 列表页里的文章链接：同域、去掉导航/翻页/资源类地址，保持页面顺序去重。
+/// 列表页里的文章链接：同域、去掉导航/翻页/资源类地址，**按「像不像文章」排序**
+/// （列表页 DOM 里导航通常在正文前面，按文档顺序取会先抓到一堆栏目页），
+/// 同分的保持文档顺序。
 pub fn article_links(html: &str, listing_url: &str) -> Vec<String> {
     let Some(base_host) = host_of(listing_url) else {
         return Vec::new();
@@ -374,7 +428,26 @@ pub fn article_links(html: &str, listing_url: &str) -> Vec<String> {
             out.push(full);
         }
     }
+    out.sort_by_key(|link| std::cmp::Reverse(link_score(link)));
     out
+}
+
+/// 「像文章」的分数：路径深、带年份日期、是网页文档的排前面；栏目根目录排后面。
+fn link_score(url: &str) -> i32 {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let segments = path.split('/').filter(|part| !part.is_empty()).count() as i32;
+    let mut score = segments * 2;
+    // `/2026/1120/…` 这类带年份的路径几乎都是文章页。
+    if path.contains("/20") {
+        score += 6;
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") || path.ends_with(".shtml") {
+        score += 4;
+    }
+    if path.ends_with('/') {
+        score -= 6;
+    }
+    score
 }
 
 /// HTML 里所有 `href="…"` / `href='…'` 的目标（原文切片）。
@@ -442,7 +515,7 @@ fn host_of(url: &str) -> Option<String> {
 
 /// 不该当成文章的链接：版块页、登录页、图片与脚本、翻页参数。
 fn junk_link(url: &str) -> bool {
-    const MARKERS: [&str; 13] = [
+    const MARKERS: [&str; 16] = [
         "/tag",
         "/tags",
         "/category",
@@ -456,6 +529,9 @@ fn junk_link(url: &str) -> bool {
         "/live",
         "/planet",
         "/index.",
+        "/shipin",
+        "/photo",
+        "/slide",
     ];
     let lower = url.to_ascii_lowercase();
     const EXTENSIONS: [&str; 7] = [".jpg", ".jpeg", ".png", ".css", ".js", ".xml", ".ico"];
@@ -586,6 +662,28 @@ mod tests {
     }
 
     #[test]
+    fn two_consecutive_failures_stop_instead_of_retrying_every_paragraph() {
+        // 网络/模型整体有问题的形态：连续两段翻不出来就停——
+        // 再一段段下去只是白等超时，剩下的段下轮再说。
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open_at(dir.path().join("t.db")).unwrap();
+        let paragraphs: Vec<String> = (0..5)
+            .map(|i| format!("第 {i} 段正文，长度足够长可以拿来出一道题。"))
+            .collect();
+        let calls = std::cell::Cell::new(0usize);
+        let always_down = |_: &str| -> Result<String> {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("network down")
+        };
+        let report =
+            create_exercises(&mut store, &paragraphs, "https://example.cn/down", None, &always_down)
+                .unwrap();
+        assert_eq!(calls.get(), 2, "连续两次不通就停，不把五段全试一遍");
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.created, 0);
+    }
+
+    #[test]
     fn one_page_is_capped_so_a_long_article_cannot_burn_the_quota() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open_at(dir.path().join("t.db")).unwrap();
@@ -611,6 +709,31 @@ mod tests {
         // 超长标题截断，合集名不该占满整行。
         let long = format!("<title>{}</title>", "很长".repeat(60));
         assert_eq!(page_title(&long, "https://x").chars().count(), 40);
+    }
+
+    #[test]
+    fn article_links_rank_deep_dated_pages_above_navigation() {
+        // 列表页里导航通常排在正文前面：按文档顺序取会先抓一堆栏目页。
+        let html = r#"
+            <a href="/gb/">栏目根目录</a>
+            <a href="/GB/index.html">频道首页</a>
+            <a href="/n1/2026/1120/c1001-1.html">正文</a>
+            <a href="/n1/2026/1119/c998-1.html">另一篇正文</a>
+        "#;
+        let links = article_links(html, "http://opinion.people.com.cn/");
+        assert_eq!(
+            links,
+            vec![
+                "http://opinion.people.com.cn/n1/2026/1120/c1001-1.html".to_string(),
+                "http://opinion.people.com.cn/n1/2026/1119/c998-1.html".to_string(),
+                "http://opinion.people.com.cn/gb/".to_string(),
+            ],
+            "带日期的正文页排最前，栏目根目录垫底：{links:?}"
+        );
+        assert!(
+            links[0].contains("/2026/"),
+            "每天取前 limit 个时先拿到的是文章"
+        );
     }
 
     #[test]
@@ -644,18 +767,89 @@ mod tests {
     }
 
     #[test]
-    fn the_sources_file_comes_with_a_skippable_example() {
+    fn the_sources_file_ships_with_real_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let sources = load_sources_at(dir.path()).unwrap();
         assert!(dir.path().join("practice_sources.json").exists(), "缺了写默认");
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].url, "", "示例条目 url 为空，运行时跳过");
+        assert_eq!(sources.len(), 2, "内置两个实测可用的来源");
+        assert!(
+            sources.iter().all(|source| !source.url.trim().is_empty()),
+            "默认必须开箱即跑：{sources:?}"
+        );
+        assert!(sources[0].url.contains("people.com.cn"));
+        assert!(sources[1].url.contains("gov.cn"));
         assert_eq!(sources[0].articles_per_day(), ARTICLES_PER_DAY);
+
         // 手写的 limit 生效，且封顶防止一次抓太多。
-        let custom: DailySource = serde_json::from_str(
-            r#"{"name":"某网历史","url":"https://www.example.cn/lishi/","limit":99}"#,
+        let custom: DailySource =
+            serde_json::from_str(r#"{"name":"某网","url":"https://e.cn/","limit":99}"#).unwrap();
+        assert_eq!(custom.articles_per_day(), 6);
+
+        // url 留空的条目是停用开关，运行时被跳过。
+        let with_disabled = DailySource {
+            name: "停用的".to_string(),
+            url: "  ".to_string(),
+            limit: 0,
+        };
+        assert!(active_sources(vec![with_disabled]).is_empty());
+        assert_eq!(active_sources(sources).len(), 2);
+    }
+
+    #[test]
+    #[ignore] // 联网 + 花少量模型额度，手动跑：cargo test -p quietly temp_live_daily -- --ignored --nocapture
+    fn temp_live_daily_import_into_a_scratch_home() {
+        let _guard = crate::translator::tests::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("QUIETLY_HOME");
+        std::env::set_var("QUIETLY_HOME", dir.path());
+
+        let outcome = daily_import_at(&dir.path().join("scratch.db"));
+
+        match previous {
+            Some(value) => std::env::set_var("QUIETLY_HOME", value),
+            None => std::env::remove_var("QUIETLY_HOME"),
+        }
+
+        // 模型可用 → 真的出题；模型不通 → **快速失败**并把真实原因带出来
+        // （探路一次失败就整轮退出，不再一段段挨超时）。
+        match outcome {
+            Ok(report) => {
+                println!("summary: {}", report.summary());
+                for note in &report.notes {
+                    println!("note: {note}");
+                }
+                assert_eq!(report.ids.len() as u32, report.created);
+                assert!(report.created > 0, "模型可用时内置来源应当能出题");
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                println!("failed fast: {message}");
+                assert!(
+                    message.contains("探路失败"),
+                    "探路失败要把真实原因带出来：{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_placeholder_file_is_replaced_with_real_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("practice_sources.json");
+        // 老版本写出的占位条目：识别出来换成内置真实来源。
+        std::fs::write(
+            &path,
+            r#"[{"name":"示例来源（把 url 换成列表页）","url":"","limit":2}]"#,
         )
         .unwrap();
-        assert_eq!(custom.articles_per_day(), 6);
+        let sources = load_sources_at(dir.path()).unwrap();
+        assert_eq!(sources.len(), 2, "老占位文件被换成内置来源");
+        assert!(sources.iter().all(|source| !source.url.is_empty()));
+
+        // 用户自己清空过 url 的文件绝不动（名字不是示例就算用户改的）。
+        std::fs::write(&path, r#"[{"name":"我的来源","url":"","limit":2}]"#).unwrap();
+        let sources = load_sources_at(dir.path()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].url, "");
     }
 }

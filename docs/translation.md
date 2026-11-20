@@ -59,7 +59,14 @@ quietly translate-practice list # CLI 同款
 ## 每日自动发现
 
 和阅读新闻同一套机制：每天第一次启动查 `practice_fetched_on`，后台跑一轮，
-界面不阻塞。来源配在数据目录的 `practice_sources.json`（缺了自动写出示例）：
+界面不阻塞。**内置两个实测可用的默认来源**（缺文件时自动写出；文件已存在不覆盖）：
+
+| 默认来源 | 列表页 | 每天 |
+|---|---|---|
+| 人民网 · 观点 | `http://opinion.people.com.cn/` | 最多 2 篇 |
+| 中国政府网 · 要闻 | `https://www.gov.cn/` | 最多 2 篇 |
+
+想增删换改数据目录的 `practice_sources.json`：
 
 ```json
 [
@@ -67,7 +74,8 @@ quietly translate-practice list # CLI 同款
 ]
 ```
 
-程序抓列表页、挑**同域文章链接**（标签页、翻页、图片、外站自动排除），
+`url` 留空 = 停用该来源。程序抓列表页、挑**同域文章链接**（按「像不像文章」排序：
+带日期、路径深的优先；标签页、翻页、视频、图片、外站自动排除），
 导过的 URL 记在库里直接跳过；每个来源每天最多 `limit` 篇（默认 2，封顶 6）。
 手动跑一轮：`quietly translate-practice daily` 或应用内 `/practice daily`。
 
@@ -87,12 +95,20 @@ quietly translate-practice grade 7
 `score` / `feedback` / `provider`，`history` 里直接能看到。
 显式给了 `--score` / `--feedback` 时以人写的为准，AI 结果只作底稿。
 
-批改走**模型无关**的通用入口（`translator::ai_settings` / `ai_generate`），选哪家按
-数据目录 **`models.json` 的条目顺序**取第一个配了 key 的（默认 **Gemini > 小米 MiMo >
-DeepSeek**，改文件顺序就改调用顺序）；key 用 `/apikey set gemini_api_key <key>` 这样配
+批改走**模型无关**的通用入口（`translator::ai_candidates` / `ai_generate`）：按数据目录
+**`models.json` 的条目顺序**取**所有配了 key 的**模型作候选（默认 **Gemini > 小米 MiMo >
+DeepSeek**，改文件顺序就改轮换顺序）；key 用 `/apikey set gemini_api_key <key>` 这样配
 （或环境变量）。清单里同时存着地址和候选型号，型号升级、换端点都改这个文件，
 不用改代码——格式与说明见 [docs/reading.md 机翻](reading.md#机翻免费额度按段用)。
 全都没配会报错并指路 `models.json` 与 `/apikey`。
+
+网络容错按「**试一次就够**」来设计：
+
+- **探路**：批改/出题前先发一次最小请求，模型整体不通立刻失败，不抓网页、不挨段超时；
+- **轮换**：一家不通自动换下一家（清单顺序），型号坏了换下一个型号；
+- **冷却**：网络级失败（连不上/超时）把地址记入冷却表，**10 分钟内直接跳过**——
+  一段失败后面所有段零耗时绕开，绝不每段重试去挨 60 秒超时；
+- **熔断**：逐段翻译连续两段失败就停当篇，剩下的下轮再说。
 
 数据库中的 `translation_exercises` 保存题目和参考译文，
 `translation_attempts` 保存答案、评分、反馈、provider 和时间。

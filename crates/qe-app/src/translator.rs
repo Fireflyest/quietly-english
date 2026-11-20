@@ -23,6 +23,10 @@
 //!
 //! 翻译是**按需**的：只翻你正读到的那一段，不会把整篇四五千词一次性提交出去。
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use qe_store::keys;
@@ -241,35 +245,98 @@ impl AiModel {
     }
 }
 
-/// 批改用哪套模型：按 `models.json` 的条目顺序取第一个配了 key 的
-/// （默认 Gemini > 小米 MiMo > DeepSeek；改文件顺序就改调用顺序）。
+/// 网络级失败（连不上/超时）的冷却时长：**试过一次不通就够了**，
+/// 冷却期内直接跳过这个地址，不再一段段重试去挨超时。
+const ENDPOINT_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// 死地址冷却表：`地址 → 标记时刻`。进程级共享——一段失败，后面所有段立刻绕开。
+fn dead_endpoints() -> &'static Mutex<HashMap<String, Instant>> {
+    static DEAD: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    DEAD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 这个地址是否在冷却中（顺手清掉过期的标记）。
+fn is_cooling(url: &str) -> bool {
+    let mut map = dead_endpoints().lock().unwrap_or_else(|err| err.into_inner());
+    map.retain(|_, marked_at| marked_at.elapsed() < ENDPOINT_COOLDOWN);
+    map.contains_key(url)
+}
+
+/// 记一次网络级失败：该地址进入冷却。
+fn mark_dead(url: &str) {
+    dead_endpoints()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(url.to_string(), Instant::now());
+}
+
+/// 一次 AI 生成的结果：正文 + 实际出活的模型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generated {
+    pub text: String,
+    /// 库里记录的服务短名（`gemini` / `mimo`…）。
+    pub id: String,
+}
+
+/// 批改/出题这类「要模型出结构化文本」的请求，按 `models.json` 的顺序取
+/// **所有配了 key 的**模型家——供 [`ai_generate`] 轮换（第一家不通就换下一家）。
 ///
 /// 不受 `QUIETLY_TRANSLATE=none` 影响：批改是你显式发起的一次请求，
-/// 不是阅读时自动联网。全都没配就报错，指路 `models.json` 和 `/apikey set`。
-pub fn ai_settings() -> Result<AiModel> {
+/// 不是阅读时自动联网。一家都没配就报错，指路 `models.json` 和 `/apikey set`。
+pub fn ai_candidates() -> Result<Vec<AiModel>> {
     let stored = keys::load();
     let entries = qe_store::models::load()?;
+    let mut candidates = Vec::new();
     for entry in &entries {
         if entry.key.is_empty() {
             continue;
         }
         if let Some(key) = keys::resolve(&stored, &entry.key) {
-            return AiModel::of(entry, key);
+            candidates.push(AiModel::of(entry, key)?);
         }
     }
-    anyhow::bail!(
-        "没有配好的模型：在 {} 里选一家，再 /apikey set <key>（/apikey list 看 key 名）",
-        qe_store::models::path().display()
-    )
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "没有配好的模型：在 {} 里选一家，再 /apikey set <key>（/apikey list 看 key 名）",
+            qe_store::models::path().display()
+        );
+    }
+    Ok(candidates)
 }
 
-/// 跑一次 AI 生成：按清单顺序把候选型号依次试过去，第一个返回正文的赢。
+/// 跑一次 AI 生成：按 `models.json` 的顺序轮着试，**第一家不通就换下一家**；
+/// 网络级失败把地址记进冷却表，一段时间内不再重复尝试。
+pub(crate) fn ai_generate(models: &[AiModel], prompt: &str) -> Result<Generated> {
+    let mut last = String::from("没有配置任何模型");
+    for ai in models {
+        match ai_generate_one(ai, prompt) {
+            Ok(text) => {
+                return Ok(Generated {
+                    text,
+                    id: ai.id.clone(),
+                })
+            }
+            Err(err) => last = format!("{err:#}"),
+        }
+    }
+    anyhow::bail!("所有模型都试过了 · {last}")
+}
+
+/// 在**一家**模型内部按候选型号依次试：
 ///
-/// 全部走 chat-completions（`models.json` 的 `apiType`），所以接什么新模型
-/// 都不用改代码——改文件即可。
-pub(crate) fn ai_generate(ai: &AiModel, prompt: &str) -> Result<String> {
+/// * 地址在冷却中 → 直接跳过（这一段几乎零耗时，不挨超时）；
+/// * 网络级失败（连不上/超时）→ 记冷却、换下一个型号，而不是立刻放弃；
+/// * key 被拒（401/403）→ 换型号没用，立刻报错让上层换下一家；
+/// * 200 但正文为空/读不懂 → 换下一个型号。
+fn ai_generate_one(ai: &AiModel, prompt: &str) -> Result<String> {
     let mut last = format!("没有可用的型号（{}）", ai.name);
+    // 网络级失败的原始错误优先展示：冷却跳过只是后果，根因是「连不上」。
+    let mut network_failure: Option<String> = None;
     for (url, model) in &ai.models {
+        if is_cooling(url) {
+            last = format!("{} {model} 地址冷却中（刚试过不通）", ai.name);
+            continue;
+        }
         let payload = serde_json::json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
@@ -286,8 +353,14 @@ pub(crate) fn ai_generate(ai: &AiModel, prompt: &str) -> Result<String> {
         .send()
         {
             Ok(response) => response,
-            // 网络不通换型号也没用，立刻报；提示带上代理状态，省得猜网络。
-            Err(err) => anyhow::bail!("{} 连不上（{}）· {err}", ai.name, link_note()),
+            // 网络级失败：记冷却换下一个型号——一次不通就够了。
+            Err(err) => {
+                mark_dead(url);
+                let message = format!("{} {model} 连不上（{}）· {err}", ai.name, link_note());
+                network_failure.get_or_insert(message.clone());
+                last = message;
+                continue;
+            }
         };
         let raw = response.as_str().unwrap_or_default();
         if (200..300).contains(&response.status_code) {
@@ -305,12 +378,15 @@ pub(crate) fn ai_generate(ai: &AiModel, prompt: &str) -> Result<String> {
             response.status_code,
             first_line(raw)
         );
-        // key 被拒时换哪个型号都一样，别再试了。
+        // key 被拒时换哪个型号都一样，别再试了（上层换下一家）。
         if matches!(response.status_code, 401 | 403) {
             anyhow::bail!("{} 拒绝了这个 key · {}", ai.name, first_line(raw));
         }
     }
-    anyhow::bail!("{last}")
+    match network_failure {
+        Some(message) => anyhow::bail!("{message}"),
+        None => anyhow::bail!("{last}"),
+    }
 }
 
 /// 「经代理 127.0.0.1:7888」/「直连」，进错误提示。
@@ -379,7 +455,7 @@ fn chat(settings: &Settings, text: &str) -> Result<String> {
         .context("模型配置丢失：settings 里没有 models.json 条目")?;
     let key = settings.key.clone().context("模型 key 没有配置")?;
     let ai = AiModel::of(entry, key)?;
-    ai_generate(&ai, &translate_prompt(text))
+    ai_generate_one(&ai, &translate_prompt(text))
 }
 
 /// chat-completions 响应里要的正文：`choices[0].message.content`。
@@ -1029,8 +1105,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ai_settings_follows_models_json_order() {
-        // 批改选哪家 = models.json 的条目顺序（这里故意把 Deepseek 放最前）。
+    fn ai_candidates_follow_models_json_order_for_rotation() {
+        // 候选 = models.json 的条目顺序、所有配了 key 的家（轮换用）。
         let _guard = lock_env();
         let dir = tempfile::tempdir().unwrap();
         let previous_home = std::env::var_os("QUIETLY_HOME");
@@ -1050,19 +1126,22 @@ pub(crate) mod tests {
         qe_store::keys::set("gemini_api_key", "g").unwrap();
         qe_store::keys::set("deepseek_api_key", "ds").unwrap();
 
-        let first = ai_settings().unwrap();
-        assert_eq!(first.name, "Deepseek", "清单在前的先用");
-        assert_eq!(first.id, "deepseek", "id 是 key 去掉 _api_key");
+        let candidates = ai_candidates().unwrap();
+        assert_eq!(candidates.len(), 2, "配了 key 的都进候选");
+        assert_eq!(candidates[0].name, "Deepseek", "清单在前的先试");
+        assert_eq!(candidates[0].id, "deepseek", "id 是 key 去掉 _api_key");
+        assert_eq!(candidates[1].name, "Gemini");
 
-        // 第一家的 key 没配就顺延到下一家。
+        // 第一家的 key 没配就轮到下一家（候选里只剩它）。
         qe_store::keys::clear(Some("deepseek_api_key")).unwrap();
-        let second = ai_settings().unwrap();
-        assert_eq!(second.name, "Gemini");
-        assert_eq!(second.id, "gemini");
+        let candidates = ai_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "Gemini");
+        assert_eq!(candidates[0].id, "gemini");
 
         // 一家都没配：报错并同时指路 models.json 和 /apikey。
         qe_store::keys::clear(None).unwrap();
-        let message = format!("{:#}", ai_settings().unwrap_err());
+        let message = format!("{:#}", ai_candidates().unwrap_err());
         assert!(message.contains("models.json"), "指路清单：{message}");
         assert!(message.contains("/apikey set"), "指路 key 配置：{message}");
 
@@ -1071,6 +1150,17 @@ pub(crate) mod tests {
             Some(value) => std::env::set_var("QUIETLY_HOME", value),
             None => std::env::remove_var("QUIETLY_HOME"),
         }
+    }
+
+    #[test]
+    fn a_dead_endpoint_cools_down_instead_of_being_retried() {
+        // 网络级失败只试一次：标记后冷却期内直接跳过，后面各段零耗时绕开。
+        let url = "https://cooldown-test.invalid/v1/chat/completions";
+        assert!(!is_cooling(url), "没试过的地址不冷却");
+        mark_dead(url);
+        assert!(is_cooling(url), "试过一次不通，冷却期内不再重试");
+        // 别的地址不受影响。
+        assert!(!is_cooling("https://other.invalid/chat"));
     }
 
     #[test]

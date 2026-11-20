@@ -369,8 +369,8 @@ impl App {
             self.note("usage: /practice <中文网页 url>");
             return Ok(());
         }
-        // 先验模型 key：没有它出不了参考译文，抓完网页也是白抓。
-        if let Err(err) = crate::translator::ai_settings() {
+        // 先验候选（key 有没有配）：没有它出不了参考译文，抓完网页也是白抓。
+        if let Err(err) = crate::translator::ai_candidates() {
             self.note(format!("practice needs a model key · {err:#}"));
             return Ok(());
         }

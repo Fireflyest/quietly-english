@@ -1,9 +1,9 @@
 //! 翻译练习的 AI 批改：打分 + 中文反馈，结果写回提交记录。
 //!
-//! **模型无关**：这里只走 [`translator::ai_settings`] / [`translator::ai_generate`]
-//! 这两个通用入口，不点名任何一家模型。选哪家由数据目录的 `models.json`
-//! 决定——**按它的条目顺序取第一个配了 key 的**（默认 Gemini > 小米 MiMo >
-//! DeepSeek），批改逻辑、命令行和库里存的 `provider` 字段都不用改。
+//! **模型无关**：这里只走 [`translator::ai_candidates`] / [`translator::ai_generate`]
+//! 这两个通用入口，不点名任何一家模型。候选按数据目录 `models.json` 的条目
+//! 顺序取**所有配了 key 的**——第一家不通自动轮到下一家，网络级失败还有冷却，
+//! 批改逻辑、命令行和库里存的 `provider` 字段都不用改。
 //!
 //! key 走 `/apikey set`（`keys.json`）或环境变量，和阅读机翻共用一处。
 //! 结果落库后 `history` 直接能看到；不满意可以重新批改（`grade` 覆盖旧结果）。
@@ -29,14 +29,15 @@ pub struct Grade {
 /// `direction` 是出题方向（`zh-en` / `en-zh`），决定提示词里说清考的是哪种表达。
 pub fn grade(source: &str, reference: &str, direction: &str, answer: &str) -> Result<Grade> {
     anyhow::ensure!(!answer.trim().is_empty(), "翻译答案不能为空");
-    let model = translator::ai_settings()?;
-    let raw = translator::ai_generate(&model, &prompt(source, reference, direction, answer))?;
-    let (score, feedback) = parse(&raw)?;
+    let candidates = translator::ai_candidates()?;
+    let generated =
+        translator::ai_generate(&candidates, &prompt(source, reference, direction, answer))?;
+    let (score, feedback) = parse(&generated.text)?;
     // provider 跟着实际出分数的模型走：换模型后库里自然能看出是谁批的。
     Ok(Grade {
         score,
         feedback,
-        provider: model.id,
+        provider: generated.id,
     })
 }
 
