@@ -77,10 +77,10 @@ const MAX_CHARS: usize = 200;
 
 /// CLI 用：直接借已经打开的库导入。
 pub fn import(store: &mut SqliteStore, url: &str) -> Result<ImportReport> {
-    // 先探路：模型整体不通就立刻失败——一次不通就够了，
+    // 先探路：模型整体不通就立刻失败——5 秒超时，一次不通就够了，
     // 不要抓完网页再一段段挨超时。
     let candidates = crate::translator::ai_candidates()?;
-    crate::translator::ai_generate(&candidates, "Reply with the single word: ok")
+    crate::translator::ai_generate_quick(&candidates, "Reply with the single word: ok")
         .context("模型探路失败，先不抓网页")?;
     import_article(store, url, None, &candidates)
 }
@@ -332,9 +332,9 @@ pub fn daily_import(store: &mut SqliteStore) -> Result<ImportReport> {
             ..ImportReport::default()
         });
     }
-    // 没有模型 key 就出不了参考译文；先探路，模型整体不通就本轮直接失败。
+    // 没有模型 key 就出不了参考译文；先探路（5 秒超时），模型整体不通就本轮直接失败。
     let candidates = crate::translator::ai_candidates()?;
-    crate::translator::ai_generate(&candidates, "Reply with the single word: ok")
+    crate::translator::ai_generate_quick(&candidates, "Reply with the single word: ok")
         .context("模型探路失败，本轮先跳过")?;
     let mut report = ImportReport::default();
     for source in &sources {

@@ -329,12 +329,30 @@ pub fn ai_candidates() -> Result<Vec<AiModel>> {
     Ok(candidates)
 }
 
+/// 正常生成的超时（秒）：正文可能较长，别误杀慢但能用的模型。
+const GENERATE_TIMEOUT: u64 = 60;
+/// 探测/探路的超时（秒）：只为知道通不通，5 秒足够，失败立刻封禁。
+const PROBE_TIMEOUT: u64 = 5;
+
 /// 跑一次 AI 生成：按 `models.json` 的顺序轮着试，**第一家不通就换下一家**；
 /// 网络级失败把地址记进死表，**本次运行内不再尝试**（重启才重新启用）。
 pub(crate) fn ai_generate(models: &[AiModel], prompt: &str) -> Result<Generated> {
+    ai_generate_with_timeout(models, prompt, GENERATE_TIMEOUT)
+}
+
+/// 快速请求（探测/探路）：5 秒超时，不通就尽快封禁换下一家。
+pub(crate) fn ai_generate_quick(models: &[AiModel], prompt: &str) -> Result<Generated> {
+    ai_generate_with_timeout(models, prompt, PROBE_TIMEOUT)
+}
+
+fn ai_generate_with_timeout(
+    models: &[AiModel],
+    prompt: &str,
+    timeout_seconds: u64,
+) -> Result<Generated> {
     let mut last = String::from("没有配置任何模型");
     for ai in models {
-        match ai_generate_one(ai, prompt) {
+        match ai_generate_one(ai, prompt, timeout_seconds) {
             Ok(text) => {
                 return Ok(Generated {
                     text,
@@ -353,7 +371,7 @@ pub(crate) fn ai_generate(models: &[AiModel], prompt: &str) -> Result<Generated>
 /// * 网络级失败（连不上/超时）→ 记入死表、换下一个型号，而不是立刻放弃；
 /// * key 被拒（401/403）→ 换型号没用，立刻报错让上层换下一家；
 /// * 200 但正文为空/读不懂 → 换下一个型号。
-fn ai_generate_one(ai: &AiModel, prompt: &str) -> Result<String> {
+fn ai_generate_one(ai: &AiModel, prompt: &str, timeout_seconds: u64) -> Result<String> {
     let mut last = format!("没有可用的型号（{}）", ai.name);
     // 网络级失败的原始错误优先展示：跳过只是后果，根因是「连不上」。
     let mut network_failure: Option<String> = None;
@@ -372,7 +390,7 @@ fn ai_generate_one(ai: &AiModel, prompt: &str) -> Result<String> {
             minreq::post(url)
                 .with_header("Authorization", format!("Bearer {}", ai.key))
                 .with_header("Content-Type", "application/json")
-                .with_timeout(60)
+                .with_timeout(timeout_seconds)
                 .with_body(payload),
         )
         .send()
@@ -480,7 +498,7 @@ fn chat(settings: &Settings, text: &str) -> Result<String> {
         .context("模型配置丢失：settings 里没有 models.json 条目")?;
     let key = settings.key.clone().context("模型 key 没有配置")?;
     let ai = AiModel::of(entry, key)?;
-    ai_generate_one(&ai, &translate_prompt(text))
+    ai_generate_one(&ai, &translate_prompt(text), GENERATE_TIMEOUT)
 }
 
 /// chat-completions 响应里要的正文：`choices[0].message.content`。

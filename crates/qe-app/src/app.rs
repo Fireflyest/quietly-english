@@ -331,7 +331,7 @@ impl App {
             return; // 没配模型 key：没东西可探
         };
         std::thread::spawn(move || {
-            let _ = crate::translator::ai_generate(&candidates, "Reply with the single word: ok");
+            let _ = crate::translator::ai_generate_quick(&candidates, "Reply with the single word: ok");
         });
     }
 
@@ -367,12 +367,34 @@ impl App {
         let mut view = ToolView::new("model")
             .accent(Accent::Note)
             .result(format!("{} candidates · models.json order", candidates.len()));
+        // 「当前第一」标给**真正会被用到的**那家：全封禁的会被 ai_generate 秒跳过，
+        // 文件顺序只是配置里的优先级，不等于当下可用。
+        let mut marked_first = false;
         for (index, ai) in candidates.iter().enumerate() {
+            let banned = ai
+                .models
+                .iter()
+                .filter(|(url, _)| crate::translator::dead_reason(url).is_some())
+                .count();
+            let usable = banned < ai.models.len();
             let mut value = format!("{} · {} 型号", ai.id, ai.models.len());
-            if index == 0 {
+            if banned > 0 {
+                if usable {
+                    value.push_str(&format!(" · {banned}/{} 封禁", ai.models.len()));
+                } else {
+                    value.push_str(" · 已封禁");
+                }
+            }
+            if usable && !marked_first {
                 value.push_str(" · 当前第一");
+                marked_first = true;
             }
             view = view.kv(format!("{}. {}", index + 1, ai.name), &value);
+        }
+        if !marked_first {
+            view = view
+                .spacer()
+                .muted("所有模型都封禁中 · /model reset 清除并重新探测");
         }
         let banned = crate::translator::dead_endpoints_snapshot();
         if !banned.is_empty() {
@@ -4236,6 +4258,9 @@ mod tests {
 
     #[test]
     fn model_status_lists_order_and_the_first_candidate() {
+        let _guard_dead = crate::translator::tests::DEAD_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let _guard = crate::translator::tests::lock_env();
         let dir = tempfile::tempdir().unwrap();
         let previous_home = std::env::var_os("QUIETLY_HOME");
@@ -4271,6 +4296,31 @@ mod tests {
             )),
             "顺序、第一名家、候补都列出来"
         );
+
+        // 排第一的被封禁：标 已封禁、不再称当前第一，第一个未封的才是当前第一。
+        crate::translator::mark_dead("https://api.deepseek.com/chat/completions", "测试封禁");
+        let before = app.messages.len();
+        app.execute(Command::Model(String::new())).unwrap();
+        assert!(
+            app.messages[before..].iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.name == "model"
+                    && view.lines.iter().any(|line| matches!(
+                        line,
+                        qe_core::view::ToolLine::Kv { key, value }
+                            if key.starts_with("1. Deepseek")
+                                && value.contains("已封禁")
+                                && !value.contains("当前第一")
+                    ))
+                    && view.lines.iter().any(|line| matches!(
+                        line,
+                        qe_core::view::ToolLine::Kv { key, value }
+                            if key.starts_with("2. Gemini") && value.contains("当前第一")
+                    ))
+            )),
+            "被封的排头不算当前第一，落到第一个未封的"
+        );
+        crate::translator::clear_dead();
 
         match previous_home {
             Some(value) => std::env::set_var("QUIETLY_HOME", value),

@@ -176,7 +176,7 @@ quietly word inspect          # 不走 TUI，直接看一个词条
 | `/mode [full\|intensive]` | 切换全篇 / 精读 |
 | `/translate` · `tab` | 显示 / 隐藏**当前段**的译文（逐段切换，别的段保持原样，不会一次铺出全文）；没有译文时按段机翻当前段 |
 | `/apikey [set <name> <value>\|list\|clear]` | 配置翻译 API key（存数据目录的 `keys.json`，不进库） |
-| `/model [reset]` | 看模型候选顺序（**谁排第一**、谁被封禁）；`reset` 清除封禁并后台重新探测 |
+| `/model [reset]` | 看模型候选与封禁状态（**当前第一 = 实际会用的那家**，全封的标「已封禁」）；`reset` 清除封禁并后台重新探测 |
 | `/mark [word]` | 标记生词（`/mark all` 标全部） |
 | `/take <n>` | 把当前段第 n 个词收进词书 |
 | `/quiz [file]` | 读后测验 |
