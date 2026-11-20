@@ -708,16 +708,18 @@ impl App {
         // Any keypress cancels a pending "press esc again".
         let was_confirming = self.confirm_exit;
 
-        // 读完一篇后的总结在等空格：空格接下一篇，按了别的键就作废——
-        // 之后再按空格不该被一个陈旧状态拽进别的文章。
-        if self.pending_next_text.is_some() {
-            match key.code {
-                KeyCode::Char(' ') if self.editor.is_empty() && self.session.is_none() => {
-                    let next = self.pending_next_text.take().expect("checked above");
-                    return self.start_reading(&next);
-                }
-                _ => self.pending_next_text = None,
-            }
+        // 读完一篇后的总结在等空格/回车：接下一篇。
+        // 别的按键**不作废**这个状态——手滑按了方向键、退格，再按空格照样能过篇；
+        // 作废只发生在执行命令（`execute`）或新开阅读时。输入行有实质内容时，
+        // 空格照常打字，不抢；只有残留空白（先前误敲的空格）会被清掉再进去。
+        if self.pending_next_text.is_some()
+            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
+            && self.editor.text().trim().is_empty()
+            && self.session.is_none()
+        {
+            let next = self.pending_next_text.take().expect("checked above");
+            self.editor.clear();
+            return self.start_reading(&next);
         }
 
         let suggestion_count = self.suggestions_for(&self.editor.text()).0.len();
@@ -3919,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn any_other_key_cancels_waiting_for_the_next_article() {
+    fn a_command_cancels_waiting_for_the_next_article() {
         let Harness { mut app, _dir } = harness();
         import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
         import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
@@ -3929,10 +3931,56 @@ mod tests {
         app.reading_next().unwrap();
         assert!(app.pending_next_text.is_some(), "总结在等空格");
 
-        // 打了别的命令就作废：之后的空格不该把人拽进下一篇。
+        // 执行了别的命令就作废：之后的空格不该把人拽进下一篇。
         app.execute(Command::Books).unwrap();
         assert!(app.pending_next_text.is_none());
         assert!(app.reading.is_none(), "总结阶段没有正在读的文章");
+    }
+
+    #[test]
+    fn stray_keys_do_not_cancel_and_enter_or_a_stray_space_still_advance() {
+        let Harness { mut app, _dir } = harness();
+        import_chapter(&mut app, &_dir, "ch1.txt", "Chapter One", "First.\n\nSecond.");
+        import_chapter(&mut app, &_dir, "ch2.txt", "Chapter Two", "Third.\n\nFourth.");
+        import_chapter(&mut app, &_dir, "ch3.txt", "Chapter Three", "Fifth.\n\nSixth.");
+
+        app.execute(Command::Read("animal-farm".into())).unwrap();
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        assert!(app.pending_next_text.is_some(), "总结在等空格");
+
+        // 手滑按了杂键：状态不作废，之后的空格仍然有效。
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            app.pending_next_text.is_some(),
+            "杂键不作废「等空格接下一篇」"
+        );
+
+        // 输入行里残留一个空格（先前误敲的）也能过：识别为空白、清掉再进。
+        app.editor.insert_char(' ');
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Chapter Two"),
+            "残留空白不挡住过篇"
+        );
+        assert!(app.editor.is_empty(), "进去前把残留空白清掉");
+
+        // 回车同样能接下一篇。
+        app.reading_next().unwrap();
+        app.reading_next().unwrap();
+        assert!(app.pending_next_text.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.reading.as_ref().map(|s| s.text.title.as_str()),
+            Some("Chapter Three"),
+            "enter 和空格一样接下一篇"
+        );
     }
 
     #[test]

@@ -690,6 +690,9 @@ impl App {
         self.store.set_setting("last_text", &session.text.title)?;
         self.reading = Some(session);
         self.reveal_anchor = true;
+        // 新开一篇作废「等空格接下一篇」（正常在 handle_key/execute 已作废，
+        // 这里兜底，避免任何路径带着陈旧状态进去）。
+        self.pending_next_text = None;
         // 过渡：从头读、够长的新文章正文流式吐出（打字机）；续读不流——
         // 视角本来就在存档的那一段。
         self.reading_fade_started = self.reading.as_ref().and_then(|session| {
