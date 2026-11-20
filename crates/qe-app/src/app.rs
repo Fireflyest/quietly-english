@@ -116,6 +116,9 @@ pub struct App {
     /// `/practice <url>` 后台导入翻译练习的结果通道。
     practice_fetch:
         Option<std::sync::mpsc::Receiver<Result<crate::practice::ImportReport, String>>>,
+    /// 背完一轮后 AI 总结建议的后台通道。
+    advice_fetch:
+        Option<std::sync::mpsc::Receiver<Result<crate::translator::Generated, String>>>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落, 段落结果)`。
     pub(crate) translation_fetch: Option<(
         i64,
@@ -178,6 +181,7 @@ impl App {
             pending_next_text: None,
             news_fetch: None,
             practice_fetch: None,
+            advice_fetch: None,
             translation_fetch: None,
             db_path: None,
         };
@@ -505,6 +509,8 @@ impl App {
             self.poll_news_fetch();
             // 网页导入翻译练习也一样：建完题再报，界面不卡。
             self.poll_practice();
+            // AI 总结建议也是后台线程，好了补一条。
+            self.poll_summary_advice();
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
             if let Some(started) = self.study_fade_started {
@@ -2418,9 +2424,105 @@ impl App {
         })?;
 
         self.push_summary()?;
+        // 统计之后补一条 AI 总结建议：后台生成，好了再上屏，不卡结束这一下。
+        self.spawn_summary_advice(session.new_done, session.review_done);
         self.note("session ended · /study again, or type a word");
         self.refresh_status();
         Ok(())
+    }
+
+    /// 背完一轮的 AI 建议：后台生成，结果并进独立通道（和抓取同款轮询）。
+    ///
+    /// 只在真实 TUI 里跑——`db_path` 只有 main 会设，测试和 CLI 由此天然不联网；
+    /// 没配模型 key 就安静跳过，统计照常显示。
+    fn spawn_summary_advice(&mut self, session_new: u32, session_reviews: u32) {
+        if self.advice_fetch.is_some() || self.db_path.is_none() {
+            return;
+        }
+        let candidates = match crate::translator::ai_candidates() {
+            Ok(candidates) => candidates,
+            Err(_) => return,
+        };
+        let context = match self.advice_context(session_new, session_reviews) {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        let prompt = Self::advice_prompt(&context);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = crate::translator::ai_generate(&candidates, &prompt)
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(outcome);
+        });
+        self.advice_fetch = Some(receiver);
+    }
+
+    /// 给 AI 的数据切片：本轮 + 今日累计 + 反复忘的词。
+    fn advice_context(&self, session_new: u32, session_reviews: u32) -> Result<String> {
+        let daily = self.store.daily(time::today())?;
+        let streak = self.store.streak()?;
+        let difficult = self
+            .store
+            .review_stats(time::today(), 8)?
+            .difficult_words
+            .iter()
+            .map(|(lemma, again)| format!("{lemma}×{again}"))
+            .collect::<Vec<_>>()
+            .join("、");
+        Ok(format!(
+            "本轮新学 {session_new} 词、复习 {session_reviews} 次；\
+今日新学 {}、复习 {}，评分 again {} / hard {} / good {} / easy {}，\
+忘记率 {}%，连续学习 {} 天，今日专注 {} 分钟。今天反复忘的词：{}。",
+            daily.new_learned,
+            daily.reviews,
+            daily.again,
+            daily.hard,
+            daily.good,
+            daily.easy,
+            daily.forget_rate(),
+            streak,
+            daily.minutes(),
+            if difficult.is_empty() {
+                "没有"
+            } else {
+                difficult.as_str()
+            }
+        ))
+    }
+
+    /// AI 建议线程有结果了就补进对话；每帧调一次。
+    fn poll_summary_advice(&mut self) {
+        let Some(receiver) = self.advice_fetch.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(generated)) => {
+                self.advice_fetch = None;
+                let view = ToolView::new("advice")
+                    .accent(Accent::Note)
+                    .badge(generated.id)
+                    .result(generated.text);
+                self.push(Message::tool(view));
+            }
+            Ok(Err(error)) => {
+                self.advice_fetch = None;
+                self.note(format!("ai advice unavailable · {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.advice_fetch = None;
+            }
+        }
+    }
+
+    /// AI 总结建议的提示词：数据 → 2-4 句中文（评价 + 主要问题 + 明天怎么做）。
+    fn advice_prompt(context: &str) -> String {
+        format!(
+            "你是一位英语学习教练，根据今天的学习数据做一次简短复盘。\
+只输出 2-4 句简体中文，不要列表、不要英文、不要客套话：\
+第一句评价今天的表现；第二句点出最主要的问题（结合忘记率和反复忘的词）；\
+最后一句给出明天具体可执行的做法。\n\n学习数据：{context}"
+        )
     }
 
     fn push_summary(&mut self) -> Result<()> {
@@ -3964,6 +4066,47 @@ mod tests {
             )),
             "坏入参给用法"
         );
+    }
+
+    #[test]
+    fn the_advice_prompt_carries_stats_and_asks_for_two_to_four_sentences() {
+        let context = "本轮新学 5 词；忘记率 39%。今天反复忘的词：inspect×3。";
+        let prompt = App::advice_prompt(context);
+        assert!(prompt.contains(context), "数据原样进提示词");
+        assert!(prompt.contains("2-4 句简体中文"), "句数约束写死");
+        assert!(prompt.contains("不要列表"), "输出形状约束");
+    }
+
+    #[test]
+    fn the_ai_advice_arrives_as_its_own_block_and_failures_become_notes() {
+        let Harness { mut app, _dir } = harness();
+        // 成功：补一条 advice 面板，badge 是实际出活的模型。
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(crate::translator::Generated {
+                text: "明天先把 inspect 过两遍。".into(),
+                id: "deepseek".into(),
+            }))
+            .unwrap();
+        app.advice_fetch = Some(receiver);
+        app.poll_summary_advice();
+        assert!(app.advice_fetch.is_none());
+        assert!(app.messages.iter().any(|message| matches!(
+            &message.body,
+            Body::Tool(view) if view.name == "advice" && view.badge.as_deref() == Some("deepseek")
+        )));
+
+        // 失败：一行说明，不打断统计。
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Err("所有模型都试过了 · Gemini 连不上".into()))
+            .unwrap();
+        app.advice_fetch = Some(receiver);
+        app.poll_summary_advice();
+        assert!(app.messages.iter().any(|message| matches!(
+            &message.body,
+            Body::Text(text) if text.contains("ai advice unavailable")
+        )));
     }
 
     #[test]
