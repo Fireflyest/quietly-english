@@ -88,10 +88,11 @@ fn run() -> Result<()> {
             let mut terminal = cli::TerminalSession::new()?;
             let db_path = store.path().to_path_buf();
             let mut app = app::App::new(Box::new(store))?;
-            // 每天第一次打开时抓一批双语新闻当阅读材料、按来源发现新练习；
-            // 都在后台线程里跑，界面不阻塞，失败只提示一次。
+            // 每天第一次打开时抓一批双语新闻当阅读材料、按来源发现新练习，
+            // 并后台探一遍模型连通性；都在后台线程里跑，界面不阻塞。
             app.enable_daily_news(db_path.clone())?;
             app.enable_daily_practice(db_path)?;
+            app.probe_models();
             app.run(&mut terminal)
         }
         Some("db") => {

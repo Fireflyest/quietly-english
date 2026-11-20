@@ -318,6 +318,82 @@ impl App {
         Ok(())
     }
 
+    /// 启动时后台探一遍模型连通性：探不通的地址**本次运行内直接不再尝试**，
+    /// 下次重启才重新启用。结果不上屏——真用到时会秒跳过并带上探测原因。
+    ///
+    /// 只在真实 TUI 里跑（`db_path` 由 main 设置），测试天然不触发；
+    /// CLI 是一次性进程，用到时自己探，不额外起线程。
+    pub fn probe_models(&self) {
+        if self.db_path.is_none() {
+            return;
+        }
+        let Ok(candidates) = crate::translator::ai_candidates() else {
+            return; // 没配模型 key：没东西可探
+        };
+        std::thread::spawn(move || {
+            let _ = crate::translator::ai_generate(&candidates, "Reply with the single word: ok");
+        });
+    }
+
+    /// `/model`：看模型候选顺序（谁排第一、谁被封）；`/model reset` 解封并重新探测。
+    fn model_command(&mut self, arg: &str) -> Result<()> {
+        match arg.trim() {
+            "" | "list" => self.show_models(),
+            "reset" | "retry" => {
+                let cleared = crate::translator::clear_dead();
+                // 只在真实 TUI 里真的重探（`db_path` 门控在 probe_models 里）。
+                self.probe_models();
+                self.note(format!(
+                    "model bans cleared ({cleared}) · re-probing in the background"
+                ));
+                Ok(())
+            }
+            _ => {
+                self.note("usage: /model [reset]");
+                Ok(())
+            }
+        }
+    }
+
+    /// 模型状态一览：`models.json` 的顺序、当前第一、以及被封禁的地址。
+    fn show_models(&mut self) -> Result<()> {
+        let candidates = match crate::translator::ai_candidates() {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                self.note(format!("no model configured · {err:#}"));
+                return Ok(());
+            }
+        };
+        let mut view = ToolView::new("model")
+            .accent(Accent::Note)
+            .result(format!("{} candidates · models.json order", candidates.len()));
+        for (index, ai) in candidates.iter().enumerate() {
+            let mut value = format!("{} · {} 型号", ai.id, ai.models.len());
+            if index == 0 {
+                value.push_str(" · 当前第一");
+            }
+            view = view.kv(format!("{}. {}", index + 1, ai.name), &value);
+        }
+        let banned = crate::translator::dead_endpoints_snapshot();
+        if !banned.is_empty() {
+            view = view
+                .spacer()
+                .muted(format!("banned until restart ({})", banned.len()));
+            for (url, reason) in banned.iter().take(5) {
+                let host = url
+                    .split("://")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or(url.as_str());
+                view = view.kv(host, reason);
+            }
+        }
+        self.push(Message::tool(
+            view.muted("/model reset 清除封禁并重新探测"),
+        ));
+        Ok(())
+    }
+
     /// 每天第一次启动时自动按来源发现新文章、导入练习（和新闻抓取同款）。
     pub fn enable_daily_practice(&mut self, db_path: std::path::PathBuf) -> Result<()> {
         self.db_path = Some(db_path);
@@ -1369,6 +1445,7 @@ impl App {
             Command::Prev => self.reading_prev(),
             Command::Translate => self.toggle_translation(),
             Command::ApiKey(arg) => self.api_key(&arg),
+            Command::Model(arg) => self.model_command(&arg),
             Command::Quiz(arg) => {
                 if arg.trim().is_empty() {
                     self.start_quiz()
@@ -4106,6 +4183,70 @@ mod tests {
         assert!(app.messages.iter().any(|message| matches!(
             &message.body,
             Body::Text(text) if text.contains("ai advice unavailable")
+        )));
+    }
+
+    #[test]
+    fn model_status_lists_order_and_the_first_candidate() {
+        let _guard = crate::translator::tests::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("QUIETLY_HOME");
+        std::env::set_var("QUIETLY_HOME", dir.path());
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"[
+                {"name":"Deepseek","key":"deepseek_api_key","apiType":"chat-completions",
+                 "models":[{"id":"deepseek-flash","url":"https://api.deepseek.com/chat/completions"}]},
+                {"name":"Gemini","key":"gemini_api_key","apiType":"chat-completions",
+                 "models":[{"id":"gemini-flash-latest","url":"https://example.invalid/chat"}]}
+            ]"#,
+        )
+        .unwrap();
+        qe_store::keys::set("deepseek_api_key", "ds").unwrap();
+        qe_store::keys::set("gemini_api_key", "g").unwrap();
+
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Model(String::new())).unwrap();
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.name == "model"
+                    && view.lines.iter().any(|line| matches!(
+                        line,
+                        qe_core::view::ToolLine::Kv { key, value }
+                            if key.starts_with("1. Deepseek") && value.contains("当前第一")
+                    ))
+                    && view.lines.iter().any(|line| matches!(
+                        line,
+                        qe_core::view::ToolLine::Kv { key, .. } if key.starts_with("2. Gemini")
+                    ))
+            )),
+            "顺序、第一名家、候补都列出来"
+        );
+
+        match previous_home {
+            Some(value) => std::env::set_var("QUIETLY_HOME", value),
+            None => std::env::remove_var("QUIETLY_HOME"),
+        }
+    }
+
+    #[test]
+    fn model_reset_lifts_bans_and_reprobes() {
+        let _guard = crate::translator::tests::DEAD_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let Harness { mut app, _dir } = harness();
+        crate::translator::mark_dead("https://banned-test.invalid/chat", "启动探测：连不上");
+        assert!(crate::translator::dead_reason("https://banned-test.invalid/chat").is_some());
+
+        app.execute(Command::Model("reset".into())).unwrap();
+        assert!(
+            crate::translator::dead_reason("https://banned-test.invalid/chat").is_none(),
+            "reset 解除封禁"
+        );
+        assert!(app.messages.iter().any(|message| matches!(
+            &message.body,
+            Body::Text(text) if text.contains("model bans cleared") && text.contains("re-probing")
         )));
     }
 

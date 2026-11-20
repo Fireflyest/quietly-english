@@ -25,7 +25,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
@@ -245,29 +244,55 @@ impl AiModel {
     }
 }
 
-/// 网络级失败（连不上/超时）的冷却时长：**试过一次不通就够了**，
-/// 冷却期内直接跳过这个地址，不再一段段重试去挨超时。
-const ENDPOINT_COOLDOWN: Duration = Duration::from_secs(600);
-
-/// 死地址冷却表：`地址 → 标记时刻`。进程级共享——一段失败，后面所有段立刻绕开。
-fn dead_endpoints() -> &'static Mutex<HashMap<String, Instant>> {
-    static DEAD: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+/// 网络级失败的死表：`地址 → 失败原因`。
+///
+/// **进程内永久**：TUI 启动时后台探一遍，探不通的地址（以及后来任何一段
+/// 网络失败）本次运行**直接不再尝试**——用到时秒跳过并带上当时的原因；
+/// 下次重启自动重新启用。
+fn dead_endpoints() -> &'static Mutex<HashMap<String, String>> {
+    static DEAD: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     DEAD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 这个地址是否在冷却中（顺手清掉过期的标记）。
-fn is_cooling(url: &str) -> bool {
-    let mut map = dead_endpoints().lock().unwrap_or_else(|err| err.into_inner());
-    map.retain(|_, marked_at| marked_at.elapsed() < ENDPOINT_COOLDOWN);
-    map.contains_key(url)
-}
-
-/// 记一次网络级失败：该地址进入冷却。
-fn mark_dead(url: &str) {
+/// 这个地址被标记过吗？带上当时的原因。
+pub(crate) fn dead_reason(url: &str) -> Option<String> {
     dead_endpoints()
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .insert(url.to_string(), Instant::now());
+        .get(url)
+        .cloned()
+}
+
+/// 标记一个地址不通（记住原因；先标记的胜出，本进程内不再碰它）。
+pub(crate) fn mark_dead(url: &str, reason: &str) {
+    dead_endpoints()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .entry(url.to_string())
+        .or_insert_with(|| reason.to_string());
+}
+
+/// 被封禁的地址与其原因（`/model` 展示用），按地址排序。
+pub fn dead_endpoints_snapshot() -> Vec<(String, String)> {
+    let map = dead_endpoints()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .map(|(url, reason)| (url.clone(), reason.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// 清除全部封禁（`/model reset` 手动重新启用），返回清掉的条数。
+pub fn clear_dead() -> usize {
+    let mut map = dead_endpoints()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let count = map.len();
+    map.clear();
+    count
 }
 
 /// 一次 AI 生成的结果：正文 + 实际出活的模型。
@@ -305,7 +330,7 @@ pub fn ai_candidates() -> Result<Vec<AiModel>> {
 }
 
 /// 跑一次 AI 生成：按 `models.json` 的顺序轮着试，**第一家不通就换下一家**；
-/// 网络级失败把地址记进冷却表，一段时间内不再重复尝试。
+/// 网络级失败把地址记进死表，**本次运行内不再尝试**（重启才重新启用）。
 pub(crate) fn ai_generate(models: &[AiModel], prompt: &str) -> Result<Generated> {
     let mut last = String::from("没有配置任何模型");
     for ai in models {
@@ -324,17 +349,17 @@ pub(crate) fn ai_generate(models: &[AiModel], prompt: &str) -> Result<Generated>
 
 /// 在**一家**模型内部按候选型号依次试：
 ///
-/// * 地址在冷却中 → 直接跳过（这一段几乎零耗时，不挨超时）；
-/// * 网络级失败（连不上/超时）→ 记冷却、换下一个型号，而不是立刻放弃；
+/// * 地址已被标记不通（启动探测/上次失败）→ 直接跳过，带上当时的原因；
+/// * 网络级失败（连不上/超时）→ 记入死表、换下一个型号，而不是立刻放弃；
 /// * key 被拒（401/403）→ 换型号没用，立刻报错让上层换下一家；
 /// * 200 但正文为空/读不懂 → 换下一个型号。
 fn ai_generate_one(ai: &AiModel, prompt: &str) -> Result<String> {
     let mut last = format!("没有可用的型号（{}）", ai.name);
-    // 网络级失败的原始错误优先展示：冷却跳过只是后果，根因是「连不上」。
+    // 网络级失败的原始错误优先展示：跳过只是后果，根因是「连不上」。
     let mut network_failure: Option<String> = None;
     for (url, model) in &ai.models {
-        if is_cooling(url) {
-            last = format!("{} {model} 地址冷却中（刚试过不通）", ai.name);
+        if let Some(reason) = dead_reason(url) {
+            last = format!("{} {model} 已标记不通，跳过 · {reason}", ai.name);
             continue;
         }
         let payload = serde_json::json!({
@@ -353,10 +378,10 @@ fn ai_generate_one(ai: &AiModel, prompt: &str) -> Result<String> {
         .send()
         {
             Ok(response) => response,
-            // 网络级失败：记冷却换下一个型号——一次不通就够了。
+            // 网络级失败：记入死表换下一个型号——一次不通就够了，本次运行不再碰。
             Err(err) => {
-                mark_dead(url);
                 let message = format!("{} {model} 连不上（{}）· {err}", ai.name, link_note());
+                mark_dead(url, &message);
                 network_failure.get_or_insert(message.clone());
                 last = message;
                 continue;
@@ -871,6 +896,10 @@ pub(crate) mod tests {
     /// 两个测试同时改会互相读到对方的目录。
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// 封禁表是进程级的：碰死表的测试（标记 / reset 清空）共用这把锁，
+    /// 免得一个测试刚标记、另一个测试的 reset 把它清掉造成偶发失败。
+    pub(crate) static DEAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
@@ -1153,14 +1182,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_dead_endpoint_cools_down_instead_of_being_retried() {
-        // 网络级失败只试一次：标记后冷却期内直接跳过，后面各段零耗时绕开。
+    fn a_dead_endpoint_is_marked_for_the_rest_of_the_run() {
+        // 网络级失败只试一次：记入死表后本进程内直接跳过，带上当时的原因；
+        // 不过期，重启才重新启用。
+        let _guard = DEAD_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let url = "https://cooldown-test.invalid/v1/chat/completions";
-        assert!(!is_cooling(url), "没试过的地址不冷却");
-        mark_dead(url);
-        assert!(is_cooling(url), "试过一次不通，冷却期内不再重试");
+        assert!(dead_reason(url).is_none(), "没试过的地址不标记");
+        mark_dead(url, "启动探测：连不上");
+        assert_eq!(dead_reason(url).as_deref(), Some("启动探测：连不上"));
+        // 先记的原因胜出（后续失败不覆盖探测结论）。
+        mark_dead(url, "又一次超时");
+        assert_eq!(dead_reason(url).as_deref(), Some("启动探测：连不上"));
         // 别的地址不受影响。
-        assert!(!is_cooling("https://other.invalid/chat"));
+        assert!(dead_reason("https://other.invalid/chat").is_none());
     }
 
     #[test]

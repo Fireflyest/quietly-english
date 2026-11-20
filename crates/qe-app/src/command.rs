@@ -43,6 +43,8 @@ pub enum Command {
     Quiz(String),
     /// `/practice <url>`：从中文网页按段生成翻译练习（AI 生成英文参考）。
     Practice(String),
+    /// `/model [reset]`：看模型候选顺序与封禁；reset 解封并重新探测。
+    Model(String),
     /// `/goto <n>`：跳到第 n 段。
     Goto(String),
     /// `/take <n>`：把当前段第 n 个候选词收进词书。
@@ -254,6 +256,12 @@ pub const SPECS: &[Spec] = &[
         help: "list exercise collections, import from a page, run daily discovery",
     },
     Spec {
+        name: "/model",
+        alias: "models",
+        args: " [reset]",
+        help: "model order, first pick & banned endpoints; reset re-enables them",
+    },
+    Spec {
         name: "/apikey",
         alias: "key",
         args: " <set|list|clear>",
@@ -338,6 +346,7 @@ impl Command {
             "apikey" | "key" => Command::ApiKey(arg),
             "quiz" | "test" => Command::Quiz(arg),
             "practice" => Command::Practice(arg),
+            "model" | "models" => Command::Model(arg),
             "goto" | "g" => Command::Goto(arg),
             "take" | "keep" => Command::Take(arg),
             "drop" | "delete" | "forget" => Command::Drop(arg),
@@ -468,6 +477,7 @@ pub const ARG_KINDS: &[(&str, ArgKind)] = &[
     ("/drop", ArgKind::Text),
     ("/mode", ArgKind::Choice(&["full", "intensive"])),
     ("/apikey", ArgKind::ApiKey),
+    ("/model", ArgKind::Choice(&["reset"])),
     ("/study", ArgKind::Number),
     ("/limit", ArgKind::Number),
     ("/goto", ArgKind::Number),
@@ -673,6 +683,17 @@ mod tests {
         assert_eq!(Command::parse("/limit 30"), Some(Command::Limit(Some(30))));
         assert_eq!(Command::parse("/limit"), Some(Command::Limit(None)));
         assert_eq!(Command::parse("/add serendipity"), Some(Command::Add("serendipity".into())));
+    }
+
+    #[test]
+    fn parses_model_status_and_reset() {
+        assert_eq!(Command::parse("/model"), Some(Command::Model(String::new())));
+        assert_eq!(
+            Command::parse("/model reset"),
+            Some(Command::Model("reset".into()))
+        );
+        assert_eq!(Command::parse("/models"), Some(Command::Model(String::new())));
+        assert_eq!(arg_kind("/model"), ArgKind::Choice(&["reset"]));
     }
 
     #[test]
