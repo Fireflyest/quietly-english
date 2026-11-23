@@ -2444,6 +2444,8 @@ impl App {
         };
         let book_id = session.book.id;
         let first_time = session.graded.is_none();
+        // 空格已经揭晓过的卡：评级只是补状态，不该重放过渡。
+        let was_revealed = session.revealed;
         let card_message = session.card_msg.unwrap_or(0);
         let was_new = card.is_new;
 
@@ -2524,10 +2526,13 @@ impl App {
             }
         }
 
-        // Only the first rating reveals the answer. Re-rating an already
-        // expanded card updates its review state without replaying the reveal.
+        // 流式过渡只在「评级本身负责揭晓」时启动（没按空格直接给分）；
+        // 空格已经揭晓过的，评级保持原状——过渡在跑就让它跑完，已出齐全量显示，
+        // 绝不把整卡重流一遍。改分（非首次评级）同样直接给全量。
         if first_time {
-            self.study_fade_started = Some(Instant::now());
+            if !was_revealed {
+                self.study_fade_started = Some(Instant::now());
+            }
         } else {
             self.study_fade_started = None;
         }
@@ -3057,6 +3062,34 @@ mod tests {
             .find_map(|message| message.card_state())
             .and_then(|state| state.stream);
         assert!(stream.is_none(), "出齐后全量显示");
+    }
+
+    #[test]
+    fn grading_after_the_space_reveal_does_not_replay_the_stream() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+
+        // 空格揭晓（过渡走起），流式跑完。
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.study_fade_started.is_some(), "空格揭晓走流式");
+        app.study_fade_started = None;
+
+        // 再按等级：只更新状态，不重放过渡——这就是「先空格再评分会刷新」的修复。
+        app.grade(Rating::Good).unwrap();
+        assert!(
+            app.study_fade_started.is_none(),
+            "空格揭晓过的卡，评级不重放流式"
+        );
+
+        // 没揭晓直接评级：评级本身负责揭晓，走流式。
+        app.advance().unwrap();
+        app.study_fade_started = None; // 先收掉新卡过渡，隔离断言
+        app.grade(Rating::Easy).unwrap();
+        assert!(
+            app.study_fade_started.is_some(),
+            "直接评级 = 揭晓，仍走流式"
+        );
     }
 
     #[test]
