@@ -30,6 +30,9 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// How many ratings can be undone in one session.
 const MAX_UNDO: usize = 50;
 
+/// 学习卡流式的时长（毫秒）：内容按进度从头吐出，到点给全量。
+const STUDY_STREAM_MS: u64 = 600;
+
 /// One reversible grading action.
 struct UndoEntry {
     /// 卡片按 lemma 归属（`cards` 表的主键），不是词典里的 `words.id`。
@@ -105,7 +108,7 @@ pub struct App {
     prev_anchor: Option<usize>,
     /// 上次为阅读进度条重绘的时间。
     reading_progress_tick: Instant,
-    /// Start time of the short progressive reveal when advancing to a card.
+    /// 学习卡流式的起点：内容按进度从头吐出，[`STUDY_STREAM_MS`] 出齐。
     study_fade_started: Option<Instant>,
     /// 阅读过渡的起点：新文章的段落按顺序分批加载。
     pub(crate) reading_fade_started: Option<Instant>,
@@ -612,7 +615,7 @@ impl App {
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
             if let Some(started) = self.study_fade_started {
-                if started.elapsed() >= Duration::from_millis(600) {
+                if started.elapsed() >= Duration::from_millis(STUDY_STREAM_MS) {
                     self.study_fade_started = None;
                     let _ = self.render_card();
                 } else {
@@ -644,8 +647,10 @@ impl App {
                 }
             }
 
-            // 流式过渡期间把轮询加密到 50ms：字往外蹦得才顺。
-            let poll_ms = if self.reading_fade_started.is_some() {
+            // 流式过渡（阅读与学习卡）期间把轮询加密到 50ms：字往外蹦得才顺。
+            let poll_ms = if self.reading_fade_started.is_some()
+                || self.study_fade_started.is_some()
+            {
                 50
             } else {
                 120
@@ -2223,18 +2228,13 @@ impl App {
         let Some(card) = session.current.clone() else {
             return Ok(());
         };
-        let fade_stage = self.study_fade_started.map(|started| {
+        // 流式：卡片内容按进度从头吐出，[`STUDY_STREAM_MS`] 出齐（和阅读同一手感）。
+        let stream = self.study_fade_started.and_then(|started| {
             let elapsed = started.elapsed();
-            if elapsed < Duration::from_millis(120) {
-                0
-            } else if elapsed < Duration::from_millis(240) {
-                1
-            } else if elapsed < Duration::from_millis(360) {
-                2
-            } else if elapsed < Duration::from_millis(480) {
-                3
+            if elapsed >= Duration::from_millis(STUDY_STREAM_MS) {
+                None
             } else {
-                4
+                Some(elapsed.as_millis() as f32 / STUDY_STREAM_MS as f32)
             }
         });
 
@@ -2249,8 +2249,8 @@ impl App {
         let mut state = CardState::new(card.word.clone(), session.badge())
             .hint(session.hint)
             .accent(accent);
-        if let Some(stage) = fade_stage {
-            state = state.fade_stage(stage);
+        if let Some(progress) = stream {
+            state = state.stream(progress);
         }
         if session.revealed {
             state = state.revealed();
@@ -2980,6 +2980,32 @@ mod tests {
             .collect::<Vec<_>>(),
             "resume keeps the remaining queue order"
         );
+    }
+
+    #[test]
+    fn a_study_card_streams_then_settles_to_full_content() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+
+        let stream = app
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.card_state())
+            .and_then(|state| state.stream);
+        let progress = stream.expect("新卡走流式输出");
+        assert!(progress < 1.0, "刚开始只吐一部分：{progress}");
+
+        // 流式结束（状态被收掉）→ 重画，内容全量。
+        app.study_fade_started = None;
+        app.render_card().unwrap();
+        let stream = app
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.card_state())
+            .and_then(|state| state.stream);
+        assert!(stream.is_none(), "出齐后全量显示");
     }
 
     #[test]

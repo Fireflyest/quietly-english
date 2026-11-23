@@ -590,13 +590,8 @@ impl ToolView {
             view.result_meta = Some(meta);
         }
 
-        let reveal_stage = state.fade_stage.unwrap_or(4);
-        if reveal_stage == 0 {
-            return view;
-        }
-        if reveal_stage == 1 {
-            return view.muted("…".to_string());
-        }
+        // 过渡期的“分段揭示”已由字符级流式取代：内容按 `stream` 进度从头吐出，
+        // 这里只负责「能不能看」（未揭晓只给提示），不再分档。
 
         if !state.revealed {
             for line in state.hint_lines() {
@@ -619,11 +614,7 @@ impl ToolView {
             let (common, secondary): (Vec<&crate::text::Sense>, Vec<&crate::text::Sense>) =
                 parsed.senses.iter().partition(|sense| !sense.is_secondary());
 
-            let common_limit = if reveal_stage == 2 {
-                1
-            } else {
-                MAX_CARD_SENSES.min(common.len())
-            };
+            let common_limit = MAX_CARD_SENSES.min(common.len());
             for sense in common.into_iter().take(common_limit) {
                 view = view.line(ToolLine::Sense {
                     label: sense.pos.clone(),
@@ -631,7 +622,7 @@ impl ToolView {
                 });
             }
 
-            if reveal_stage >= 3 && !secondary.is_empty() {
+            if !secondary.is_empty() {
                 view = view.muted("rare / technical".to_string());
                 for sense in &secondary {
                     view = view.line(ToolLine::Sense {
@@ -641,10 +632,8 @@ impl ToolView {
                 }
             }
 
-            if reveal_stage >= 3 {
-                if let Some(forms) = parsed.forms {
-                    view = view.muted(forms);
-                }
+            if let Some(forms) = parsed.forms {
+                view = view.muted(forms);
             }
         }
 
@@ -652,7 +641,7 @@ impl ToolView {
         // "Japanese rice wine" in the Chinese source, so it shows up here.
         // Folded by default — it is supporting detail, and up to six lines of it
         // would push the Chinese senses off the screen.
-        if reveal_stage >= 3 && !word.glosses.is_empty() {
+        if !word.glosses.is_empty() {
             if state.expand_glosses {
                 view = view.spacer().muted("more meanings".to_string());
                 for gloss in word.glosses.iter().take(MAX_CARD_GLOSSES) {
@@ -669,13 +658,11 @@ impl ToolView {
             }
         }
 
-        if reveal_stage >= 3 {
-            if let Some(definition) = &word.definition {
-                view = view.muted(definition.clone());
-            }
+        if let Some(definition) = &word.definition {
+            view = view.muted(definition.clone());
         }
 
-        if reveal_stage >= 3 && !word.collocations.is_empty() {
+        if !word.collocations.is_empty() {
             // No `phrases` label here: the table names its own columns, and a label
             // on top of a `phrase | meaning` header just says it twice.
             view = view.spacer();
@@ -688,7 +675,7 @@ impl ToolView {
         }
 
         let roots = word.roots();
-        if reveal_stage >= 4 && !roots.is_empty() {
+        if !roots.is_empty() {
             // Rendered like a function definition, because that is what a word's
             // morphology actually is: a name applied to typed parts.
             //
@@ -735,7 +722,7 @@ impl ToolView {
             }));
         }
 
-        if reveal_stage >= 4 && !word.examples.is_empty() {
+        if !word.examples.is_empty() {
             // Examples live in the right-hand column so the meaning and the
             // etymology keep the left, and the headword inside each sentence is
             // highlighted against its surroundings.
@@ -750,7 +737,7 @@ impl ToolView {
             }
         }
 
-        if reveal_stage >= 4 && state.show_ratings {
+        if state.show_ratings {
             view = view.spacer().line(ToolLine::Rating {
                 selected: state.graded,
             });
@@ -785,8 +772,10 @@ pub struct CardState {
     /// The English glosses are a nice-to-have next to the Chinese senses, so they
     /// stay folded until asked for; `m` flips this on every card at once.
     pub expand_glosses: bool,
-    /// Progressive reveal stage for a newly arrived study card.
-    pub fade_stage: Option<u8>,
+    /// 流式输出进度（`0.0..=1.0`）；`None` = 全文直接显示。
+    ///
+    /// 新卡到达、揭晓答案时由 app 每帧推进，内容像打字机一样从头吐出。
+    pub stream: Option<f32>,
 }
 
 impl CardState {
@@ -802,7 +791,7 @@ impl CardState {
             footer: None,
             accent: Accent::Neutral,
             expand_glosses: false,
-            fade_stage: None,
+            stream: None,
         }
     }
 
@@ -851,8 +840,8 @@ impl CardState {
         self
     }
 
-    pub fn fade_stage(mut self, stage: u8) -> Self {
-        self.fade_stage = Some(stage);
+    pub fn stream(mut self, progress: f32) -> Self {
+        self.stream = Some(progress);
         self
     }
 

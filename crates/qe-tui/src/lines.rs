@@ -20,6 +20,7 @@ use qe_core::model::Rating;
 use qe_core::view::{Accent, Body, CodeBlock, Message, Role, TableView, ToolLine, ToolView};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
@@ -130,6 +131,60 @@ pub fn pad_left(text: &str, width: usize) -> String {
     }
 }
 
+/// 流式输出：按「进度 × 全文字符数」从头裁掉超出的部分，字符逐个露出。
+///
+/// 至少给 12 个字符——第一帧先露出词头，不白屏；进度到 1.0（或内容太短）时原样返回。
+pub fn stream_cut(lines: Vec<Line<'static>>, progress: f32) -> Vec<Line<'static>> {
+    const FLOOR: usize = 12;
+    let total: usize = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.chars().count())
+        .sum();
+    let budget = ((total as f32 * progress.clamp(0.0, 1.0)) as usize)
+        .max(FLOOR)
+        .min(total);
+    if budget >= total {
+        return lines;
+    }
+    let mut remaining = budget;
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if remaining == 0 {
+            break;
+        }
+        let mut line = line;
+        let mut stop = false;
+        for span in &mut line.spans {
+            let chars = span.content.chars().count();
+            if chars <= remaining {
+                remaining -= chars;
+            } else {
+                // 裁到最后一个完整字符，不留半个字。
+                let byte = span
+                    .content
+                    .char_indices()
+                    .nth(remaining)
+                    .map(|(at, _)| at)
+                    .unwrap_or(0);
+                span.content = Cow::Owned(span.content[..byte].to_string());
+                remaining = 0;
+                stop = true;
+                break;
+            }
+            if remaining == 0 {
+                stop = true;
+                break;
+            }
+        }
+        out.push(line);
+        if stop {
+            break;
+        }
+    }
+    out
+}
+
 /// 消息 → 若干渲染行。
 pub fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
     message_lines_hits(message, width).0
@@ -168,7 +223,13 @@ pub fn message_lines_hits(message: &Message, width: usize) -> (Vec<Line<'static>
             BlockHits::default(),
         ),
         Body::Tool(tool) => tool_lines_hits(tool, width),
-        Body::Card(state) => tool_lines_hits(&ToolView::word_card(state), width),
+        Body::Card(state) => {
+            let (mut lines, hits) = tool_lines_hits(&ToolView::word_card(state), width);
+            if let Some(progress) = state.stream {
+                lines = stream_cut(lines, progress);
+            }
+            (lines, hits)
+        }
         Body::Table(table) => (table_lines(table, width), BlockHits::default()),
     }
 }
@@ -1380,6 +1441,44 @@ fn table_lines(table: &TableView, width: usize) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_cuts_lines_at_a_character_budget() {
+        // 三行共 26 字符。
+        let lines = || {
+            vec![
+                Line::from("abcdefghij"),
+                Line::from("klmnopqrst"),
+                Line::from("uvwxyz"),
+            ]
+        };
+
+        // 进度 0.5 → 13 字符：第一行整行 + 第二行前 3 个。
+        let cut = stream_cut(lines(), 0.5);
+        assert_eq!(cut.len(), 2);
+        assert_eq!(cut[0].spans[0].content, "abcdefghij");
+        assert_eq!(cut[1].spans[0].content, "klm");
+
+        // 进度 0.75 → 19 字符：第二行裁到 9 个，不留半个字。
+        let cut = stream_cut(lines(), 0.75);
+        assert_eq!(cut.len(), 2);
+        assert_eq!(cut[1].spans[0].content, "klmnopqrs");
+
+        // 进度 0 → 下限 12 字符：第一帧先露出词头，不白屏。
+        let cut = stream_cut(lines(), 0.0);
+        assert_eq!(cut.len(), 2);
+        assert_eq!(cut[1].spans[0].content, "kl");
+
+        // 出齐 → 原样。
+        let cut = stream_cut(lines(), 1.0);
+        assert_eq!(cut.len(), 3);
+
+        // 内容比下限还短：原样返回，不越界。
+        let tiny = vec![Line::from("hi")];
+        let cut = stream_cut(tiny, 0.0);
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].spans[0].content, "hi");
+    }
 
     fn flat(lines: &[Line<'static>]) -> Vec<String> {
         lines
