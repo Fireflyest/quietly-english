@@ -7,7 +7,7 @@
 use qe_core::view::Message;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::lines::{display_width, tail, truncate};
@@ -17,6 +17,15 @@ use crate::theme;
 pub enum ViewMode {
     Input,
     Study,
+}
+
+/// 一条右上角的悬浮提示：后台任务、瞬时状态这类**不占对话历史**的消息，
+/// 几秒后自动消失。
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub text: String,
+    /// 警告/失败样式（红），普通信息用默认样式。
+    pub warn: bool,
 }
 
 /// One inline completion hint: `(prefix, description)`.
@@ -48,6 +57,8 @@ pub struct View<'a> {
     pub cursor_on: bool,
     /// Messages arrived while scrolled back.
     pub unread: u16,
+    /// 右上角的悬浮提示（过期由 app 剔除，渲染只管画）。
+    pub toasts: &'a [Toast],
 }
 
 /// Geometry captured during a draw so the app can map mouse events back to it.
@@ -120,7 +131,48 @@ pub fn draw(frame: &mut Frame, view: &View) -> DrawInfo {
     render_rule(frame, rows[3]);
     render_input(frame, rows[4], view);
     render_footer(frame, rows[5], view);
+    // 悬浮提示最后画：盖在顶栏右上角，不参与布局。
+    render_toasts(frame, area, view.toasts);
     info
+}
+
+/// 右上角的悬浮提示：带边框的小块竖着叠在顶栏上，最多四条。
+fn render_toasts(frame: &mut Frame, area: Rect, toasts: &[Toast]) {
+    if toasts.is_empty() || area.width < 16 || area.height < 4 {
+        return;
+    }
+    let width = area.width.min(46);
+    let inner = usize::from(width.saturating_sub(2)).max(8);
+    let mut y = area.y;
+    for toast in toasts.iter().take(4) {
+        let remaining = area.height.saturating_sub(y - area.y);
+        if remaining < 3 {
+            break;
+        }
+        let wrapped = crate::lines::wrap(&toast.text, inner);
+        let height = (u16::try_from(wrapped.len()).unwrap_or(u16::MAX) + 2).min(remaining);
+        let rect = Rect {
+            x: area.x + area.width - width,
+            y,
+            width,
+            height,
+        };
+        let style = if toast.warn {
+            theme::warn()
+        } else {
+            theme::bold()
+        };
+        let lines: Vec<Line> = wrapped
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, style)))
+            .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::dim());
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
+        y += height + 1;
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, view: &View) {
@@ -494,6 +546,7 @@ mod tests {
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
+            toasts: &[],
         };
         let text = render_to_string(&view, 100, 24);
         assert!(text.contains("CET-4"));
@@ -530,6 +583,7 @@ mod tests {
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
+            toasts: &[],
         };
         let text = render_to_string(&view, 60, 12);
         assert!(text.contains('█'), "thumb should be visible:\n{text}");
@@ -552,6 +606,7 @@ mod tests {
             scroll_back,
             cursor_on: true,
             unread: 0,
+            toasts: &[],
         }
     }
 
@@ -628,6 +683,7 @@ mod tests {
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
+            toasts: &[],
         };
         let text = render_to_string(&view, 40, 10);
         let alpha = text.lines().position(|l| l.contains("alpha")).unwrap();
@@ -657,6 +713,7 @@ mod tests {
             scroll_back: 0,
             cursor_on,
             unread: 0,
+            toasts: &[],
         }
     }
 
@@ -725,6 +782,7 @@ mod tests {
             scroll_back: 0,
             cursor_on: true,
             unread: 0,
+            toasts: &[],
         };
         let buffer = buffer_of(&view, 80, 24);
         let panel = theme::PANEL_BG;

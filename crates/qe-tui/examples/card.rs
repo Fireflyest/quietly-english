@@ -57,6 +57,7 @@ fn main() {
         scroll_back: 0,
         cursor_on: false,
         unread: 0,
+        toasts: &[],
     };
 
     let backend = TestBackend::new(width, height);

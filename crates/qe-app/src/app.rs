@@ -14,7 +14,7 @@ use crossterm::event::{
 use qe_core::model::{Book, Rating, SessionLog, SrsCard, StudyCard, Word};
 use qe_core::view::{summary_tool, Accent, CardState, Message, SummaryStatus, TableView, ToolView};
 use qe_core::{srs, time, Store};
-use qe_tui::{draw, DrawInfo, Suggestion, TerminalSession, View, ViewMode};
+use qe_tui::{draw, DrawInfo, Suggestion, TerminalSession, Toast, View, ViewMode};
 
 use crate::command::{self, Command};
 use crate::editor::Editor;
@@ -32,6 +32,14 @@ const MAX_UNDO: usize = 50;
 
 /// 学习卡流式的时长（毫秒）：内容按进度从头吐出，到点给全量。
 const STUDY_STREAM_MS: u64 = 600;
+
+/// 一条右上角的悬浮提示：不写进对话历史，[`App::live_toasts`] 到点剔除。
+#[derive(Debug)]
+struct FloatingNote {
+    text: String,
+    warn: bool,
+    until: Instant,
+}
 
 /// One reversible grading action.
 struct UndoEntry {
@@ -122,6 +130,8 @@ pub struct App {
     /// 背完一轮后 AI 总结建议的后台通道。
     advice_fetch:
         Option<std::sync::mpsc::Receiver<Result<crate::translator::Generated, String>>>,
+    /// 右上角的悬浮提示（后台任务、瞬时状态），几秒自动消失。
+    floating: Vec<FloatingNote>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落, 段落结果)`。
     pub(crate) translation_fetch: Option<(
         i64,
@@ -185,6 +195,7 @@ impl App {
             news_fetch: None,
             practice_fetch: None,
             advice_fetch: None,
+            floating: Vec::new(),
             translation_fetch: None,
             db_path: None,
         };
@@ -209,7 +220,7 @@ impl App {
     /// 立刻抓一次（`/news`），不受「今天已抓过」限制。
     pub fn fetch_news_now(&mut self) -> Result<()> {
         if self.news_fetch.is_some() {
-            self.note("already fetching news · one moment");
+            self.float("already fetching news · one moment");
             return Ok(());
         }
         if self.db_path.is_none() {
@@ -217,6 +228,42 @@ impl App {
             return Ok(());
         }
         self.spawn_news_fetch()
+    }
+
+    /// 右上角悬浮几秒的提示：后台任务的开始/失败、瞬时状态这类**不需要留档**
+    /// 的信息才进来——要能回看的仍走 [`Self::note`] 进对话。
+    fn float(&mut self, text: impl Into<String>) {
+        self.push_floating(text, false);
+    }
+
+    /// 警告样式的悬浮提示（红字），用于失败类消息。
+    fn float_warn(&mut self, text: impl Into<String>) {
+        self.push_floating(text, true);
+    }
+
+    fn push_floating(&mut self, text: impl Into<String>, warn: bool) {
+        self.floating.push(FloatingNote {
+            text: text.into(),
+            warn,
+            until: Instant::now() + Duration::from_secs(5),
+        });
+        // 最多叠四条：新的顶掉最老的，别糊满右上角。
+        if self.floating.len() > 4 {
+            self.floating.remove(0);
+        }
+    }
+
+    /// 给这一帧的悬浮提示：先剔除过期的，再映射成渲染层要的 `Toast`。
+    fn live_toasts(&mut self) -> Vec<Toast> {
+        self.floating
+            .retain(|note| note.until > Instant::now());
+        self.floating
+            .iter()
+            .map(|note| Toast {
+                text: note.text.clone(),
+                warn: note.warn,
+            })
+            .collect()
     }
 
     fn spawn_news_fetch(&mut self) -> Result<()> {
@@ -231,7 +278,7 @@ impl App {
             let _ = sender.send(outcome);
         });
         self.news_fetch = Some(receiver);
-        self.note("fetching reading material in the background …");
+        self.float("fetching reading material in the background …");
         Ok(())
     }
 
@@ -258,13 +305,13 @@ impl App {
                         view.muted("/library shows the books · /read <slug> starts one"),
                     ));
                 } else {
-                    self.note(format!("news: nothing new · {}", report.summary()));
+                    self.float(format!("news: nothing new · {}", report.summary()));
                 }
             }
             Ok(Err(error)) => {
                 self.news_fetch = None;
                 // 网络不通不该打断阅读：给一行提示，下次启动再试。
-                self.note(format!("news fetch failed · {error}"));
+                self.float_warn(format!("news fetch failed · {error}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -282,7 +329,7 @@ impl App {
         }
         if arg.eq_ignore_ascii_case("daily") {
             if self.practice_fetch.is_some() {
-                self.note("already importing · one moment");
+                self.float("already importing · one moment");
                 return Ok(());
             }
             return self.spawn_practice_daily();
@@ -346,7 +393,7 @@ impl App {
                 let cleared = crate::translator::clear_dead();
                 // 只在真实 TUI 里真的重探（`db_path` 门控在 probe_models 里）。
                 self.probe_models();
-                self.note(format!(
+                self.float(format!(
                     "model bans cleared ({cleared}) · re-probing in the background"
                 ));
                 Ok(())
@@ -441,7 +488,7 @@ impl App {
             return Ok(());
         };
         if self.practice_fetch.is_some() {
-            self.note("already importing · one moment");
+            self.float("already importing · one moment");
             return Ok(());
         }
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -459,14 +506,14 @@ impl App {
             let _ = sender.send(outcome);
         });
         self.practice_fetch = Some(receiver);
-        self.note("checking practice sources in the background …");
+        self.float("checking practice sources in the background …");
         Ok(())
     }
 
     /// `/practice <url>`：后台抓中文网页、按段建题，界面不阻塞。
     fn import_practice(&mut self, url: &str) -> Result<()> {
         if self.practice_fetch.is_some() {
-            self.note("already importing · one moment");
+            self.float("already importing · one moment");
             return Ok(());
         }
         let url = url.trim().to_string();
@@ -490,7 +537,7 @@ impl App {
             let _ = sender.send(outcome);
         });
         self.practice_fetch = Some(receiver);
-        self.note("importing exercises from the page in the background …");
+        self.float("importing exercises from the page in the background …");
         Ok(())
     }
 
@@ -515,7 +562,7 @@ impl App {
                         view.muted("translate-practice history <id> 看题目 · submit 作答"),
                     ));
                 } else if report.notes.is_empty() {
-                    self.note(format!("practice: nothing new · {}", report.summary()));
+                    self.float(format!("practice: nothing new · {}", report.summary()));
                 } else {
                     // 没有新题但有话说（来源没配、列表页抓不开……）。
                     let mut view = ToolView::new("practice")
@@ -529,7 +576,7 @@ impl App {
             }
             Ok(Err(error)) => {
                 self.practice_fetch = None;
-                self.note(format!("practice import failed · {error}"));
+                self.float_warn(format!("practice import failed · {error}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -564,6 +611,9 @@ impl App {
                 "type a word, or / for commands"
             };
 
+            // 悬浮提示：剔除过期的，取活的给这一帧（右上角，不占对话历史）。
+            let toasts = self.live_toasts();
+
             let view = View {
                 messages: &self.messages,
                 input: &input,
@@ -580,6 +630,7 @@ impl App {
                 scroll_back: self.scroll_back,
                 cursor_on: self.cursor_on,
                 unread: self.unread,
+                toasts: &toasts,
             };
 
             let mut info = DrawInfo::default();
@@ -641,9 +692,9 @@ impl App {
                 let on = !terminal.mouse_enabled();
                 terminal.set_mouse(on)?;
                 if on {
-                    self.note("mouse capture on · scroll and click work, text selection is off");
+                    self.float("mouse capture on · scroll and click work, text selection is off");
                 } else {
-                    self.note("mouse capture off · select and copy with the mouse · F2 to restore");
+                    self.float("mouse capture off · select and copy with the mouse · F2 to restore");
                 }
             }
 
@@ -2527,7 +2578,7 @@ impl App {
         self.push_summary()?;
         // 统计之后补一条 AI 总结建议：后台生成，好了再上屏，不卡结束这一下。
         self.spawn_summary_advice(session.new_done, session.review_done);
-        self.note("session ended · /study again, or type a word");
+        self.float("session ended · /study again, or type a word");
         self.refresh_status();
         Ok(())
     }
@@ -2607,7 +2658,7 @@ impl App {
             }
             Ok(Err(error)) => {
                 self.advice_fetch = None;
-                self.note(format!("ai advice unavailable · {error}"));
+                self.float_warn(format!("ai advice unavailable · {error}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -4168,7 +4219,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_fetch_is_a_note_not_an_error_block() {
+    fn a_failed_fetch_floats_a_warning_not_an_error_block() {
         let Harness { mut app, _dir } = harness();
         let (sender, receiver) = std::sync::mpsc::channel();
         app.news_fetch = Some(receiver);
@@ -4176,11 +4227,20 @@ mod tests {
 
         app.poll_news_fetch();
         assert!(app.news_fetch.is_none());
+        // 失败走右上角红色悬浮：仍然可见，但不占对话历史、更不是错误块。
         assert!(
-            app.messages
+            app.floating.iter().any(|note| note.warn
+                && note.text.contains("news fetch failed")
+                && note.text.contains("offline")),
+            "the failure is visible: {:?}",
+            app.floating
+        );
+        assert!(
+            !app
+                .messages
                 .iter()
                 .any(|message| matches!(&message.body, Body::Text(text) if text.contains("offline"))),
-            "the failure is visible"
+            "失败不写进对话"
         );
         assert!(
             app.store.setting("news_fetched_on").unwrap().is_none(),
@@ -4251,7 +4311,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ai_advice_arrives_as_its_own_block_and_failures_become_notes() {
+    fn the_ai_advice_arrives_as_its_own_block_and_failures_float() {
         let Harness { mut app, _dir } = harness();
         // 成功：补一条 advice 面板，badge 是实际出活的模型。
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -4269,14 +4329,20 @@ mod tests {
             Body::Tool(view) if view.name == "advice" && view.badge.as_deref() == Some("deepseek")
         )));
 
-        // 失败：一行说明，不打断统计。
+        // 失败：右上角红色悬浮提示，不打断统计、不占历史。
         let (sender, receiver) = std::sync::mpsc::channel();
         sender
             .send(Err("所有模型都试过了 · Gemini 连不上".into()))
             .unwrap();
         app.advice_fetch = Some(receiver);
         app.poll_summary_advice();
-        assert!(app.messages.iter().any(|message| matches!(
+        assert!(
+            app.floating
+                .iter()
+                .any(|note| note.warn && note.text.contains("ai advice unavailable")),
+            "失败走红色悬浮"
+        );
+        assert!(!app.messages.iter().any(|message| matches!(
             &message.body,
             Body::Text(text) if text.contains("ai advice unavailable")
         )));
@@ -4368,10 +4434,26 @@ mod tests {
             crate::translator::dead_reason("https://banned-test.invalid/chat").is_none(),
             "reset 解除封禁"
         );
-        assert!(app.messages.iter().any(|message| matches!(
-            &message.body,
-            Body::Text(text) if text.contains("model bans cleared") && text.contains("re-probing")
-        )));
+        // 临时回执走右上角悬浮，不占对话历史。
+        assert!(
+            app.floating
+                .iter()
+                .any(|note| note.text.contains("model bans cleared")),
+            "回执进了悬浮区：{:?}",
+            app.floating
+        );
+        assert!(
+            !app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Text(text) if text.contains("model bans cleared")
+            )),
+            "悬浮消息不写进对话"
+        );
+        // 到点自动清掉。
+        app.floating[0].until = Instant::now() - Duration::from_secs(1);
+        let live = app.live_toasts();
+        assert!(live.is_empty(), "过期的悬浮提示被剔除");
+        assert!(app.floating.is_empty());
     }
 
     #[test]
