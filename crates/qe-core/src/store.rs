@@ -137,6 +137,9 @@ pub trait Store {
 
     // ---- 统计 ----
     fn daily(&self, day: NaiveDate) -> Result<DailyStats>;
+    /// 从 `from` 起连续 `days` 天的统计，按日历顺序；缺记录的天补零
+    /// （7 天平均、趋势条形图都要按自然日算，不能漏天）。
+    fn daily_history(&self, from: NaiveDate, days: usize) -> Result<Vec<DailyStats>>;
     fn streak(&self) -> Result<u32>;
     fn upcoming(&self, from: NaiveDate, days: usize) -> Result<Vec<(NaiveDate, u32)>>;
     fn review_stats(&self, day: NaiveDate, limit: usize) -> Result<ReviewStats>;

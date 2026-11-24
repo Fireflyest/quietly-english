@@ -2067,6 +2067,72 @@ impl Store for SqliteStore {
         })
     }
 
+    fn daily_history(&self, from: NaiveDate, days: usize) -> Result<Vec<DailyStats>> {
+        let end = from + ChronoDuration::days(days as i64);
+        let mut by_day: std::collections::HashMap<String, DailyStats> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT day, COUNT(*), COALESCE(SUM(is_new), 0),
+                        COALESCE(SUM(rating = 'again'), 0), COALESCE(SUM(rating = 'hard'), 0),
+                        COALESCE(SUM(rating = 'good'), 0), COALESCE(SUM(rating = 'easy'), 0)
+                 FROM reviews
+                 WHERE day >= ?1 AND day < ?2
+                 GROUP BY day",
+            )?;
+            let rows = stmt.query_map(
+                [time::format_day(from), time::format_day(end)],
+                |row| {
+                    // 列序：day, COUNT(*), SUM(is_new), again, hard, good, easy。
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        DailyStats {
+                            reviews: row.get::<_, i64>(1)? as u32,
+                            new_learned: row.get::<_, i64>(2)? as u32,
+                            again: row.get::<_, i64>(3)? as u32,
+                            hard: row.get::<_, i64>(4)? as u32,
+                            good: row.get::<_, i64>(5)? as u32,
+                            easy: row.get::<_, i64>(6)? as u32,
+                            ..DailyStats::default()
+                        },
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (day, stats) = row?;
+                by_day.insert(day, stats);
+            }
+        }
+        // 专注时长并进同一天。
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT day, COALESCE(SUM(seconds), 0)
+                 FROM sessions
+                 WHERE day >= ?1 AND day < ?2
+                 GROUP BY day",
+            )?;
+            let rows = stmt.query_map(
+                [time::format_day(from), time::format_day(end)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
+            )?;
+            for row in rows {
+                let (day, seconds) = row?;
+                by_day.entry(day).or_default().seconds = seconds;
+            }
+        }
+        // 按日历逐天输出，缺记录的补零。
+        let mut out = Vec::with_capacity(days);
+        let mut cursor = from;
+        while cursor < end {
+            let key = time::format_day(cursor);
+            let mut stats = by_day.remove(&key).unwrap_or_default();
+            stats.day = Some(cursor);
+            out.push(stats);
+            cursor = cursor + ChronoDuration::days(1);
+        }
+        Ok(out)
+    }
+
     fn streak(&self) -> Result<u32> {
         let mut stmt = self
             .conn
@@ -3147,6 +3213,48 @@ mod tests {
             .record_review("inspect", book.id, None, &card, Rating::Good, Utc::now(), true)
             .unwrap();
         (store, dir, book.id)
+    }
+
+    #[test]
+    fn daily_history_covers_every_calendar_day_and_merges_sessions() {
+        let (mut store, _dir, book_id) = graded_store();
+        // graded_store 已在今天记了 1 条；再补三天前和两天前各一条。
+        let back2 = Utc::now() - ChronoDuration::days(2);
+        let back3 = Utc::now() - ChronoDuration::days(3);
+        let card = srs::review(None, Rating::Good, back3);
+        store
+            .record_review("inspect", book_id, None, &card, Rating::Good, back3, true)
+            .unwrap();
+        store
+            .record_review("inspect", book_id, None, &card, Rating::Again, back2, false)
+            .unwrap();
+        store
+            .record_session(&qe_core::model::SessionLog {
+                started_at: back2,
+                ended_at: back2 + ChronoDuration::minutes(10),
+                seconds: 600,
+                new_count: 0,
+                review_count: 1,
+            })
+            .unwrap();
+
+        let from = time::today() - ChronoDuration::days(6);
+        let history = store.daily_history(from, 7).unwrap();
+        assert_eq!(history.len(), 7, "按自然日补齐，缺的补零");
+        assert!(history.iter().all(|stats| stats.day.is_some()));
+        // 顺序即日历顺序，最后一天是今天。
+        assert_eq!(history[6].day, Some(time::today()));
+
+        let reviews: u32 = history.iter().map(|stats| stats.reviews).sum();
+        assert_eq!(reviews, 3, "今天1 + 三天前1 + 两天前1");
+        // 从今天-6 数：下标4 = 今天-2：again 一条 + 专注 600 秒。
+        let day2 = &history[4];
+        assert_eq!(day2.again, 1);
+        assert_eq!(day2.reviews, 1);
+        assert_eq!(day2.seconds, 600, "sessions 按天并进同一行");
+        // 没记录的那天是零，不是缺行。
+        let empty = &history[0];
+        assert_eq!((empty.reviews, empty.new_learned, empty.seconds), (0, 0, 0));
     }
 
     #[test]

@@ -2631,7 +2631,7 @@ impl App {
         self.advice_fetch = Some(receiver);
     }
 
-    /// 给 AI 的数据切片：本轮 + 今日累计 + 反复忘的词。
+    /// 给 AI 的数据切片：本轮 + 今日累计 + 反复忘的词 + **近 7 天逐日趋势**。
     fn advice_context(&self, session_new: u32, session_reviews: u32) -> Result<String> {
         let daily = self.store.daily(time::today())?;
         let streak = self.store.streak()?;
@@ -2643,10 +2643,32 @@ impl App {
             .map(|(lemma, again)| format!("{lemma}×{again}"))
             .collect::<Vec<_>>()
             .join("、");
+        // 多天视角：只给今天，模型没法判断「今天算好还是坏」。
+        let past = self
+            .store
+            .daily_history(time::today() - chrono::Duration::days(6), 7)?;
+        let timeline = past
+            .iter()
+            .filter_map(|stats| {
+                stats.day.map(|day| {
+                    format!(
+                        "{} 新{}/复习{}",
+                        time::format_short(day),
+                        stats.new_learned,
+                        stats.reviews
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("，");
+        let days = past.len().max(1) as u32;
+        let avg_reviews = past.iter().map(|stats| stats.reviews).sum::<u32>() / days;
+        let avg_new = past.iter().map(|stats| stats.new_learned).sum::<u32>() / days;
         Ok(format!(
             "本轮新学 {session_new} 词、复习 {session_reviews} 次；\
 今日新学 {}、复习 {}，评分 again {} / hard {} / good {} / easy {}，\
-忘记率 {}%，连续学习 {} 天，今日专注 {} 分钟。今天反复忘的词：{}。",
+忘记率 {}%，连续学习 {} 天，今日专注 {} 分钟。今天反复忘的词：{}。\
+近7天（日期 新词/复习）：{timeline}；7天平均：复习 {avg_reviews}、新词 {avg_new}。",
             daily.new_learned,
             daily.reviews,
             daily.again,
@@ -2692,9 +2714,11 @@ impl App {
     /// AI 总结建议的提示词：数据 → 2-4 句中文（评价 + 主要问题 + 明天怎么做）。
     fn advice_prompt(context: &str) -> String {
         format!(
-            "你是一位英语学习教练，根据今天的学习数据做一次简短复盘。\
+            "你是一位英语学习教练，根据今天与近7天的学习数据做一次简短复盘\
+（结合7天均值判断今天算好还是差）。\
 只输出 2-4 句简体中文，不要列表、不要英文、不要客套话：\
-第一句评价今天的表现；第二句点出最主要的问题（结合忘记率和反复忘的词）；\
+第一句结合均值与趋势评价今天的表现；第二句点出最主要的问题\
+（结合忘记率、反复忘的词和近几天的波动）；\
 最后一句给出明天具体可执行的做法。\n\n学习数据：{context}"
         )
     }
@@ -2703,6 +2727,10 @@ impl App {
         let daily = self.store.daily(time::today())?;
         let review_stats = self.store.review_stats(time::today(), 5)?;
         let streak = self.store.streak()?;
+        // 近 7 天（含今天，缺的补零）：均值对比与逐日趋势都从这里来。
+        let past = self
+            .store
+            .daily_history(time::today() - chrono::Duration::days(6), 7)?;
         let upcoming = self
             .store
             .upcoming(time::today(), 7)?
@@ -2732,6 +2760,7 @@ impl App {
         self.push(Message::tool(summary_tool(
             &daily,
             streak,
+            &past,
             &upcoming,
             &status,
             &review_stats.difficult_words,

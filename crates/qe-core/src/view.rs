@@ -1059,6 +1059,7 @@ pub struct SummaryStatus {
 pub fn summary_tool(
     daily: &DailyStats,
     streak: u32,
+    past: &[DailyStats],
     upcoming: &[(String, u32)],
     status: &SummaryStatus,
     difficult_words: &[(String, u32)],
@@ -1082,6 +1083,21 @@ pub fn summary_tool(
         format!("{} done · {} still due", daily.reviews, status.due_left)
     };
 
+    // 多天对比：单看今天不知道算好算坏，和近 N 天均值放一起才看得出来。
+    let days = past.len() as u32;
+    let (avg_reviews, avg_new) = (
+        past.iter()
+            .map(|stats| stats.reviews)
+            .sum::<u32>()
+            .checked_div(days)
+            .unwrap_or(0),
+        past.iter()
+            .map(|stats| stats.new_learned)
+            .sum::<u32>()
+            .checked_div(days)
+            .unwrap_or(0),
+    );
+
     let mut view = ToolView::new("summary")
         .accent(Accent::Note)
         .badge(day)
@@ -1100,11 +1116,42 @@ pub fn summary_tool(
                 daily.again, daily.hard, daily.good, daily.easy
             ),
         )
-        .kv("forget rate", format!("{}%", daily.forget_rate()))
-        .kv("streak", format!("{streak} days"));
+        .kv("forget rate", format!("{}%", daily.forget_rate()));
+    if days > 0 {
+        view = view.kv(
+            format!("vs {days}-day avg"),
+            format!(
+                "reviews {} vs {avg_reviews} · new {} vs {avg_new}",
+                daily.reviews, daily.new_learned
+            ),
+        );
+    }
+    view = view.kv("streak", format!("{streak} days"));
 
     if status.deck_total > 0 {
         view = view.kv("deck", format!("{} words", status.deck_total));
+    }
+
+    // 近 N 天的活动（按天，含今天）：和下面的未来曲线首尾相接。
+    if !past.is_empty() {
+        let max = past
+            .iter()
+            .map(|stats| stats.reviews)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        view = view.spacer().muted(format!("past {} days", past.len()));
+        for stats in past {
+            let label = stats
+                .day
+                .map(crate::time::format_short)
+                .unwrap_or_default();
+            view = view.line(ToolLine::Bar {
+                label,
+                value: stats.reviews,
+                max,
+            });
+        }
     }
 
     if !upcoming.is_empty() {
@@ -1174,6 +1221,7 @@ mod tests {
             &daily(8, 12),
             4,
             &[],
+            &[],
             &SummaryStatus {
                 new_left: 12,
                 due_left: 3,
@@ -1198,6 +1246,7 @@ mod tests {
             &daily(20, 30),
             9,
             &[],
+            &[],
             &SummaryStatus {
                 new_left: 0,
                 due_left: 0,
@@ -1217,8 +1266,67 @@ mod tests {
     }
 
     #[test]
+    fn summary_compares_today_with_the_past_and_charts_it() {
+        let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let past = vec![
+            DailyStats {
+                day: Some(day(2026, 11, 18)),
+                new_learned: 10,
+                reviews: 80,
+                ..DailyStats::default()
+            },
+            DailyStats {
+                day: Some(day(2026, 11, 19)),
+                new_learned: 20,
+                reviews: 90,
+                ..DailyStats::default()
+            },
+            DailyStats {
+                day: Some(day(2026, 11, 20)),
+                new_learned: 30,
+                reviews: 100,
+                ..DailyStats::default()
+            },
+        ];
+        let view = summary_tool(
+            &daily(60, 115),
+            4,
+            &past,
+            &[],
+            &SummaryStatus::default(),
+            &[],
+        );
+
+        // 今天 vs 近 3 天均值：reviews 115 vs 90、new 60 vs 20。
+        let kvs = kv_lines(&view);
+        assert!(
+            kvs.iter()
+                .any(|line| line == "vs 3-day avg=reviews 115 vs 90 · new 60 vs 20"),
+            "均值对比行：{kvs:?}"
+        );
+
+        // 近几天的活动条形图：按天、顺序即日历顺序。
+        let bars: Vec<u32> = view
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                ToolLine::Bar { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars, vec![80, 90, 100], "过去三天各一条");
+    }
+
+    #[test]
     fn summary_headline_carries_counts() {
-        let view = summary_tool(&daily(8, 12), 4, &[], &SummaryStatus::default(), &[]);
+        let view = summary_tool(
+            &daily(8, 12),
+            4,
+            &[],
+            &[],
+            &SummaryStatus::default(),
+            &[],
+        );
         let headline = view.result.expect("headline");
         assert!(headline.contains("8 new"));
         assert!(headline.contains("12 reviews"));
@@ -1230,6 +1338,7 @@ mod tests {
         let view = summary_tool(
             &daily(2, 10),
             1,
+            &[],
             &[],
             &SummaryStatus::default(),
             &[("hard".to_string(), 3)],
