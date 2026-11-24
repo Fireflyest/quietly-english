@@ -5,6 +5,8 @@
 //! * 新卡先进入 learning 阶段，三个步长：10 分钟、1 天、3 天；
 //! * 毕业（graduation）后进入 review 阶段，间隔按难度因子 `ease` 指数增长；
 //! * 忘记（again）会扣 `ease` 并进入 relearning，重新巩固后回到 review；
+//! * **提示降档**：用过提示（tab）的评级按低一档执行（[`hinted_rating`]）——
+//!   靠词根想起来 ≠ 凭空想起，调度保守一点；
 //! * 所有间隔上限 365 天，`ease` 限制在 1.3 ~ 3.0。
 //!
 //! 这套规则与扇贝/Anki 的“记忆曲线”一致：短间隔重复 → 逐步拉长 → 遗忘后回调。
@@ -34,6 +36,18 @@ fn clamp_ease(ease: f64) -> f64 {
 
 fn cap_interval(days: u32) -> u32 {
     days.clamp(1, MAX_INTERVAL)
+}
+
+/// 用过提示的评级降一档执行：不是凭空想起来的，调度保守一点。
+///
+/// `Good` 按 `Hard` 算、`Easy` 按 `Good` 算；`Hard` / `Again` 已是底线，不变。
+/// 只影响调度（间隔与 ease），统计里仍按用户实际按的键计。
+pub fn hinted_rating(rating: Rating) -> Rating {
+    match rating {
+        Rating::Good => Rating::Hard,
+        Rating::Easy => Rating::Good,
+        other => other,
+    }
 }
 
 /// 根据上一次状态与本次评价，算出下一次复习时间。
@@ -234,6 +248,38 @@ mod tests {
         assert_eq!(card.reps, 1);
         // 第二步是 1 天
         assert!(card.due_at > at(9) + Duration::hours(23));
+    }
+
+    #[test]
+    fn hinted_grades_run_one_level_down() {
+        assert_eq!(hinted_rating(Rating::Good), Rating::Hard);
+        assert_eq!(hinted_rating(Rating::Easy), Rating::Good);
+        assert_eq!(hinted_rating(Rating::Hard), Rating::Hard, "已是底线");
+        assert_eq!(hinted_rating(Rating::Again), Rating::Again, "已是底线");
+    }
+
+    #[test]
+    fn a_hinted_good_schedules_conservatively() {
+        // 一张复习卡：直接 Good vs 提示后 Good（按 Hard 执行）。
+        let mut prev = SrsCard::new(at(9));
+        prev.phase = Phase::Review;
+        prev.interval_days = 10;
+        prev.ease = 2.5;
+        prev.last_review_at = Some(at(1));
+
+        let direct = review(Some(&prev), Rating::Good, at(10));
+        let hinted = review(Some(&prev), hinted_rating(Rating::Good), at(10));
+        assert!(
+            hinted.interval_days < direct.interval_days,
+            "提示后的间隔更短：{} < {}",
+            hinted.interval_days,
+            direct.interval_days
+        );
+        assert!(hinted.ease < direct.ease, "提示后 ease 不涨反扣");
+        assert_eq!(
+            hinted.due_at,
+            at(10) + Duration::days(hinted.interval_days as i64)
+        );
     }
 
     #[test]

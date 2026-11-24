@@ -16,6 +16,9 @@ pub struct StudySnapshot {
     pub current: Option<StudyCard>,
     pub revealed: bool,
     pub hint: bool,
+    /// 这张卡是否用过提示（恢复快照后不丢）。
+    #[serde(default)]
+    pub hinted: bool,
     pub graded: Option<Rating>,
     pub last_after: Option<SrsCard>,
     pub new_done: u32,
@@ -33,6 +36,9 @@ pub struct StudySession {
     pub revealed: bool,
     /// Roots are on screen while the answer is still hidden.
     pub hint: bool,
+    /// 这张卡是否**用过**提示（看过一次就算，sticky 到下一张；
+    /// 评分时按低一档调度，见 `srs::hinted_rating`）。
+    pub hinted: bool,
     /// Rating already written for the current card; may be changed with 1-4 again.
     pub graded: Option<Rating>,
     /// Card state computed from the last rating, used for the "next ..." footer.
@@ -56,6 +62,7 @@ impl StudySession {
             current: None,
             revealed: false,
             hint: false,
+            hinted: false,
             graded: None,
             last_after: None,
             new_done: 0,
@@ -90,6 +97,7 @@ impl StudySession {
         self.current = Some(card);
         self.revealed = false;
         self.hint = false;
+        self.hinted = false;
         self.graded = None;
         self.last_after = None;
         self.card_msg = None;
@@ -103,6 +111,7 @@ impl StudySession {
             current: self.current.clone(),
             revealed: self.revealed,
             hint: self.hint,
+            hinted: self.hinted,
             graded: self.graded,
             last_after: self.last_after.clone(),
             new_done: self.new_done,
@@ -123,6 +132,7 @@ impl StudySession {
             current: snapshot.current,
             revealed: snapshot.revealed,
             hint: snapshot.hint,
+            hinted: snapshot.hinted,
             graded: snapshot.graded,
             last_after: snapshot.last_after,
             new_done: snapshot.new_done,

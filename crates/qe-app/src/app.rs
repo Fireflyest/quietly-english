@@ -2310,11 +2310,15 @@ impl App {
             state = state.graded(rating);
         }
         if let Some(after) = &session.last_after {
-            state = state.footer(format!(
+            let mut footer = format!(
                 "next {duration} · interval {}d · ease {:.2}",
                 after.interval_days, after.ease,
                 duration = human_interval(after, Utc::now())
-            ));
+            );
+            if session.hinted {
+                footer.push_str(" · after hint");
+            }
+            state = state.footer(footer);
         }
 
         let message = Message::card(state);
@@ -2387,6 +2391,10 @@ impl App {
                 return Ok(());
             }
             session.hint = !session.hint;
+            // 看过一次提示就算「用过」：评分时调度降一档（关掉提示也一样）。
+            if session.hint {
+                session.hinted = true;
+            }
         }
         // Keep the feedback and the revealed card from appearing as one abrupt
         // replacement after a 1-4 rating.
@@ -2446,11 +2454,20 @@ impl App {
         let first_time = session.graded.is_none();
         // 空格已经揭晓过的卡：评级只是补状态，不该重放过渡。
         let was_revealed = session.revealed;
+        // 这张卡是否用过提示（看过一次就算）。
+        let hinted = session.hinted;
         let card_message = session.card_msg.unwrap_or(0);
         let was_new = card.is_new;
 
         let now = Utc::now();
-        let after = srs::review(card.card.as_ref(), rating, now);
+        // 用过提示：调度降一档（Good→Hard、Easy→Good），不是凭空想起来的；
+        // 统计里仍记用户实际按的键。
+        let scheduled = if hinted {
+            srs::hinted_rating(rating)
+        } else {
+            rating
+        };
+        let after = srs::review(card.card.as_ref(), scheduled, now);
         if first_time {
             self.store.record_review(
                 &card.word.lemma,
@@ -3090,6 +3107,49 @@ mod tests {
             app.study_fade_started.is_some(),
             "直接评级 = 揭晓，仍走流式"
         );
+    }
+
+    #[test]
+    fn a_hinted_grade_is_demoted_and_marked_in_the_footer() {
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+
+        // tab 开提示 → 这张卡记为「用过」。
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.session.as_ref().unwrap().hinted, "看过提示就算用过");
+
+        // 关掉提示也算用过（看过一次就记住了）。
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.session.as_ref().unwrap().hint, "提示关掉了");
+        assert!(app.session.as_ref().unwrap().hinted, "但降档仍然生效");
+
+        // 评分：调度降一档，角标注明 after hint。
+        app.grade(Rating::Good).unwrap();
+        let footer = app
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.card_state())
+            .and_then(|state| state.footer.clone())
+            .expect("评完有下一次间隔的角标");
+        assert!(footer.contains("after hint"), "角标要说明降档：{footer}");
+
+        // 下一张卡复位。
+        app.advance().unwrap();
+        assert!(!app.session.as_ref().unwrap().hinted, "换卡复位");
+
+        // 没用过提示的直接评级：不降档、不标 after hint。
+        app.grade(Rating::Good).unwrap();
+        let footer = app
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.card_state())
+            .and_then(|state| state.footer.clone())
+            .expect("评完有角标");
+        assert!(!footer.contains("after hint"), "直接想起不标：{footer}");
     }
 
     #[test]
