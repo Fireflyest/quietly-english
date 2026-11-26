@@ -33,6 +33,10 @@ const MAX_UNDO: usize = 50;
 /// 学习卡流式的时长（毫秒）：内容按进度从头吐出，到点给全量。
 const STUDY_STREAM_MS: u64 = 600;
 
+/// 会话在对话里保留的卡片消息上限：留最近十张可回翻，
+/// 又不让背词时长推高每帧的全量重排版成本。
+const KEEP_CARD_MESSAGES: usize = 10;
+
 /// 一条右上角的悬浮提示：不写进对话历史，[`App::live_toasts`] 到点剔除。
 #[derive(Debug)]
 struct FloatingNote {
@@ -814,6 +818,11 @@ impl App {
                 self.messages.clear();
                 self.table_words.clear();
                 self.undo.clear();
+                // 消息没了，卡片槽位也作废：下一张重新开槽，裁剪不删错。
+                if let Some(session) = self.session.as_mut() {
+                    session.card_slots.clear();
+                    session.card_msg = None;
+                }
                 self.greet()?;
                 return Ok(());
             }
@@ -1909,6 +1918,8 @@ impl App {
             session.last_after = None;
             session.current = Some(entry.card.clone());
             session.card_msg = Some(entry.message);
+            // truncate_after 砍掉了更新的卡片槽：同步丢弃，别留失效下标。
+            session.card_slots.retain(|slot| *slot <= entry.message);
         }
 
         // Drop the trailing "rated" note the undo makes false.
@@ -2329,10 +2340,52 @@ impl App {
                 let index = self.messages.len() - 1;
                 if let Some(session) = self.session.as_mut() {
                     session.card_msg = Some(index);
+                    session.card_slots.push(index);
                 }
+                // 裁到最近 KEEP_CARD_MESSAGES 条：留十张可回翻，
+                // 对话不随背词时长无限膨胀。
+                self.trim_old_cards();
             }
         }
         Ok(())
+    }
+
+    /// 会话只保留最近 [`KEEP_CARD_MESSAGES`] 条卡片消息：删掉最老的槽位，
+    /// 并把它之后的所有下标前移（当前卡片槽、undo 记录）——下标不动就会指错消息。
+    fn trim_old_cards(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if session.card_slots.len() <= KEEP_CARD_MESSAGES {
+            return;
+        }
+        let removed = session.card_slots[0];
+        // 下标已失效（对话被清空过之类）：丢掉坏槽自愈，绝不删错消息。
+        if removed >= self.messages.len() {
+            if let Some(session) = self.session.as_mut() {
+                session.card_slots.remove(0);
+            }
+            return;
+        }
+        self.messages.remove(removed);
+        if let Some(session) = self.session.as_mut() {
+            session.card_slots.remove(0);
+            for slot in &mut session.card_slots {
+                *slot -= 1;
+            }
+            if let Some(current) = session.card_msg.as_mut() {
+                if *current > removed {
+                    *current -= 1;
+                }
+            }
+        }
+        // 指向被删槽的 undo 记录作废（那是十张以前的卡了）；靠后的整体前移。
+        self.undo.retain(|entry| entry.message != removed);
+        for entry in &mut self.undo {
+            if entry.message > removed {
+                entry.message -= 1;
+            }
+        }
     }
 
     fn reveal(&mut self) -> Result<()> {
@@ -3179,6 +3232,49 @@ mod tests {
             .and_then(|state| state.footer.clone())
             .expect("评完有角标");
         assert!(!footer.contains("after hint"), "直接想起不标：{footer}");
+    }
+
+    #[test]
+    fn a_study_session_keeps_the_last_ten_cards() {
+        // 保留最近十张卡可回翻，同时对话不随背词时长无限膨胀（越背越卡的根源）。
+        // Again 会把卡重新排队，永远有下一张，可以连推验证裁剪。
+        let Harness { mut app, _dir } = harness();
+        app.execute(Command::Study(Some(3))).unwrap();
+        for _ in 0..13 {
+            app.grade(Rating::Again).unwrap();
+            app.advance().unwrap();
+        }
+
+        let cards = app
+            .messages
+            .iter()
+            .filter(|message| message.card_state().is_some())
+            .count();
+        assert_eq!(cards, KEEP_CARD_MESSAGES, "保留最近十张卡");
+
+        let session = app.session.as_ref().unwrap();
+        assert_eq!(
+            session.card_slots.len(),
+            KEEP_CARD_MESSAGES,
+            "槽位表同步裁剪"
+        );
+        assert_eq!(
+            session.card_msg,
+            Some(*session.card_slots.last().unwrap()),
+            "当前卡是最新槽"
+        );
+        assert!(
+            session.card_slots.windows(2).all(|pair| pair[0] < pair[1]),
+            "槽位保持递增：{:?}",
+            session.card_slots
+        );
+        assert!(
+            app.undo
+                .iter()
+                .all(|entry| entry.message < app.messages.len()),
+            "undo 下标都指向仍存在的消息：{:?}",
+            app.undo.iter().map(|entry| entry.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -4706,7 +4802,8 @@ mod tests {
         app.execute(Command::Study(Some(3))).unwrap();
         app.grade(Rating::Good).unwrap();
         app.advance().unwrap();
-        assert_eq!(card_count(&app), 2, "next card appears");
+        // 每张卡开一个新槽（保留十张历史）；下一张卡出现在新槽里。
+        assert_eq!(card_count(&app), 2, "next card appears in its own slot");
         assert_eq!(app.session.as_ref().unwrap().graded, None);
         assert!(!app.session.as_ref().unwrap().revealed);
     }

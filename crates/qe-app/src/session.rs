@@ -52,6 +52,9 @@ pub struct StudySession {
     pub review_total: u32,
     /// Index of the card message inside `App::messages`.
     pub card_msg: Option<usize>,
+    /// 本会话开过的卡片槽位（旧→新）；app 据此把历史裁到最近 10 条
+    /// （见 `App::trim_old_cards`），既留十张可回翻，又不让对话膨胀。
+    pub card_slots: Vec<usize>,
 }
 
 impl StudySession {
@@ -71,6 +74,7 @@ impl StudySession {
             new_total,
             review_total,
             card_msg: None,
+            card_slots: Vec::new(),
         }
     }
 
@@ -100,6 +104,8 @@ impl StudySession {
         self.hinted = false;
         self.graded = None;
         self.last_after = None;
+        // 每张卡开一个新槽位：历史由 app 裁到最近 KEEP_CARD_MESSAGES 条，
+        // 既保留往回翻十张的余地，又不让对话无限膨胀拖慢每帧重排版。
         self.card_msg = None;
     }
 
@@ -141,6 +147,7 @@ impl StudySession {
             new_total: snapshot.new_total,
             review_total: snapshot.review_total,
             card_msg: None,
+            card_slots: Vec::new(),
         })
     }
 }
