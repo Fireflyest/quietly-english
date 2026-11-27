@@ -11,7 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::model::{
     Book, BookProgress,     DailyStats, DictReport, Example, ImportPlan, ImportReport, PracticeSetStat, Quiz, Rating,
     ReviewStats, ReadingLog, ReadingStats, SessionLog, SrsCard, StudyCard, Word,
-    TranslationAttempt, TranslationExercise,
+    TranslationAttempt, TranslationExercise, WordRoot,
 };
 
 pub trait Store {
@@ -200,6 +200,9 @@ pub trait Store {
     // ---- 导入 ----
     fn import_plan(&mut self, plan: &ImportPlan) -> Result<ImportReport>;
     fn add_examples(&mut self, examples: &[(String, Example)]) -> Result<u32>;
+    /// 给**还没有词根**的词条写入词根（带来源）；已有词根的不覆盖。
+    /// 返回是否写入。
+    fn set_word_roots(&mut self, lemma: &str, roots: &[WordRoot]) -> Result<bool>;
     /// 导入常用词组表（`lemma<TAB>phrase<TAB>gloss`），只更新已有词条。
     /// 返回 `(覆盖词数, 新增搭配数)`。
     fn import_phrases(&mut self, path: &Path) -> Result<(u32, u32)>;

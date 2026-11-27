@@ -134,6 +134,9 @@ pub struct App {
     /// 背完一轮后 AI 总结建议的后台通道。
     advice_fetch:
         Option<std::sync::mpsc::Receiver<Result<crate::translator::Generated, String>>>,
+    /// 总结后「薄弱词加工」（补词根/例句）的后台通道。
+    polish_fetch:
+        Option<std::sync::mpsc::Receiver<Result<crate::polish::Polished, String>>>,
     /// 右上角的悬浮提示（后台任务、瞬时状态），几秒自动消失。
     floating: Vec<FloatingNote>,
     /// 后台机翻一段的结果通道：`(文本 id, 段落, 段落结果)`。
@@ -199,6 +202,7 @@ impl App {
             news_fetch: None,
             practice_fetch: None,
             advice_fetch: None,
+            polish_fetch: None,
             floating: Vec::new(),
             translation_fetch: None,
             db_path: None,
@@ -667,6 +671,8 @@ impl App {
             self.poll_practice();
             // AI 总结建议也是后台线程，好了补一条。
             self.poll_summary_advice();
+            // 薄弱词加工（补词根/例句）同理。
+            self.poll_word_polish();
             // 机器翻译也一样：翻完再补进卡片，界面不卡。
             self.poll_translation();
             if let Some(started) = self.study_fade_started {
@@ -2653,6 +2659,8 @@ impl App {
         self.push_summary()?;
         // 统计之后补一条 AI 总结建议：后台生成，好了再上屏，不卡结束这一下。
         self.spawn_summary_advice(session.new_done, session.review_done);
+        // 再挑今天忘最多、且缺词根/例句的词，后台补齐（带来源标注）。
+        self.spawn_word_polish();
         self.float("session ended · /study again, or type a word");
         self.refresh_status();
         Ok(())
@@ -2760,6 +2768,126 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.advice_fetch = None;
+            }
+        }
+    }
+
+    /// 总结时挑「今天忘得多、且缺词根或例句」的前几个词。
+    ///
+    /// 只挑缺的：已有的（多带真实出处）不进名单，模型也就不会去动它。
+    fn polish_candidates(&self) -> Result<Vec<crate::polish::PolishWord>> {
+        let difficult = self.store.review_stats(time::today(), 8)?.difficult_words;
+        let mut out = Vec::new();
+        for (lemma, again) in difficult {
+            if out.len() >= 5 {
+                break;
+            }
+            let Some(word) = self.store.word(&lemma)? else {
+                continue;
+            };
+            let need_roots = word.roots.is_empty();
+            let need_examples = word.examples.is_empty();
+            if !need_roots && !need_examples {
+                continue;
+            }
+            out.push(crate::polish::PolishWord {
+                lemma: word.lemma,
+                translation: word.translation,
+                again,
+                need_roots,
+                need_examples,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 把薄弱词交给模型补词根/例句（后台；只在真实 TUI 里跑）。
+    /// 该补的都齐了就不花额度。
+    fn spawn_word_polish(&mut self) {
+        if self.polish_fetch.is_some() || self.db_path.is_none() {
+            return;
+        }
+        let Ok(candidates) = self.polish_candidates() else {
+            return;
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let Ok(models) = crate::translator::ai_candidates() else {
+            return;
+        };
+        let prompt = crate::polish::prompt(&candidates);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = crate::translator::ai_generate(&models, &prompt)
+                .map_err(|err| format!("{err:#}"))
+                .and_then(|generated| {
+                    crate::polish::polish_from_generated(generated)
+                        .map_err(|err| format!("{err:#}"))
+                });
+            let _ = sender.send(outcome);
+        });
+        self.polish_fetch = Some(receiver);
+    }
+
+    /// 加工线程有结果了就落库并出报告；每帧调一次。
+    fn poll_word_polish(&mut self) {
+        let Some(receiver) = self.polish_fetch.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(polished)) => {
+                self.polish_fetch = None;
+                let source = format!("AI · {}", polished.model);
+                let mut roots_done: Vec<String> = Vec::new();
+                let mut examples_done: Vec<String> = Vec::new();
+                for upgrade in &polished.upgrades {
+                    if !upgrade.roots.is_empty()
+                        && self
+                            .store
+                            .set_word_roots(&upgrade.lemma, &upgrade.roots)
+                            .unwrap_or(false)
+                    {
+                        roots_done.push(upgrade.lemma.clone());
+                    }
+                    if !upgrade.examples.is_empty() {
+                        let batch: Vec<(String, qe_core::Example)> = upgrade
+                            .examples
+                            .iter()
+                            .map(|example| (upgrade.lemma.clone(), example.clone()))
+                            .collect();
+                        let added = self.store.add_examples(&batch).unwrap_or(0);
+                        if added > 0 {
+                            examples_done.push(upgrade.lemma.clone());
+                        }
+                    }
+                }
+                if roots_done.is_empty() && examples_done.is_empty() {
+                    self.float("word polish: nothing new");
+                } else {
+                    let mut view = ToolView::new("polish")
+                        .accent(Accent::Note)
+                        .result(format!(
+                            "{} roots · {} examples",
+                            roots_done.len(),
+                            examples_done.len()
+                        ));
+                    if !roots_done.is_empty() {
+                        view = view.kv("roots", roots_done.join(", "));
+                    }
+                    if !examples_done.is_empty() {
+                        view = view.kv("examples", examples_done.join(", "));
+                    }
+                    self.push(Message::tool(view.muted(format!("来源：{source}"))));
+                }
+            }
+            Ok(Err(error)) => {
+                self.polish_fetch = None;
+                self.float_warn(format!("word polish failed · {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.polish_fetch = None;
             }
         }
     }
@@ -4672,6 +4800,143 @@ mod tests {
         let live = app.live_toasts();
         assert!(live.is_empty(), "过期的悬浮提示被剔除");
         assert!(app.floating.is_empty());
+    }
+
+    #[test]
+    fn polish_candidates_take_the_forgotten_and_the_incomplete() {
+        let Harness { mut app, _dir } = harness();
+        let book = app.store.current_book().unwrap().expect("fixture deck");
+        let deck: Vec<String> = app
+            .store
+            .new_cards(book.id, 10)
+            .unwrap()
+            .iter()
+            .map(|word| word.lemma.clone())
+            .collect();
+        assert!(deck.len() >= 2, "fixture needs two words");
+        let (a, b) = (deck[0].clone(), deck[1].clone());
+
+        // 再导一个「既没词根也没例句」的词（fixture 三词都带例句）。
+        let mut plan = qe_core::model::ImportPlan::new("bare", "Bare", "fixture");
+        plan.words.push(qe_core::model::Word::new("bare", "n. 光秃"));
+        app.store.import_plan(&plan).unwrap();
+
+        // 今天 a忘 1 次、b 忘 2 次（b 更不熟练）、bare 忘 1 次。
+        let card = qe_core::srs::review(None, Rating::Again, chrono::Utc::now());
+        let now = chrono::Utc::now();
+        app.store
+            .record_review(&a, book.id, None, &card, Rating::Again, now, false)
+            .unwrap();
+        app.store
+            .record_review(&b, book.id, None, &card, Rating::Again, now, false)
+            .unwrap();
+        app.store
+            .record_review(&b, book.id, None, &card, Rating::Again, now, false)
+            .unwrap();
+        app.store
+            .record_review("bare", book.id, None, &card, Rating::Again, now, false)
+            .unwrap();
+
+        // b 补齐（词根 + 例句都有了）→ 不进名单；a 只缺词根 → 进。
+        app.store
+            .set_word_roots(
+                &b,
+                &[qe_core::model::WordRoot::new(
+                    "x",
+                    "y",
+                    qe_core::model::RootKind::Root,
+                )],
+            )
+            .unwrap();
+        app.store
+            .add_examples(&[(b.clone(), qe_core::model::Example::new("例句。", None))])
+            .unwrap();
+
+        let candidates = app.polish_candidates().unwrap();
+        assert!(
+            candidates.iter().all(|candidate| candidate.lemma != b),
+            "词根例句都齐的词不进名单"
+        );
+        let a_entry = candidates
+            .iter()
+            .find(|candidate| candidate.lemma == a)
+            .expect("缺词根的 a 应该进名单");
+        assert!(a_entry.need_roots && !a_entry.need_examples, "a 只缺词根");
+        let bare = candidates
+            .iter()
+            .find(|candidate| candidate.lemma == "bare")
+            .expect("全缺的 bare 应该进名单");
+        assert!(bare.need_roots && bare.need_examples);
+        assert!(candidates.len() <= 5, "最多挑五个");
+    }
+
+    #[test]
+    fn polished_words_land_in_the_dictionary_with_sources() {
+        let Harness { mut app, _dir } = harness();
+        let lemma = "inspect";
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(crate::polish::Polished {
+                model: "deepseek".to_string(),
+                upgrades: vec![crate::polish::Upgrade {
+                    lemma: lemma.to_string(),
+                    roots: vec![qe_core::model::WordRoot::new(
+                        "in-",
+                        "向内",
+                        qe_core::model::RootKind::Prefix,
+                    )
+                    .with_source("AI · deepseek")],
+                    examples: vec![{
+                        let mut example =
+                            qe_core::model::Example::new("They inspected it.", None);
+                        example.source = Some("AI · deepseek".to_string());
+                        example
+                    }],
+                }],
+            }))
+            .unwrap();
+        app.polish_fetch = Some(receiver);
+        app.poll_word_polish();
+
+        let word = app.store.word(lemma).unwrap().expect("词在库里");
+        assert_eq!(word.roots.len(), 1, "词根写进去了");
+        assert_eq!(word.roots[0].source.as_deref(), Some("AI · deepseek"));
+        assert!(!word.examples.is_empty(), "例句写进去了");
+        assert_eq!(
+            word.examples.last().unwrap().source.as_deref(),
+            Some("AI · deepseek")
+        );
+
+        // 报告进对话，且写明来源。
+        assert!(
+            app.messages.iter().any(|message| matches!(
+                &message.body,
+                Body::Tool(view) if view.name == "polish"
+                    && view.result.as_deref().is_some_and(|text| text.contains("roots"))
+                    && view.lines.iter().any(|line| matches!(
+                        line,
+                        qe_core::view::ToolLine::Muted(text) if text.contains("AI · deepseek")
+                    ))
+            )),
+            "报告里标注来源"
+        );
+    }
+
+    #[test]
+    fn a_failed_polish_floats_a_warning() {
+        let Harness { mut app, _dir } = harness();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Err("所有模型都试过了 · Gemini 连不上".to_string()))
+            .unwrap();
+        app.polish_fetch = Some(receiver);
+        app.poll_word_polish();
+        assert!(
+            app.floating.iter().any(|note| note.warn
+                && note.text.contains("word polish failed")),
+            "失败走红色悬浮"
+        );
     }
 
     #[test]

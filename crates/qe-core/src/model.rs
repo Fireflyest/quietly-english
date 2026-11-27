@@ -82,6 +82,9 @@ pub struct Example {
     pub en: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zh: Option<String>,
+    /// 来源（Tatoeba、AI 补录…）；老数据没有此字段，解析为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl Example {
@@ -89,6 +92,7 @@ impl Example {
         Self {
             en: en.into(),
             zh,
+            source: None,
         }
     }
 }

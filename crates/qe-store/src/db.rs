@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use qe_core::model::{
     Book, BookProgress, Collocation, DailyStats, DictReport, Example, ImportPlan, ImportReport,
     Phase, PracticeSetStat, Quiz, Rating, ReadingLog, ReadingStats, ReviewStats, SessionLog,
-    SrsCard, StudyCard, TranslationAttempt, TranslationExercise, Word,
+    SrsCard, StudyCard, TranslationAttempt, TranslationExercise, Word, WordRoot,
 };
 use qe_core::store::Store;
 use qe_core::time;
@@ -2897,6 +2897,19 @@ impl Store for SqliteStore {
         tx.commit()?;
         Ok(added)
     }
+
+    fn set_word_roots(&mut self, lemma: &str, roots: &[WordRoot]) -> Result<bool> {
+        if roots.is_empty() {
+            return Ok(false);
+        }
+        // 只写还没有词根的词（`roots = '[]'`）：带真实出处的词源导入绝不覆盖。
+        let raw = serde_json::to_string(roots)?;
+        let changed = self.conn.execute(
+            "UPDATE dict.words SET roots = ?2 WHERE lemma = ?1 AND roots = '[]'",
+            params![lemma.trim(), raw],
+        )?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
@@ -3181,6 +3194,34 @@ mod tests {
             .ensure_practice_set("新合集", "web", Some("https://example.cn/x"))
             .unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn roots_are_only_written_when_missing() {
+        let (mut store, _dir) = temp_store();
+        let mut plan = ImportPlan::new("t", "T", "fixture");
+        plan.words.push(Word::new("bare", "n. 光秃"));
+        store.import_plan(&plan).unwrap();
+
+        let roots = vec![qe_core::model::WordRoot::new(
+            "bare",
+            "光秃",
+            RootKind::Root,
+        )];
+        assert!(
+            store.set_word_roots("bare", &roots).unwrap(),
+            "还没有词根的词可以写入"
+        );
+        let word = store.word("bare").unwrap().unwrap();
+        assert_eq!(word.roots.len(), 1);
+
+        // 带真实出处的词源导入结果绝不覆盖。
+        store.import_plan(&sample_plan()).unwrap();
+        assert!(!store
+            .set_word_roots("inspect", &roots)
+            .unwrap(), "已有词根的词跳过");
+        let inspect = store.word("inspect").unwrap().unwrap();
+        assert!(inspect.roots.len() > 1, "原有词根原样保留");
     }
 
     #[test]

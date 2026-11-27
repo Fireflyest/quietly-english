@@ -733,6 +733,7 @@ impl ToolView {
                     en: example.en.clone(),
                     zh: example.zh.clone(),
                     highlight: Some(word.lemma.clone()),
+                    source: example.source.clone(),
                 });
             }
         }
@@ -874,6 +875,8 @@ impl CardState {
                 en: example.en.clone(),
                 zh: None,
                 highlight: Some(self.word.lemma.clone()),
+                // 提示阶段连译文都不给，来源自然也不显示。
+                source: None,
             });
             return lines;
         }
@@ -922,6 +925,8 @@ pub enum ToolLine {
         /// Word to emphasise inside `en`. Matched case-insensitively, including the
         /// common inflections (`-s`, `-es`, `-ed`, `-ing`, `-d`).
         highlight: Option<String>,
+        /// 来源标注（`AI · deepseek` 等）；无来源的老例句为 `None` 不显示。
+        source: Option<String>,
     },
     /// One dictionary sense. `index == 0` means no number (a secondary sense).
     Sense {
@@ -1184,6 +1189,7 @@ pub fn example_lines(examples: &[Example]) -> Vec<ToolLine> {
             en: e.en.clone(),
             zh: e.zh.clone(),
             highlight: None,
+            source: e.source.clone(),
         })
         .collect()
 }

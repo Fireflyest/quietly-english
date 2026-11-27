@@ -12,6 +12,7 @@ mod grade;
 mod guardian;
 mod html;
 mod news;
+mod polish;
 mod practice;
 mod reader;
 mod session;

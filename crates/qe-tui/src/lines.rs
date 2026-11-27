@@ -555,12 +555,14 @@ fn rows_with_inner(
                 en,
                 zh,
                 highlight,
+                source,
             } => {
                 rows.extend(example_rows(
                     *index,
                     en,
                     zh.as_deref(),
                     highlight.as_deref(),
+                    source.as_deref(),
                     inner,
                 ));
             }
@@ -823,6 +825,7 @@ fn example_rows(
     en: &str,
     zh: Option<&str>,
     highlight: Option<&str>,
+    source: Option<&str>,
     width: usize,
 ) -> Vec<Vec<Span<'static>>> {    let mut rows = Vec::new();
     // `1 ` gutter, then a space: continuation lines align under the sentence, not
@@ -850,6 +853,13 @@ fn example_rows(
         for piece in wrap(zh, body) {
             rows.push(vec![pad.clone(), Span::styled(piece, theme::muted())]);
         }
+    }
+    // 来源标注（AI 补录的例句）：一行小字，老例句没有来源就不显示。
+    if let Some(source) = source {
+        rows.push(vec![
+            pad.clone(),
+            Span::styled(format!("· {source}"), theme::faint()),
+        ]);
     }
 
     rows

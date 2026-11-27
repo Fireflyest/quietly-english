@@ -136,6 +136,7 @@ pub fn collect_examples(
                 Example {
                     en: en.to_string(),
                     zh: Some(zh.to_string()),
+                    source: None,
                 },
             ));
             stats.attached += 1;
